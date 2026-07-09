@@ -3,6 +3,7 @@
 use image::codecs::jpeg::JpegEncoder;
 use xcap::Monitor;
 
+#[derive(Clone)]
 pub struct Grabber {
     pub index: usize,
 }
@@ -37,4 +38,43 @@ impl Grabber {
             None => (0, 0, 1920, 1080),
         }
     }
+}
+
+/// Grab a single frame from the given camera index → JPEG. Grabs a few frames
+/// first so the camera has time to auto-expose (the first frame is often dark).
+pub fn open_camera(index: u32) -> Option<nokhwa::Camera> {
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+    use nokhwa::Camera;
+    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
+    let mut cam = Camera::new(CameraIndex::Index(index), requested).ok()?;
+    cam.open_stream().ok()?;
+    for _ in 0..3 {
+        let _ = cam.frame(); // warm up (first frames are often dark)
+    }
+    Some(cam)
+}
+
+/// One frame from an already-open camera → JPEG. MJPEG frames are already JPEG
+/// (returned as-is, avoiding the mozjpeg decoder); others decode in pure Rust.
+pub fn frame_to_jpeg(cam: &mut nokhwa::Camera, quality: u8) -> Option<Vec<u8>> {
+    use nokhwa::pixel_format::RgbFormat;
+    use nokhwa::utils::FrameFormat;
+    let frame = cam.frame().ok()?;
+    if frame.source_frame_format() == FrameFormat::MJPEG {
+        return Some(frame.buffer().to_vec());
+    }
+    let img = frame.decode_image::<RgbFormat>().ok()?;
+    let mut out = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut out, quality);
+    enc.encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8).ok()?;
+    Some(out)
+}
+
+pub fn camera_snapshot(index: u32, quality: u8) -> Option<Vec<u8>> {
+    let mut cam = open_camera(index)?;
+    for _ in 0..3 {
+        let _ = cam.frame();
+    }
+    frame_to_jpeg(&mut cam, quality)
 }

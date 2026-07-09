@@ -4,7 +4,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 use base64::Engine;
-use tiny_http::{Header, Method, Request, Response, Server};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 use crate::capture::Grabber;
 use crate::input::Ev;
@@ -101,22 +101,200 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
     let method = req.method().clone();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+    // Live MJPEG streams have their own body type (a Read that never ends), so
+    // they can't flow through the `Resp` (Cursor) match below — respond directly.
+    if method == Method::Get && path == "/stream" {
+        stream_screen(req, cfg);
+        return;
+    }
+    if method == Method::Get && path == "/camstream" {
+        let index = query_index(&url);
+        stream_camera(req, cfg, index);
+        return;
+    }
     let resp = match (&method, path.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
         (Method::Get, "/frame") => match cfg.grabber.grab_jpeg(cfg.quality, cfg.max_width) {
             Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
             None => Response::from_string("capture failed").with_status_code(500),
         },
+        (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {
             input_ep(&mut req, tx);
             Response::from_string("").with_status_code(204)
         }
         (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Post, "/update") => update_ep(&mut req),
+        (Method::Post, "/dissolve") => dissolve_ep(),
         (Method::Get, "/download") => download_ep(&url, cfg),
+        (Method::Get, "/list") => list_ep(&url, cfg),
         (Method::Post, "/upload") => upload_ep(&mut req, cfg),
         _ => Response::from_string("not found").with_status_code(404),
     };
     let _ = req.respond(resp);
+}
+
+fn update_ep(req: &mut Request) -> Resp {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let url = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("url").and_then(|u| u.as_str()).map(String::from));
+    let url = match url {
+        Some(u) => u,
+        None => return Response::from_string("no url").with_status_code(400),
+    };
+    let bytes = match download_bytes(&url) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Response::from_string("download failed").with_status_code(502),
+    };
+    if !apply_update(&bytes) {
+        return Response::from_string("update failed").with_status_code(500);
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        std::process::exit(0);
+    });
+    Response::from_string(format!("updated ({} bytes); restarting", bytes.len()))
+}
+
+/// Replace the running executable with `bytes` and spawn the new one (same args).
+/// The caller is responsible for exiting this process afterwards.
+pub(crate) fn apply_update(bytes: &[u8]) -> bool {
+    let tmp = std::env::temp_dir().join("airm-update.bin");
+    if std::fs::write(&tmp, bytes).is_err() {
+        return false;
+    }
+    if self_replace::self_replace(&tmp).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&tmp);
+    if let Ok(exe) = std::env::current_exe() {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let _ = std::process::Command::new(exe).args(args).spawn();
+    }
+    true
+}
+
+fn dissolve_ep() -> Resp {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        crate::persistence::uninstall();
+        std::process::exit(0);
+    });
+    Response::from_string("dissolving — removing autostart and exiting")
+}
+
+fn download_bytes(url: &str) -> Option<Vec<u8>> {
+    let mut reader = ureq::get(url).call().ok()?.into_reader();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn query_index(url: &str) -> u32 {
+    url.split('?')
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("index="))
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Boundary header for one JPEG frame in a multipart/x-mixed-replace stream.
+fn frame_head(len: usize) -> Vec<u8> {
+    format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+}
+
+fn mjpeg_headers() -> Vec<Header> {
+    vec![hdr("Content-Type", "multipart/x-mixed-replace; boundary=frame")]
+}
+
+/// A Read that yields an endless MJPEG stream of screen captures (~14 fps).
+struct ScreenStream {
+    grabber: Grabber,
+    quality: u8,
+    max_width: u32,
+    buf: Vec<u8>,
+    pos: usize,
+}
+impl std::io::Read for ScreenStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            std::thread::sleep(std::time::Duration::from_millis(70));
+            let jpeg = self.grabber.grab_jpeg(self.quality, self.max_width).unwrap_or_default();
+            self.buf = frame_head(jpeg.len());
+            self.buf.extend_from_slice(&jpeg);
+            self.buf.extend_from_slice(b"\r\n");
+            self.pos = 0;
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// A Read that yields an endless MJPEG stream from an open camera.
+struct CameraStream {
+    cam: nokhwa::Camera,
+    quality: u8,
+    buf: Vec<u8>,
+    pos: usize,
+}
+impl std::io::Read for CameraStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            let jpeg = crate::capture::frame_to_jpeg(&mut self.cam, self.quality).unwrap_or_default();
+            self.buf = frame_head(jpeg.len());
+            self.buf.extend_from_slice(&jpeg);
+            self.buf.extend_from_slice(b"\r\n");
+            self.pos = 0;
+        }
+        let n = (self.buf.len() - self.pos).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+fn stream_screen(req: Request, cfg: &Config) {
+    let reader = ScreenStream {
+        grabber: cfg.grabber.clone(),
+        quality: cfg.quality,
+        max_width: cfg.max_width,
+        buf: Vec::new(),
+        pos: 0,
+    };
+    let resp = Response::new(StatusCode(200), mjpeg_headers(), reader, None, None);
+    let _ = req.respond(resp);
+}
+
+fn stream_camera(req: Request, cfg: &Config, index: u32) {
+    match crate::capture::open_camera(index) {
+        Some(cam) => {
+            let reader = CameraStream { cam, quality: cfg.quality, buf: Vec::new(), pos: 0 };
+            let resp = Response::new(StatusCode(200), mjpeg_headers(), reader, None, None);
+            let _ = req.respond(resp);
+        }
+        None => {
+            let _ = req.respond(Response::from_string("camera open failed").with_status_code(500));
+        }
+    }
+}
+
+fn camera_ep(url: &str, cfg: &Config) -> Resp {
+    let index = query_index(url);
+    let quality = cfg.quality;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::capture::camera_snapshot(index, quality));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(Some(bytes)) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+        _ => Response::from_string("camera capture failed or timed out").with_status_code(500),
+    }
 }
 
 fn input_ep(req: &mut Request, tx: &Sender<Ev>) {
@@ -189,6 +367,47 @@ fn resolve_path(cfg: &Config, path: &str) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(expand_tilde(path)))
     }
+}
+
+fn list_ep(url: &str, cfg: &Config) -> Resp {
+    let query = url.split('?').nth(1).unwrap_or("");
+    let mut path = String::new();
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("path=") {
+            path = percent_decode(v);
+        }
+    }
+    if path.is_empty() {
+        path = if !cfg.share.is_empty() {
+            cfg.share.clone()
+        } else {
+            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "/".to_string())
+        };
+    }
+    let full = match resolve_path(cfg, &path) {
+        Some(f) => f,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}), 403),
+    };
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&full) {
+        for e in rd.flatten() {
+            let md = e.metadata().ok();
+            let dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+            let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+            entries.push(serde_json::json!({"name": e.file_name().to_string_lossy(), "dir": dir, "size": size}));
+        }
+    }
+    entries.sort_by(|a, b| {
+        let (ad, bd) = (a["dir"].as_bool().unwrap_or(false), b["dir"].as_bool().unwrap_or(false));
+        bd.cmp(&ad).then_with(|| {
+            a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+        })
+    });
+    let parent = full.parent().map(|p| p.to_string_lossy().to_string());
+    json_resp(
+        &serde_json::json!({"ok": true, "path": full.to_string_lossy(), "parent": parent, "entries": entries}),
+        200,
+    )
 }
 
 fn expand_tilde(p: &str) -> String {
