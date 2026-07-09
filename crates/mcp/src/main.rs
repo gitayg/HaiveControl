@@ -45,6 +45,35 @@ struct UploadArgs {
     #[serde(default)]
     remote_dir: Option<String>,
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ClickArgs {
+    device: String,
+    /// horizontal position as a fraction of the screen width, 0.0 (left) to 1.0 (right)
+    x: f64,
+    /// vertical position as a fraction of the screen height, 0.0 (top) to 1.0 (bottom)
+    y: f64,
+    /// "left" (default), "right", or "middle"
+    #[serde(default)]
+    button: Option<String>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct TypeArgs {
+    device: String,
+    text: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct KeyArgs {
+    device: String,
+    /// key name, e.g. Enter, Tab, Escape, Backspace, ArrowDown, F5
+    key: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct CameraArgs {
+    device: String,
+    /// camera index, default 0
+    #[serde(default)]
+    index: Option<u32>,
+}
 
 #[derive(Clone)]
 struct Srv {
@@ -121,22 +150,32 @@ impl Srv {
             _ => Err(format!("ambiguous device: {}", m.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", "))),
         }
     }
+
+    async fn input(&self, base: &str, ev: serde_json::Value) -> Result<(), ErrorData> {
+        self.auth(self.client.post(format!("{base}/input")))
+            .json(&ev)
+            .send()
+            .await
+            .map_err(err)?;
+        Ok(())
+    }
 }
 
 #[tool_router]
 impl Srv {
-    #[tool(description = "List devices currently registered with the hub (ready to connect).")]
+    #[tool(description = "List devices registered with the hub, with full details (OS, user, CPU, memory, all network interfaces, last-seen seconds). Returns JSON.")]
     async fn list_devices(&self) -> Result<CallToolResult, ErrorData> {
-        let agents = self.agents().await.map_err(err)?;
-        let text = if agents.is_empty() {
-            "no devices registered".to_string()
-        } else {
-            agents
-                .iter()
-                .map(|a| format!("{} — {}://{}:{}", a.name, a.scheme, a.ip, a.port))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let v: serde_json::Value = self
+            .client
+            .get(format!("{}/agents", self.hub.trim_end_matches('/')))
+            .send()
+            .await
+            .map_err(err)?
+            .json()
+            .await
+            .map_err(err)?;
+        let agents = v.get("agents").cloned().unwrap_or_else(|| serde_json::json!([]));
+        let text = serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
@@ -174,6 +213,34 @@ impl Srv {
             .map_err(err)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/jpeg")]))
+    }
+
+    #[tool(description = "Capture a photo from the device's camera (webcam). Optional index selects the camera (default 0).")]
+    async fn camera_snapshot(&self, Parameters(a): Parameters<CameraArgs>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        let url = match a.index {
+            Some(i) => format!("{base}/camera?index={i}"),
+            None => format!("{base}/camera"),
+        };
+        let bytes = self.auth(self.client.get(url)).send().await.map_err(err)?.bytes().await.map_err(err)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/jpeg")]))
+    }
+
+    #[tool(description = "Update the agent on the device to the latest build hosted by the hub (self-replace + restart).")]
+    async fn update_agent(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        let url = format!("{}/x/update?target={}", self.hub.trim_end_matches('/'), urlencode(&base));
+        let text = self.client.get(url).send().await.map_err(err)?.text().await.map_err(err)?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(description = "Dissolve the agent on the device — stop it and remove its autostart (the binary is not deleted).")]
+    async fn dissolve_agent(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        let url = format!("{}/x/dissolve?target={}", self.hub.trim_end_matches('/'), urlencode(&base));
+        let text = self.client.get(url).send().await.map_err(err)?.text().await.map_err(err)?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(description = "Download a file from the device to the Mac. Returns the local path.")]
@@ -221,6 +288,34 @@ impl Srv {
             format!("[error] {}", out["error"].as_str().unwrap_or("failed"))
         };
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    }
+
+    #[tool(description = "Click at a position on the device's screen. x and y are fractions 0.0-1.0 from the top-left.")]
+    async fn click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        let btn = match a.button.as_deref() { Some("right") => 2, Some("middle") => 1, _ => 0 };
+        self.input(&base, serde_json::json!({"type":"down","button":btn,"x":a.x,"y":a.y})).await?;
+        self.input(&base, serde_json::json!({"type":"up","button":btn})).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("clicked at ({:.3}, {:.3})", a.x, a.y))]))
+    }
+
+    #[tool(description = "Type text on the device as keystrokes.")]
+    async fn type_text(&self, Parameters(a): Parameters<TypeArgs>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        for c in a.text.chars() {
+            let k = c.to_string();
+            self.input(&base, serde_json::json!({"type":"key","action":"down","key":k})).await?;
+            self.input(&base, serde_json::json!({"type":"key","action":"up","key":k})).await?;
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("typed {} chars", a.text.chars().count()))]))
+    }
+
+    #[tool(description = "Press a named key on the device (e.g. Enter, Tab, Escape, Backspace, ArrowDown).")]
+    async fn press_key(&self, Parameters(a): Parameters<KeyArgs>) -> Result<CallToolResult, ErrorData> {
+        let base = self.resolve(&a.device).await.map_err(err)?;
+        self.input(&base, serde_json::json!({"type":"key","action":"down","key":a.key})).await?;
+        self.input(&base, serde_json::json!({"type":"key","action":"up","key":a.key})).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("pressed {}", a.key))]))
     }
 }
 

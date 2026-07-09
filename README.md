@@ -53,7 +53,8 @@ binaries per OS to the release:
 Nothing to install to *run* them — they're static native binaries.
 
 ### Platform notes (runtime)
-- **Windows** — works out of the box.
+- **Windows** — works out of the box. The C runtime is **statically linked**
+  (`+crt-static`), so no Visual C++ Redistributable is required (no `VCRUNTIME140.dll`).
 - **macOS** — the agent needs **Screen Recording** and **Accessibility** permission
   (System Settings → Privacy & Security). Unsigned binary: right-click → Open the
   first time to clear Gatekeeper.
@@ -70,18 +71,33 @@ On Windows run:  HaiveControl.exe itays-macbook-pro
 ```
 Keep it running. Both machines must be on the **same LAN**.
 
-## Step 2 — run the agent on Windows
+## Step 2 — run the agent on the target
 
-```bat
-HaiveControl.exe itays-macbook-pro my-secret-password
+**The hub hosts the binaries**, so the target downloads and runs in one line — no manual
+copy. The dashboard shows a ready-made, per-OS command with a copy button. It downloads
+the file as **`airm`** and registers it. For example:
+
+```powershell
+# Windows (PowerShell or cmd) — works in both
+curl.exe -L -o airm.exe http://MAC_IP:8770/bin/HaiveControl-windows.exe
+.\airm.exe MAC_IP:8770 --id itays-macbook-pro
 ```
-(Windows shown; on macOS/Linux it's `./HaiveControl-macos itays-macbook-pro …`.)
-- 1st argument: the **Mac ID** from step 1.
-- 2nd argument (optional): a **password**. If given, the admin is prompted for it when
-  connecting. Omit it for an open LAN-only session.
+```bash
+# macOS / Linux
+curl -L -o airm http://MAC_IP:8770/bin/HaiveControl-macos && chmod +x airm
+./airm MAC_IP:8770 --id itays-macbook-pro
+```
 
-The first run triggers a **firewall** prompt — allow it on private networks. The agent
-finds the Mac by that id and registers itself.
+The target can be given by **direct IP** (`MAC_IP:8770`), by **Mac ID** (Bonjour
+`--id`), or both (IP first, Bonjour fallback). Append a **password** as a final argument
+to require auth. After registering, the agent prints **`ready`**. The first run triggers
+a **firewall** prompt — allow it on private networks.
+
+### Staying current
+The agent **auto-checks the hub for a newer build every 2 minutes** and self-updates in
+place. You can also push an update on demand from the dashboard (**Update**) or MCP
+(`update_agent`) — the agent replaces its own executable and relaunches with the same
+arguments.
 
 ### Lifetime modes
 Pick how long the agent sticks around (default = one-time):
@@ -131,19 +147,27 @@ Because the cert is self-signed, the first time you connect the browser shows a
 
 Set `SCREEN_TLS=0` to fall back to plain HTTP if you'd rather not deal with the cert.
 
-## Using it
+## Using it — the hub dashboard
 
-- **View:** the full screen streams live.
-- **Control:** the "control" checkbox (top bar) is on by default — move/click/scroll
-  and type go to the target machine. Uncheck to look without touching.
-- **Remote commands:** type in the bottom box, Enter runs it via the shell; output
-  appears in the overlay (toggle with the **output** button).
-- **File transfer:**
-  - *Upload* — pick a file and click **upload**. It lands in `SCREEN_SHARE` (or the
-    user's home dir if unset). The overlay shows the saved path.
-  - *Download* — type a path in the **download path** box and click **get**; the
-    browser downloads it. With `SCREEN_SHARE` set, paths are relative to that folder
-    and can't escape it (`..` is blocked); unset = any path the user can read.
+The dashboard is a single-page console: a **device sidebar** on the left, a **stage** on
+the right. Pick a device and everything happens in place — no new tabs. The sidebar
+polls every few seconds so status dots (online / idle / stale) and last-seen stay live
+without reloading (an active stream keeps playing).
+
+Per selected device you get its details (OS, CPU, memory, user, IPs, cameras, mics) and
+an action bar that renders results **in the stage viewport**:
+
+- **● Live screen** — the full screen streams live (MJPEG).
+- **● Cam live** — live webcam video. A **camera picker** chooses which camera; the
+  same picker feeds **Camera shot**.
+- **Screenshot** / **Camera shot** — a single fresh frame.
+- **Run…** — enter a command; stdout/stderr print to the inline console.
+- **Get file / Put file** — a remote **file browser** to download or upload.
+- **Update** — hot-update this agent to the hub's latest build.
+- **Dissolve** — stop the agent and remove its autostart (does not delete the binary).
+
+Uploads land in `SCREEN_SHARE` (or the user's home dir if unset); with `SCREEN_SHARE`
+set, browsing/downloads are confined to that folder (`..` is blocked).
 
 ## Run commands from the Mac (API + CLI)
 
@@ -175,10 +199,19 @@ Returns `{"ok":true,"code":0,"stdout":"…","stderr":"…"}`. Other endpoints:
 The `haive-mcp` binary wraps the same API as MCP tools, so an AI client (Claude Code,
 Claude Desktop, etc.) can operate a device by name. Tools exposed:
 
-- `list_devices()` — registered devices
-- `screenshot(device)` — returns the current screen as an image
+- `list_devices()` — registered devices, with full details (OS, CPU, memory, logged-in
+  user, IPs, cameras, microphones, last-seen)
+- `screenshot(device)` — the current screen as an image
+- `camera_snapshot(device, index?)` — a still from a connected webcam (pick which with `index`)
 - `run_command(device, command)` — run a shell command, get output
+- `click(device, x, y)` / `type_text(device, text)` / `press_key(device, key)` — drive mouse + keyboard
 - `download_file(device, remote_path, save_as?)` / `upload_file(device, local_path, remote_dir?)`
+- `update_agent(device)` — hot-update the agent to the hub's latest build
+- `dissolve_agent(device)` — stop the agent and remove its autostart
+
+Live video (screen and camera) streams as MJPEG in the browser dashboard; it isn't an
+MCP tool because a stream isn't a single tool response — use `screenshot` /
+`camera_snapshot` for AI-driven stills.
 
 ### One MCP server, many devices
 The hub tracks every registered agent, so a single `haive-mcp` controls them all —
@@ -238,11 +271,13 @@ point the shortcut at a small `.bat` that does `set SCREEN_PW=… & HaiveControl
 
 ## Layout (Rust workspace)
 - `crates/agent` → **`HaiveControl`** — the agent (Windows/macOS/Linux): screen capture,
-  `/frame`, `/input`, `/exec`, `/upload`, `/download`, viewer page; registers to the hub.
-  Modules: `capture` (xcap), `input` (enigo), `tls` (rcgen), `discovery` (mdns-sd),
-  `persistence`, `http`.
+  `/frame`, `/stream` (live MJPEG), `/camera` + `/camstream` (webcam), `/input`, `/exec`,
+  `/upload`, `/download`, `/list`, `/update`, `/dissolve`; registers to the hub and
+  reports full sysinfo. Modules: `capture` (xcap + nokhwa), `input` (enigo), `tls`
+  (rcgen), `discovery` (mdns-sd, self-update), `persistence`, `http`.
 - `crates/hub` → **`HaiveHub`** — the Mac hub: Bonjour advertise, `/register`, `/agents`,
-  dashboard.
+  the single-page dashboard, hosts the agent binaries (`/bin/*`), and proxies device
+  actions (`/x/*`, incl. live-stream passthrough).
 - `crates/cli` → **`haivectl`** — Mac CLI: `list` / `exec` / `get` / `put` by device name.
 - `crates/mcp` → **`haive-mcp`** — Mac MCP server: `list_devices` / `screenshot` /
   `run_command` / `download_file` / `upload_file` tools (rmcp).

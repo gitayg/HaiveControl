@@ -20,6 +20,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
+sysinfo = "0.33"
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
+self-replace = "1"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
