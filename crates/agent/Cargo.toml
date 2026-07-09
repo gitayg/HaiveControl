@@ -1,0 +1,25 @@
+[package]
+name = "haive-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "HaiveControl"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+enigo = "0.2"
+rcgen = "0.13"
+mdns-sd = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+ureq = { version = "2", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

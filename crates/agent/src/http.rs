@@ -1,0 +1,408 @@
+// HTTP(S) server: routing, auth, and the browser viewer page.
+use std::path::PathBuf;
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use base64::Engine;
+use tiny_http::{Header, Method, Request, Response, Server};
+
+use crate::capture::Grabber;
+use crate::input::Ev;
+
+type Resp = Response<std::io::Cursor<Vec<u8>>>;
+
+pub struct Config {
+    pub password: String,
+    pub port: u16,
+    pub quality: u8,
+    pub max_width: u32,
+    pub exec_enabled: bool,
+    pub tls: bool,
+    pub share: String,
+    pub grabber: Grabber,
+    pub cert: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
+    let server = Arc::new(build_server(&cfg));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let (s, c, tx) = (server.clone(), cfg.clone(), input_tx.clone());
+        handles.push(std::thread::spawn(move || loop {
+            match s.recv() {
+                Ok(req) => handle(req, &c, &tx),
+                Err(_) => break,
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+fn build_server(cfg: &Config) -> Server {
+    let addr = format!("0.0.0.0:{}", cfg.port);
+    if cfg.tls {
+        let (c, k) = cfg.cert.clone().expect("tls enabled without cert");
+        Server::https(
+            addr,
+            tiny_http::SslConfig { certificate: c, private_key: k },
+        )
+        .expect("bind https")
+    } else {
+        Server::http(addr).expect("bind http")
+    }
+}
+
+fn hdr(k: &str, v: &str) -> Header {
+    Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap()
+}
+
+fn header_value(req: &Request, name: &'static str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+fn authorized(req: &Request, cfg: &Config) -> bool {
+    if cfg.password.is_empty() {
+        return true;
+    }
+    if let Some(v) = header_value(req, "Authorization") {
+        if let Some(b64) = v.strip_prefix("Basic ") {
+            if let Ok(dec) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                if let Ok(s) = String::from_utf8(dec) {
+                    if let Some((_, pass)) = s.split_once(':') {
+                        return pass == cfg.password;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn json_resp(v: &serde_json::Value, code: u16) -> Resp {
+    Response::from_string(v.to_string())
+        .with_status_code(code)
+        .with_header(hdr("Content-Type", "application/json"))
+}
+
+fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
+    if !authorized(&req, cfg) {
+        let _ = req.respond(
+            Response::from_string("Authentication required")
+                .with_status_code(401)
+                .with_header(hdr("WWW-Authenticate", "Basic realm=\"HaiveControl\"")),
+        );
+        return;
+    }
+    let method = req.method().clone();
+    let url = req.url().to_string();
+    let path = url.split('?').next().unwrap_or("/").to_string();
+    let resp = match (&method, path.as_str()) {
+        (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
+        (Method::Get, "/frame") => match cfg.grabber.grab_jpeg(cfg.quality, cfg.max_width) {
+            Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+            None => Response::from_string("capture failed").with_status_code(500),
+        },
+        (Method::Post, "/input") => {
+            input_ep(&mut req, tx);
+            Response::from_string("").with_status_code(204)
+        }
+        (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Get, "/download") => download_ep(&url, cfg),
+        (Method::Post, "/upload") => upload_ep(&mut req, cfg),
+        _ => Response::from_string("not found").with_status_code(404),
+    };
+    let _ = req.respond(resp);
+}
+
+fn input_ep(req: &mut Request, tx: &Sender<Ev>) {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(ev) = parse_ev(&v) {
+            let _ = tx.send(ev);
+        }
+    }
+}
+
+fn parse_ev(v: &serde_json::Value) -> Option<Ev> {
+    let t = v.get("type")?.as_str()?;
+    let x = v.get("x").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    let y = v.get("y").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    let btn = v.get("button").and_then(|n| n.as_u64()).unwrap_or(0) as u8;
+    Some(match t {
+        "move" => Ev::Move(x, y),
+        "down" => Ev::Down(btn, x, y),
+        "up" => Ev::Up(btn),
+        "scroll" => Ev::Scroll(v.get("dy").and_then(|n| n.as_i64()).unwrap_or(0) as i32),
+        "key" => Ev::Key(
+            v.get("action").and_then(|a| a.as_str()) == Some("down"),
+            v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string(),
+        ),
+        _ => return None,
+    })
+}
+
+fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
+    if !cfg.exec_enabled {
+        return json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403);
+    }
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let cmd = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let cmd = cmd.trim().to_string();
+    if cmd.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "empty command"}), 400);
+    }
+    let out = if cfg!(windows) {
+        std::process::Command::new("cmd").arg("/C").arg(&cmd).output()
+    } else {
+        std::process::Command::new("sh").arg("-c").arg(&cmd).output()
+    };
+    match out {
+        Ok(o) => json_resp(
+            &serde_json::json!({
+                "ok": true,
+                "code": o.status.code().unwrap_or(-1),
+                "stdout": String::from_utf8_lossy(&o.stdout),
+                "stderr": String::from_utf8_lossy(&o.stderr),
+            }),
+            200,
+        ),
+        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+    }
+}
+
+fn resolve_path(cfg: &Config, path: &str) -> Option<PathBuf> {
+    if !cfg.share.is_empty() {
+        if path.contains("..") {
+            return None;
+        }
+        Some(PathBuf::from(expand_tilde(&cfg.share)).join(path))
+    } else {
+        Some(PathBuf::from(expand_tilde(path)))
+    }
+}
+
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            return format!("{home}/{rest}");
+        }
+    }
+    p.to_string()
+}
+
+fn download_ep(url: &str, cfg: &Config) -> Resp {
+    let query = url.split('?').nth(1).unwrap_or("");
+    let mut path = String::new();
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("path=") {
+            path = percent_decode(v);
+        }
+    }
+    match resolve_path(cfg, &path) {
+        Some(full) if full.is_file() => match std::fs::read(&full) {
+            Ok(bytes) => {
+                let fname = full
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "download".to_string());
+                Response::from_data(bytes)
+                    .with_header(hdr("Content-Type", "application/octet-stream"))
+                    .with_header(hdr(
+                        "Content-Disposition",
+                        &format!("attachment; filename=\"{fname}\""),
+                    ))
+            }
+            Err(_) => json_resp(&serde_json::json!({"ok": false, "error": "read failed"}), 500),
+        },
+        _ => json_resp(&serde_json::json!({"ok": false, "error": "not a file"}), 404),
+    }
+}
+
+fn upload_ep(req: &mut Request, cfg: &Config) -> Resp {
+    let boundary = header_value(req, "Content-Type")
+        .and_then(|ct| ct.split("boundary=").nth(1).map(|s| s.to_string()));
+    let boundary = match boundary {
+        Some(b) => b,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no multipart boundary"}), 400),
+    };
+    let mut body = Vec::new();
+    let _ = req.as_reader().read_to_end(&mut body);
+    let (file, dir) = parse_multipart(&body, &boundary);
+    let (fname, data) = match file {
+        Some(f) => f,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no file"}), 400),
+    };
+    let target = dir.filter(|d| !d.is_empty()).unwrap_or_else(|| {
+        if cfg.share.is_empty() {
+            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default()
+        } else {
+            cfg.share.clone()
+        }
+    });
+    let dest_dir = match resolve_path(cfg, &target) {
+        Some(d) if d.is_dir() => d,
+        _ => return json_resp(&serde_json::json!({"ok": false, "error": "target dir not found"}), 400),
+    };
+    let basename = std::path::Path::new(&fname)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or(fname);
+    let dest = dest_dir.join(basename);
+    match std::fs::write(&dest, &data) {
+        Ok(_) => json_resp(&serde_json::json!({"ok": true, "saved": dest.to_string_lossy()}), 200),
+        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+    }
+}
+
+fn parse_multipart(body: &[u8], boundary: &str) -> (Option<(String, Vec<u8>)>, Option<String>) {
+    let delim = format!("--{boundary}").into_bytes();
+    let mut file = None;
+    let mut dir = None;
+    for part in split_on(body, &delim) {
+        let part = part.strip_prefix(b"\r\n").unwrap_or(part);
+        if let Some(idx) = find(part, b"\r\n\r\n") {
+            let (head, rest) = part.split_at(idx);
+            let content = &rest[4..];
+            let content = content.strip_suffix(b"\r\n").unwrap_or(content);
+            let head_s = String::from_utf8_lossy(head);
+            if head_s.contains("name=\"file\"") {
+                let fname = head_s
+                    .split("filename=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .unwrap_or("upload.bin")
+                    .to_string();
+                file = Some((fname, content.to_vec()));
+            } else if head_s.contains("name=\"dir\"") {
+                dir = Some(String::from_utf8_lossy(content).trim().to_string());
+            }
+        }
+    }
+    (file, dir)
+}
+
+fn split_on<'a>(data: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + sep.len() <= data.len() {
+        if &data[i..i + sep.len()] == sep {
+            parts.push(&data[start..i]);
+            i += sep.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(&data[start..]);
+    parts
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(n) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(n);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+pub const PAGE: &str = r####"<!doctype html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HaiveControl</title>
+<style>
+ html,body{margin:0;background:#111;color:#ddd;font-family:system-ui,sans-serif}
+ #screen{display:block;max-width:100%;height:auto;cursor:crosshair;margin:0 auto}
+ #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;align-items:center;
+      padding:6px;background:#000c;backdrop-filter:blur(4px)}
+ #cmd{flex:1;background:#1c1c1c;color:#eee;border:1px solid #444;padding:7px;
+      font-family:ui-monospace,monospace;border-radius:4px}
+ #out{position:fixed;right:8px;bottom:50px;max-width:46%;max-height:42%;overflow:auto;
+      background:#000d;color:#4ade80;font-family:ui-monospace,monospace;font-size:12px;
+      padding:10px;white-space:pre-wrap;border-radius:6px;display:none}
+ button,label{background:#2a2a2a;color:#eee;border:1px solid #555;padding:7px 11px;
+      border-radius:4px;cursor:pointer;font-size:13px}
+</style></head><body>
+<img id="screen" src="/frame">
+<pre id="out"></pre>
+<div id="bar">
+  <label><input type="checkbox" id="ctrl" checked> control</label>
+  <input id="cmd" placeholder="remote command (Enter to run)…" autocomplete="off">
+  <input type="file" id="file" style="max-width:150px">
+  <button id="upbtn">upload</button>
+  <input id="dlpath" placeholder="download path…" autocomplete="off" style="max-width:150px">
+  <button id="dlbtn">get</button>
+  <button id="outbtn">output</button>
+</div>
+<script>
+const img=document.getElementById('screen'),cmd=document.getElementById('cmd'),
+      out=document.getElementById('out'),ctrl=document.getElementById('ctrl');
+const on=()=>ctrl.checked;
+function refresh(){const n=new Image();
+  n.onload=()=>{img.src=n.src;setTimeout(refresh,90);};
+  n.onerror=()=>setTimeout(refresh,600);
+  n.src='/frame?t='+Date.now();}
+refresh();
+function norm(e){const r=img.getBoundingClientRect();
+  return {x:Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),
+          y:Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))};}
+function send(ev){fetch('/input',{method:'POST',
+  headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)});}
+let last=0;
+img.addEventListener('mousemove',e=>{if(!on())return;const t=Date.now();
+  if(t-last<45)return;last=t;const p=norm(e);send({type:'move',x:p.x,y:p.y});});
+img.addEventListener('mousedown',e=>{if(!on())return;e.preventDefault();const p=norm(e);
+  send({type:'down',button:e.button,x:p.x,y:p.y});});
+img.addEventListener('mouseup',e=>{if(!on())return;e.preventDefault();const p=norm(e);
+  send({type:'up',button:e.button,x:p.x,y:p.y});});
+img.addEventListener('contextmenu',e=>e.preventDefault());
+img.addEventListener('wheel',e=>{if(!on())return;e.preventDefault();
+  send({type:'scroll',dy:-Math.sign(e.deltaY)*3});},{passive:false});
+document.addEventListener('keydown',e=>{if(!on()||document.activeElement===cmd)return;
+  e.preventDefault();send({type:'key',action:'down',key:e.key});});
+document.addEventListener('keyup',e=>{if(!on()||document.activeElement===cmd)return;
+  e.preventDefault();send({type:'key',action:'up',key:e.key});});
+cmd.addEventListener('keydown',e=>{if(e.key==='Enter'){const c=cmd.value;cmd.value='';run(c);}});
+document.getElementById('outbtn').onclick=()=>{
+  out.style.display=out.style.display==='none'?'block':'none';};
+document.getElementById('upbtn').onclick=async()=>{
+  const f=document.getElementById('file').files[0];if(!f)return;
+  out.style.display='block';out.textContent='uploading '+f.name+'…';
+  const fd=new FormData();fd.append('file',f);
+  try{const r=await fetch('/upload',{method:'POST',body:fd});const j=await r.json();
+    out.textContent=j.ok?('uploaded → '+j.saved):('[error] '+(j.error||'failed'));}
+  catch(err){out.textContent='[error] '+err;}};
+document.getElementById('dlbtn').onclick=()=>{
+  const p=document.getElementById('dlpath').value.trim();if(!p)return;
+  window.open('/download?path='+encodeURIComponent(p),'_blank');};
+async function run(c){if(!c)return;out.style.display='block';out.textContent='$ '+c+'\n…';
+  try{const r=await fetch('/exec',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:c})});
+  const j=await r.json();
+  out.textContent='$ '+c+'\n'+(j.ok?((j.stdout||'')+(j.stderr||'')||'(exit '+j.code+')')
+    :('[error] '+(j.error||'failed')));}
+  catch(err){out.textContent='$ '+c+'\n[error] '+err;}}
+</script></body></html>"####;

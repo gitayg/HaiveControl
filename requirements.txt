@@ -1,6 +1,0 @@
-flask
-mss
-pillow
-pynput
-zeroconf
-cryptography

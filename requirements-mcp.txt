@@ -1,2 +1,0 @@
-# Mac-side MCP server only (not needed on target devices).
-mcp
