@@ -1,0 +1,135 @@
+// Standard, visible autostart per OS. Nothing hidden; uninstall removes it.
+use std::env;
+#[allow(unused_imports)]
+use std::path::{Path, PathBuf};
+
+pub fn boot_args(mac_id: &str, password: &Option<String>, name: &Option<String>) -> Vec<String> {
+    let mut v = vec![mac_id.to_string()];
+    if let Some(p) = password {
+        v.push(p.clone());
+    }
+    if let Some(n) = name {
+        v.push("--name".to_string());
+        v.push(n.clone());
+    }
+    v
+}
+
+pub fn install(args: &[String]) {
+    let exe = env::current_exe().unwrap_or_default();
+    #[cfg(windows)]
+    win_install(&exe, args);
+    #[cfg(target_os = "macos")]
+    mac_install(&exe, args);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux_install(&exe, args);
+    let _ = (&exe, args);
+}
+
+pub fn uninstall() {
+    #[cfg(windows)]
+    win_uninstall();
+    #[cfg(target_os = "macos")]
+    mac_uninstall();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux_uninstall();
+}
+
+fn home() -> String {
+    env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_default()
+}
+
+// ---- macOS: LaunchAgent ----
+#[cfg(target_os = "macos")]
+fn plist_path() -> PathBuf {
+    PathBuf::from(home()).join("Library/LaunchAgents/com.haive.agent.plist")
+}
+
+#[cfg(target_os = "macos")]
+fn mac_install(exe: &Path, args: &[String]) {
+    let mut pa = format!("      <string>{}</string>\n", exe.display());
+    for a in args {
+        pa.push_str(&format!("      <string>{a}</string>\n"));
+    }
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.haive.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
+    );
+    let p = plist_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, plist);
+    let _ = std::process::Command::new("launchctl")
+        .args(["load", &p.to_string_lossy()])
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+fn mac_uninstall() {
+    let p = plist_path();
+    let _ = std::process::Command::new("launchctl")
+        .args(["unload", &p.to_string_lossy()])
+        .status();
+    let _ = std::fs::remove_file(&p);
+}
+
+// ---- Linux: XDG autostart ----
+#[cfg(all(unix, not(target_os = "macos")))]
+fn desktop_path() -> PathBuf {
+    PathBuf::from(home()).join(".config/autostart/haivecontrol.desktop")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_install(exe: &Path, args: &[String]) {
+    let mut ex = format!("{}", exe.display());
+    for a in args {
+        ex.push(' ');
+        ex.push_str(a);
+    }
+    let entry = format!(
+        "[Desktop Entry]\nType=Application\nName=HaiveControl\nExec={ex}\nX-GNOME-Autostart-enabled=true\n"
+    );
+    let p = desktop_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, entry);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_uninstall() {
+    let _ = std::fs::remove_file(desktop_path());
+}
+
+// ---- Windows: HKCU Run ----
+#[cfg(windows)]
+fn win_install(exe: &Path, args: &[String]) {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(key) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        KEY_SET_VALUE,
+    ) {
+        let mut cmd = format!("\"{}\"", exe.display());
+        for a in args {
+            cmd.push_str(&format!(" \"{a}\""));
+        }
+        let _ = key.set_value("HaiveControl", &cmd);
+    }
+}
+
+#[cfg(windows)]
+fn win_uninstall() {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(key) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        KEY_SET_VALUE,
+    ) {
+        let _ = key.delete_value("HaiveControl");
+    }
+}
