@@ -36,6 +36,7 @@ jobs:
           libxdo-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
           libx11-dev libxtst-dev libdbus-1-dev pkg-config
           libwayland-dev libxkbcommon-dev
+          libpipewire-0.3-dev libclang-dev
 
       - name: Build all binaries
         run: cargo build --release
