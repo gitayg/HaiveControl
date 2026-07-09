@@ -6,3 +6,5 @@ dist/
 .remotescreen/
 .haive/
 out/
+target/
+Cargo.lock
