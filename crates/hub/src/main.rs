@@ -13,7 +13,7 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tiny_http::{Header, Method, Request, Response, Server};
 
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "2.0.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
