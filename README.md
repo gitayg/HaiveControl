@@ -19,7 +19,7 @@ or an **MCP-enabled AI** — nothing to install on the viewing side.
 ## How it works
 
 ```
-  Mac:      python3 hub.py          → prints  "Mac ID: itays-macbook-pro"
+  Mac:      HaiveHub                 → prints  "Mac ID: itays-macbook-pro"
   Windows:  HaiveControl.exe itays-macbook-pro
                  └─ finds the Mac by that id (Bonjour), registers itself,
                     then serves screen + control + shell on port 8765
@@ -28,33 +28,41 @@ or an **MCP-enabled AI** — nothing to install on the viewing side.
 
 The only thing you configure on Windows is **one argument: the Mac's ID**.
 
-## Getting the binaries (CI builds all three platforms)
+## Built in Rust
 
-Push this folder to a GitHub repo. `.github/workflows/build.yml` runs a
-**Windows + macOS + Linux** matrix and builds two single-file binaries per OS —
-the agent (`HaiveControl`) and the hub (`HaiveHub`):
+HaiveControl is a Rust workspace producing four small, dependency-free binaries:
 
-- Tag a release: `git tag v1.0.0 && git push --tags` → binaries are attached to the
-  GitHub Release (e.g. `HaiveControl-windows.exe`, `HaiveControl-macos`,
-  `HaiveControl-linux`, plus the `HaiveHub-*` set).
-- Or run the **build** workflow manually (workflow_dispatch) → download from the run's
-  Artifacts.
+| Binary | Role | ~size |
+|---|---|---|
+| `HaiveControl` | agent (runs on each device) | 5 MB |
+| `HaiveHub` | hub (runs on the Mac) | 3 MB |
+| `haivectl` | CLI (Mac) | 5 MB |
+| `haive-mcp` | MCP server (Mac) | 6 MB |
 
-No Python needed on any target machine to *run* them. To build the agent locally on
-Windows instead, `build.bat` still works.
+**Build from source:** `cargo build --release` → binaries land in `target/release/`.
+
+**CI builds all three platforms.** `.github/workflows/build.yml` runs a
+**Windows + macOS + Linux** matrix (`cargo build --release`) and attaches all four
+binaries per OS to the release:
+
+- Tag a release: `git tag v1.0.0 && git push --tags` → e.g. `HaiveControl-windows.exe`,
+  `HaiveControl-macos`, `HaiveControl-linux`, plus the `HaiveHub-*`, `haivectl-*`,
+  `haive-mcp-*` sets.
+- Or run the **build** workflow manually (workflow_dispatch) → download from Artifacts.
+
+Nothing to install to *run* them — they're static native binaries.
 
 ### Platform notes (runtime)
 - **Windows** — works out of the box.
 - **macOS** — the agent needs **Screen Recording** and **Accessibility** permission
   (System Settings → Privacy & Security). Unsigned binary: right-click → Open the
   first time to clear Gatekeeper.
-- **Linux** — needs an **X11** session (mss/pynput don't support Wayland). Install
-  `libx11`/`libxtst` if missing.
+- **Linux** — needs an **X11** session (Wayland unsupported by the capture/input
+  crates). Build deps: `libxdo-dev libxcb1-dev libx11-dev libxtst-dev`.
 
 ## Step 1 — start the hub on the Mac
 
-Double-click `run_hub.command` (or `python3 hub.py`). It prints your **Mac ID** and a
-dashboard URL, e.g.:
+Run `HaiveHub` (`./HaiveHub-macos`). It prints your **Mac ID** and a dashboard URL, e.g.:
 ```
 Mac ID:  itays-macbook-pro
 Dashboard: http://localhost:8770/
@@ -142,14 +150,14 @@ Set `SCREEN_TLS=0` to fall back to plain HTTP if you'd rather not deal with the 
 Everything the browser does is a plain HTTP API on the agent, so you can drive a
 device from a script. Two ways:
 
-**`haivectl.py` (recommended)** — resolves the device through the hub by name, so you
+**`haivectl` (recommended)** — resolves the device through the hub by name, so you
 never type its IP:
 
 ```bash
-python3 haivectl.py list                          # list registered devices
-python3 haivectl.py exec mymac "ipconfig /all"    # run a command, print output
-python3 haivectl.py get  mymac C:\logs\app.log    # download a file
-python3 haivectl.py put  mymac ./patch.zip C:\tmp # upload a file
+haivectl list                          # list registered devices
+haivectl exec mymac "ipconfig /all"    # run a command, print output
+haivectl get  mymac C:\logs\app.log    # download a file
+haivectl put  mymac ./patch.zip C:\tmp # upload a file
 ```
 Global flags come **before** the subcommand: `--hub` (default `http://localhost:8770`),
 `--password` (if the agent set one), `--cafile` (agent `cert.pem` to verify TLS).
@@ -164,8 +172,8 @@ Returns `{"ok":true,"code":0,"stdout":"…","stderr":"…"}`. Other endpoints:
 
 ## Use it as an MCP server (drive devices from an AI)
 
-`mcp_server.py` wraps the same API as MCP tools, so an AI client (Claude Code, Claude
-Desktop, etc.) can operate a device by name. Tools exposed:
+The `haive-mcp` binary wraps the same API as MCP tools, so an AI client (Claude Code,
+Claude Desktop, etc.) can operate a device by name. Tools exposed:
 
 - `list_devices()` — registered devices
 - `screenshot(device)` — returns the current screen as an image
@@ -173,7 +181,7 @@ Desktop, etc.) can operate a device by name. Tools exposed:
 - `download_file(device, remote_path, save_as?)` / `upload_file(device, local_path, remote_dir?)`
 
 ### One MCP server, many devices
-The hub tracks every registered agent, so a single `mcp_server.py` controls them all —
+The hub tracks every registered agent, so a single `haive-mcp` controls them all —
 just run the agent on each device with the **same Mac ID**. They each register and you
 target them by name: `run_command("linux-box", …)`, `screenshot("macmini")`. Give each
 a clear label with `--name` (or `SCREEN_NAME`) so they're easy to tell apart:
@@ -182,11 +190,10 @@ a clear label with `--name` (or `SCREEN_NAME`) so they're easy to tell apart:
 HaiveControl.exe mymac secret --name reception-pc
 ```
 
-Runs on the Mac next to the hub. Install its one dependency and register it:
+Runs on the Mac next to the hub. Register the binary:
 
 ```bash
-pip install -r requirements-mcp.txt
-claude mcp add haive -- python3 /full/path/to/mcp_server.py
+claude mcp add haive -- /full/path/to/haive-mcp
 ```
 
 Config via env (set in your MCP client, or export before launch): `HAIVE_HUB`
@@ -229,20 +236,17 @@ point the shortcut at a small `.bat` that does `set SCREEN_PW=… & HaiveControl
   browser before reaching the remote. Use the command box for those cases.
 - Intended for **your own devices**. Don't deploy it to watch someone without consent.
 
-## Files
-- `hub.py` / `run_hub.command` — **Mac** hub: advertises the Mac ID, collects
-  registrations, serves the dashboard
-- `server.py` — the **agent** (Windows/macOS/Linux): MJPEG stream, `/input`, `/exec`,
-  `/upload`, `/download`, viewer page; registers to the hub
-- `capture.py` — screen grab → JPEG
-- `input_control.py` — mouse/keyboard injection (pynput)
-- `discovery.py` — Bonjour advertise (hub) + resolve (agent)
-- `tls.py` — self-signed certificate generation (agent HTTPS)
-- `persistence.py` — autostart install/uninstall (`--persist` / `--ttl` / `--uninstall`)
-- `haivectl.py` — **Mac** CLI: `list` / `exec` / `get` / `put` against a device by name
-- `mcp_server.py` — **Mac** MCP server: `list_devices` / `screenshot` / `run_command` /
-  `download_file` / `upload_file` tools (deps in `requirements-mcp.txt`)
-- `build.bat` / `.github/workflows/build.yml` — single-exe build (local / CI)
+## Layout (Rust workspace)
+- `crates/agent` → **`HaiveControl`** — the agent (Windows/macOS/Linux): screen capture,
+  `/frame`, `/input`, `/exec`, `/upload`, `/download`, viewer page; registers to the hub.
+  Modules: `capture` (xcap), `input` (enigo), `tls` (rcgen), `discovery` (mdns-sd),
+  `persistence`, `http`.
+- `crates/hub` → **`HaiveHub`** — the Mac hub: Bonjour advertise, `/register`, `/agents`,
+  dashboard.
+- `crates/cli` → **`haivectl`** — Mac CLI: `list` / `exec` / `get` / `put` by device name.
+- `crates/mcp` → **`haive-mcp`** — Mac MCP server: `list_devices` / `screenshot` /
+  `run_command` / `download_file` / `upload_file` tools (rmcp).
+- `.github/workflows/build.yml` — `cargo build --release` matrix (Windows/macOS/Linux).
 
 ## License
 

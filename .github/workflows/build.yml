@@ -23,36 +23,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Linux screen-capture deps
+      - name: Linux capture/input build deps
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst6
-
-      - run: pip install -r requirements.txt pyinstaller
-
-      - name: Build agent
         run: >
-          pyinstaller --onefile --name HaiveControl
-          --hidden-import zeroconf._utils.ipaddress
-          --hidden-import zeroconf._handlers.answers
-          server.py
+          sudo apt-get update && sudo apt-get install -y
+          libxdo-dev libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+          libx11-dev libxtst-dev libdbus-1-dev pkg-config
 
-      - name: Build hub
-        run: >
-          pyinstaller --onefile --name HaiveHub
-          --hidden-import zeroconf._utils.ipaddress
-          --hidden-import zeroconf._handlers.answers
-          hub.py
+      - name: Build all binaries
+        run: cargo build --release
 
       - name: Collect artifacts
         shell: bash
         run: |
           mkdir out
-          cp "dist/HaiveControl${{ matrix.ext }}"    "out/HaiveControl-${{ matrix.suffix }}${{ matrix.ext }}"
-          cp "dist/HaiveHub${{ matrix.ext }}" "out/HaiveHub-${{ matrix.suffix }}${{ matrix.ext }}"
+          for b in HaiveControl HaiveHub haivectl haive-mcp; do
+            cp "target/release/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
