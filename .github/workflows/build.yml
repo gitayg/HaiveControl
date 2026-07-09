@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows
+            ext: ".exe"
+          - os: macos-latest
+            suffix: macos
+            ext: ""
+          - os: ubuntu-latest
+            suffix: linux
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linux screen-capture deps
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxtst6
+
+      - run: pip install -r requirements.txt pyinstaller
+
+      - name: Build agent
+        run: >
+          pyinstaller --onefile --name HaiveControl
+          --hidden-import zeroconf._utils.ipaddress
+          --hidden-import zeroconf._handlers.answers
+          server.py
+
+      - name: Build hub
+        run: >
+          pyinstaller --onefile --name HaiveHub
+          --hidden-import zeroconf._utils.ipaddress
+          --hidden-import zeroconf._handlers.answers
+          hub.py
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir out
+          cp "dist/HaiveControl${{ matrix.ext }}"    "out/HaiveControl-${{ matrix.suffix }}${{ matrix.ext }}"
+          cp "dist/HaiveHub${{ matrix.ext }}" "out/HaiveHub-${{ matrix.suffix }}${{ matrix.ext }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HaiveControl-${{ matrix.suffix }}
+          path: out/*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: out/*
