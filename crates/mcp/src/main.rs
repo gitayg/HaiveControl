@@ -167,7 +167,14 @@ impl Srv {
             exact
         };
         match m.len() {
-            0 => Err(format!("no device matching '{name}' — call list_devices first")),
+            0 if agents.is_empty() => Err(format!(
+                "no devices visible for this owner ('{}'). Check HIVE_OWNER matches how the device was enrolled (--owner …), or unset it to see all.",
+                self.owner
+            )),
+            0 => Err(format!(
+                "no device matching '{name}'. Visible devices: {}",
+                agents.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ")
+            )),
             1 => Ok(m[0].target()),
             _ => Err(format!("ambiguous device: {}", m.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", "))),
         }
