@@ -182,6 +182,11 @@ shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's det
 an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
 run command, input, …) and which owner made them. So you can watch agents work in real time.
 
+**Audit log.** The sidebar's **📋 Audit log** opens a running record of every device action —
+each row is *when · via (browser/MCP) · action · device · who · detail* (e.g. the exact
+command run). It's scoped to your account (you see actions on your own devices) and updates
+live. Recorded server-side (in memory, last 500 events).
+
 ## Run commands from the Mac (API + CLI)
 
 Everything the browser does is a plain HTTP API on the agent, so you can drive a

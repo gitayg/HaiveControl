@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.6";
+const VERSION: &str = "2.2.7";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -89,6 +89,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                 return;
             }
+            if auditable(&path) {
+                audit(user.as_deref().unwrap_or(""), "browser", action_label(&path), &device_name(agents, &t), "");
+            }
         }
     }
     // /m/* is the token-authed MCP API (a headless MCP can't pass SSO either, so
@@ -112,6 +115,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                     return;
                 }
                 record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""));
+                if auditable(&path) {
+                    audit(mowner.as_deref().unwrap_or(""), "mcp", action_label(&path), &device_name(agents, &t), "");
+                }
             }
         }
     }
@@ -134,6 +140,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             Response::from_string("").with_status_code(204)
         }
         (Method::Get, "/agents") => json_agents(agents, user.as_deref()),
+        (Method::Get, "/audit") => json_audit(user.as_deref()),
         (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
         (Method::Post, "/relay/hello") => {
             let mut body = String::new();
@@ -246,6 +253,63 @@ fn mcp_action(path: &str) -> &'static str {
         "/m/input" => "input",
         _ => "access",
     }
+}
+
+/// The registered `name` for a proxy target (falls back to its key).
+fn device_name(agents: &Agents, target: &str) -> String {
+    let key = device_key(target);
+    agents
+        .lock()
+        .unwrap()
+        .get(&key)
+        .and_then(|a| a.data.get("name").and_then(|n| n.as_str()).map(String::from))
+        .unwrap_or(key)
+}
+
+// Audit log: (when, actor, source, action, device, detail), newest first.
+type AuditEvent = (Instant, String, String, String, String, String);
+
+fn audit_log() -> &'static Mutex<std::collections::VecDeque<AuditEvent>> {
+    static A: std::sync::OnceLock<Mutex<std::collections::VecDeque<AuditEvent>>> = std::sync::OnceLock::new();
+    A.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
+}
+
+fn audit(actor: &str, source: &str, action: &str, device: &str, detail: &str) {
+    let mut m = audit_log().lock().unwrap();
+    m.push_front((
+        Instant::now(),
+        actor.to_string(),
+        source.to_string(),
+        action.to_string(),
+        device.to_string(),
+        detail.chars().take(180).collect(),
+    ));
+    m.truncate(500);
+}
+
+/// Human label for an auditable action path (`/x/*` or `/m/*`).
+fn action_label(path: &str) -> &'static str {
+    let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
+    match p {
+        "/frame" => "screenshot",
+        "/camera" => "camera photo",
+        "/stream" => "live screen",
+        "/camstream" => "live camera",
+        "/exec" => "run command",
+        "/input" => "input",
+        "/download" => "download file",
+        "/upload" => "upload file",
+        "/update" => "update agent",
+        "/dissolve" => "dissolve agent",
+        "/shell/open" => "open shell",
+        _ => "access",
+    }
+}
+
+/// Whether a device-action path is worth an audit entry (skips noisy polls).
+fn auditable(path: &str) -> bool {
+    let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
+    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open")
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -528,6 +592,7 @@ fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: b
         record_mcp_access(target, "run command", user.unwrap_or(""));
     }
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
+    audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, "run command", &device_name(agents, target), cmd);
     let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
     match dev_unary(target, "POST", "/exec", Some(("application/json".into(), payload))) {
         Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "application/json")),
@@ -545,6 +610,8 @@ fn proxy_input(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     }
     record_mcp_access(target, "input", user.unwrap_or(""));
     let ev = v.get("ev").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let ev_kind = ev.get("type").and_then(|x| x.as_str()).unwrap_or("input");
+    audit(user.unwrap_or(""), "mcp", "input", &device_name(agents, target), ev_kind);
     match dev_unary(target, "POST", "/input", Some(("application/json".into(), ev.to_string().into_bytes()))) {
         Some(_) => Response::from_string("").with_status_code(204),
         None => json_resp(&serde_json::json!({"ok": false, "error": "device unreachable"})),
@@ -728,6 +795,27 @@ fn json_agents(agents: &Agents, user: Option<&str>) -> Resp {
     json_resp(&serde_json::json!({"agents": live(agents, user)}))
 }
 
+/// Audit events, scoped to the requesting user (all when no user context).
+fn json_audit(user: Option<&str>) -> Resp {
+    let now = Instant::now();
+    let events: Vec<serde_json::Value> = audit_log()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, actor, ..)| match user {
+            None => true,
+            Some(u) => actor == u,
+        })
+        .map(|(at, actor, source, action, device, detail)| {
+            serde_json::json!({
+                "secs": now.duration_since(*at).as_secs(),
+                "actor": actor, "source": source, "action": action, "device": device, "detail": detail
+            })
+        })
+        .collect();
+    json_resp(&serde_json::json!({"audit": events}))
+}
+
 fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: Option<&str>) -> Resp {
     // When the hub is reachable at a public URL (a cloud deploy), show relay-mode
     // install commands (device dials out); otherwise LAN-mode (hub reaches in).
@@ -773,11 +861,13 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code>{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
 <div class=\"legend\"><span><span class=\"dot on\"></span>online</span><span><span class=\"dot idle\"></span>idle</span><span><span class=\"dot off\"></span>stale</span></div>\
 <ul id=\"devlist\" class=\"devlist\"></ul>\
+<button class=\"addbtn\" onclick=\"showAudit()\">📋 Audit log</button>\
 <button class=\"addbtn\" onclick=\"toggleReg()\">+ Register a device</button>\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><p class=\"reg-hint\">Download the agent, then run it:</p>{win}{mac}{lin}</div>\
 </aside>\
 <main class=\"stage\">\
 <div class=\"stage-empty\" id=\"stage-empty\">Select a device from the left to control it.</div>\
+<div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account</span></div><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
 <div id=\"detail\" style=\"display:none\">\
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
 <a class=\"dh-open\" id=\"d-open\" target=\"_blank\">Open agent&nbsp;↗</a></div>\
@@ -834,6 +924,19 @@ pre{margin:0}
 .act-act{color:#c3c9d8;min-width:120px}
 .act-by{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .act-ago{font-variant-numeric:tabular-nums;flex:none}
+.aud-head{font-size:16px;font-weight:700;margin-bottom:12px}
+.aud-cols,.aud-row{display:grid;grid-template-columns:78px 62px 130px 130px 150px 1fr;gap:12px;align-items:center;padding:7px 8px}
+.aud-cols{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.5px;border-bottom:1px solid var(--line2)}
+.aud-row{font-size:12px;border-bottom:1px solid var(--line)}
+.aud-row:hover{background:var(--surface2)}
+.aud-when,.aud-actor{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aud-src{font-size:9px;text-transform:uppercase;font-weight:700;padding:2px 0;border-radius:5px;text-align:center}
+.aud-src.mcp{background:rgba(91,157,255,.16);color:var(--accent)}
+.aud-src.browser{background:var(--surface2);color:var(--muted)}
+.aud-act{color:#d7dbe6;font-weight:600}
+.aud-dev{color:#c3c9d8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aud-detail{color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.aud-empty{color:var(--muted2);padding:18px 8px;font-size:13px}
 .dl-load.warn{color:var(--idle)}
 .dl-load.hot{color:var(--danger)}
 .empty-li{color:var(--muted);font-size:12px;padding:14px 11px}
@@ -927,9 +1030,13 @@ function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
 function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
+var AUDIT_ON=false;
+function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
+function showAudit(){AUDIT_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
+function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){var ev=j.audit||[];var el=document.getElementById('audit-rows');if(!ev.length){el.innerHTML='<div class="aud-empty">No device actions recorded yet.</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}).catch(function(){});}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){AUDIT_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
@@ -968,7 +1075,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 /* ---- init + live poll (no full reload, so streams keep playing) ---- */
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}fetchAgents();setInterval(fetchAgents,5000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {
