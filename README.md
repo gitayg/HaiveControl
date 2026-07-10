@@ -172,6 +172,11 @@ renders results **in the stage viewport**:
 Uploads land in `SCREEN_SHARE` (or the user's home dir if unset); with `SCREEN_SHARE`
 set, browsing/downloads are confined to that folder (`..` is blocked).
 
+Each device in the sidebar has a **🤖 icon** — click it to copy a ready-to-paste block
+that sets up the MCP for that device (the `claude mcp add …` line with the hub URL, your
+`MCP_TOKEN`, and your owner pre-filled) plus a few example prompts. Hand it to your AI agent
+and it can drive that machine.
+
 ## Run commands from the Mac (API + CLI)
 
 Everything the browser does is a plain HTTP API on the agent, so you can drive a

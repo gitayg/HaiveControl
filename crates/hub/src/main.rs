@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.4";
+const VERSION: &str = "2.2.5";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -697,6 +697,16 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             )
         }
     };
+    // Values the dashboard bakes into the per-device "copy agent setup" action.
+    // Behind SSO, so showing the viewer their own MCP token + owner is fine.
+    let hb_base = std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("http://{hub_ip}:{hub_port}"));
+    let hb_mtok = std::env::var("MCP_TOKEN").ok().filter(|s| !s.is_empty()).unwrap_or_default();
+    let hb = format!(
+        "<script>window.HB={{base:\"{}\",mtok:\"{}\",owner:\"{}\"}}</script>",
+        hb_base.replace('"', ""),
+        hb_mtok.replace('"', ""),
+        user.unwrap_or("").replace('"', "")
+    );
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\
@@ -719,7 +729,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}<script src=\"/assets/xterm.js\"></script><script src=\"/assets/addon-fit.js\"></script>{script}</body></html>",
+</div>{fb}{hb}<script src=\"/assets/xterm.js\"></script><script src=\"/assets/addon-fit.js\"></script>{script}</body></html>",
         cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML
     );
     Response::from_string(html).with_header(hdr("Content-Type", "text/html"))
@@ -751,6 +761,8 @@ pre{margin:0}
 .dl-name{font-size:13px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dl-meta{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dl-load{flex:none;font-size:11px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums}
+.agi{flex:none;background:none;border:0;cursor:pointer;font-size:14px;line-height:1;opacity:.55;padding:2px 3px;border-radius:6px;transition:opacity .12s,background .12s}
+.agi:hover{opacity:1;background:var(--surface2)}
 .dl-load.warn{color:var(--idle)}
 .dl-load.hot{color:var(--danger)}
 .empty-li{color:var(--muted);font-size:12px;padding:14px 11px}
@@ -839,7 +851,9 @@ function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
 function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
-function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(d.name||d.hostname||d.ip)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+load+'</li>';});el.innerHTML=h;}
+function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
+function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
+function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
 function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
