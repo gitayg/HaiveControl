@@ -182,6 +182,13 @@ shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's det
 an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
 run command, input, …) and which owner made them. So you can watch agents work in real time.
 
+**Fleet status.** The sidebar's **📊 Fleet status** opens a whole-fleet overview — one row
+per device, every parameter at a glance: status dot, OS/arch, logged-in user, live CPU load,
+free/total RAM, cores, camera/mic counts, address (LAN or relay), last-seen, and a **🤖⇄**
+marker when an AI agent is on it. A summary strip up top counts online / idle / stale devices,
+shows average CPU load, and how many are being accessed via MCP right now. It's owner-scoped and
+refreshes live; click any row to jump straight into that device's control view.
+
 **Audit log.** The sidebar's **📋 Audit log** opens a running record of every device action —
 each row is *when · via (browser/MCP) · action · device · who · detail* (e.g. the exact
 command run). It's scoped to your account (you see actions on your own devices) and updates

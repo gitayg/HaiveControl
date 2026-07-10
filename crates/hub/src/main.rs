@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.3.0";
+const VERSION: &str = "2.4.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -1094,10 +1094,11 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\
 <aside class=\"side\">\
-<div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code>{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
+<div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
 <div class=\"legend\"><span><span class=\"dot on\"></span>online</span><span><span class=\"dot idle\"></span>idle</span><span><span class=\"dot off\"></span>stale</span></div>\
 <input id=\"devsearch\" class=\"devsearch\" type=\"search\" placeholder=\"Search devices…\" autocomplete=\"off\" oninput=\"SEARCH=this.value.toLowerCase();renderSide(LAST);\">\
 <ul id=\"devlist\" class=\"devlist\"></ul>\
+<button class=\"addbtn\" onclick=\"showOverview()\">📊 Fleet status</button>\
 <button class=\"addbtn\" onclick=\"showFleet()\">⚡ Fleet run</button>\
 <button class=\"addbtn\" onclick=\"showAudit()\">📋 Audit log</button>\
 <button class=\"addbtn\" onclick=\"toggleReg()\">+ Register a device</button>\
@@ -1106,6 +1107,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <main class=\"stage\">\
 <div class=\"stage-empty\" id=\"stage-empty\">Select a device from the left to control it.</div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account</span></div><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
+<div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th></th><th>Device</th><th>OS</th><th>User</th><th class=\"ov-num\">CPU</th><th class=\"ov-num\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th>Last seen</th><th>MCP</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
 <div id=\"fleet-view\" style=\"display:none\"><div class=\"aud-head\">Fleet run <span class=\"dim2\">— run on all your devices, in parallel</span></div><div class=\"fleet-bar\"><input id=\"fleet-cmd\" class=\"devsearch\" placeholder=\"shell command to run on every device…\" autocomplete=\"off\"><button class=\"b\" onclick=\"runFleet()\">Run on all</button></div><div id=\"fleet-results\"></div></div>\
 <div id=\"detail\" style=\"display:none\">\
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
@@ -1141,6 +1143,7 @@ pre{margin:0}
 .side{width:288px;flex:none;border-right:1px solid var(--line);display:flex;flex-direction:column;background:#11141d}
 .side-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:15px 15px 6px}
 .side-head code{display:inline-block;margin-top:7px}
+.hubid{cursor:help;border-bottom:1px dotted var(--muted2)}
 .side .legend{padding:6px 15px 12px}
 .devlist{list-style:none;margin:0;padding:7px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:3px}
 .dev-li{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;cursor:pointer;border:1px solid transparent;transition:background .12s,border-color .12s}
@@ -1181,6 +1184,20 @@ pre{margin:0}
 .devsearch:focus{border-color:var(--accent)}
 .fleet-bar{display:flex;gap:8px;margin-bottom:14px}
 .fleet-bar .devsearch{margin:0;flex:1}
+.ov-summary{display:flex;flex-wrap:wrap;gap:8px 16px;margin-bottom:14px;font-size:12px;color:var(--muted)}
+.ov-summary .ovs{display:inline-flex;align-items:center;gap:6px}
+.ov-summary b{color:var(--text)}
+.ov-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
+.ov-tbl{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}
+.ov-tbl th{text-align:left;padding:9px 12px;color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.5px;border-bottom:1px solid var(--line2);position:sticky;top:0;background:var(--panel,var(--bg));font-weight:600}
+.ov-tbl td{padding:9px 12px;border-bottom:1px solid var(--line2)}
+.ov-tbl tbody tr:last-child td{border-bottom:0}
+.ov-row{cursor:pointer}
+.ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
+.ov-nm{font-weight:600;color:var(--text)}
+.ov-num{text-align:right;font-variant-numeric:tabular-nums}
+.ov-tbl .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+.ov-empty{text-align:center;color:var(--muted2);padding:24px}
 .fleet-card{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
 .fleet-dev{background:var(--surface2);padding:7px 12px;font-weight:600;font-size:12px;color:#d7dbe6}
 .fleet-out{margin:0;padding:10px 12px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.5;color:#c3c9d8;white-space:pre-wrap;max-height:200px;overflow:auto}
@@ -1271,27 +1288,30 @@ var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
+function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(OVERVIEW_ON)renderOverview(arr);var special=AUDIT_ON||OVERVIEW_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!SEL&&arr.length&&!special){select(baseOf(arr[0]));}}).catch(function(){});}
 function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
-function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
+function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('stage-empty').style.display='block';}
 var AUDIT_ON=false;
 function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function showAudit(){AUDIT_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
+function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
 function sysCall(kind,arg){var u='/x/sys?target='+enc(SEL)+'&kind='+enc(kind);if(arg)u+='&arg='+enc(arg);out(kind+' …');fetch(u).then(function(r){return r.json();}).then(function(j){out(j.output||('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
 function doSys(){var k=prompt('Report — hardware / av / encryption / firewall / processes / services / network / packages / updates / power_report','hardware');if(k)sysCall(k.trim(),'');}
 function doPower(){var a=prompt('Action — reboot / shutdown / sleep / logoff / update_all / firewall_on / firewall_off / usb_lock / usb_unlock','sleep');if(!a)return;a=a.trim();if(!confirm(a+' — run on this device?'))return;sysCall(a,'');}
 function doMsg(){var t=prompt('Message to show the logged-in user:');if(t)sysCall('message',t);}
 function doInstall(){var p=prompt('Package to install (winget id / brew formula / apt package):');if(p)sysCall('install',p.trim());}
 function doPosture(){out('checking compliance…');fetch('/x/sys?target='+enc(SEL)+'&kind=posture').then(function(r){return r.json();}).then(function(j){if(!j.ok){out('[error] '+(j.error||'failed'));return;}var s='Compliance: '+j.grade+' ('+j.score+'/100)\n';(j.checks||[]).forEach(function(c){s+='  ['+(c.pass?'PASS':'FAIL')+'] '+c.check+'\n';});out(s);}).catch(function(e){out('error: '+e);});}
-function showFleet(){AUDIT_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
+function showFleet(){AUDIT_ON=false;OVERVIEW_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
+var OVERVIEW_ON=false;
+function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='block';renderOverview(LAST);}
+function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="12" class="ov-empty">No devices.</td></tr>';return;}body.innerHTML=arr.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+'</td><td>'+esc2(d.user||'—')+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td></tr>';}).join('');}
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch('/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){var ev=j.audit||[];var el=document.getElementById('audit-rows');if(!ev.length){el.innerHTML='<div class="aud-empty">No device actions recorded yet.</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}).catch(function(){});}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){AUDIT_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){AUDIT_ON=false;OVERVIEW_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
@@ -1331,7 +1351,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
 document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {
