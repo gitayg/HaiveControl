@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.3";
+const VERSION: &str = "2.2.4";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -89,6 +89,24 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             }
         }
     }
+    // /m/* is the token-authed MCP API (a headless MCP can't pass SSO either, so
+    // it's SSO-bypassed and carries ?mtok=<MCP_TOKEN>&owner=<user>). Ownership is
+    // scoped by the caller-supplied owner; exec/input carry their target in the body.
+    let mowner = query_param(&url, "owner");
+    if path.starts_with("/m/") {
+        if !mcp_ok(&url) {
+            let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+            return;
+        }
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input") {
+            if let Some(t) = query_param(&url, "target") {
+                if !may_control(mowner.as_deref(), agents, &t) {
+                    let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
+                    return;
+                }
+            }
+        }
+    }
     // Live MJPEG streams pipe an endless reqwest body straight through tiny_http,
     // so they bypass the `Resp` match below (which expects a finite Cursor body).
     if method == Method::Get && (path == "/x/stream" || path == "/x/camstream") {
@@ -150,6 +168,17 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/list") => proxy_list(&url),
         (Method::Post, "/x/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/live") => live_page(&url),
+        // MCP API (token-authed, owner-scoped) — mirrors the device actions the
+        // haive-mcp server needs, routed through the hub so it works over relay.
+        (Method::Get, "/m/agents") => json_agents(agents, mowner.as_deref()),
+        (Method::Get, "/m/frame") => proxy_frame(&url),
+        (Method::Get, "/m/camera") => proxy_camera(&url),
+        (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref()),
+        (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
+        (Method::Get, "/m/download") => proxy_download(&url),
+        (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
+        (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
+        (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref()),
         _ => Response::from_string("not found").with_status_code(404),
     };
@@ -185,6 +214,14 @@ fn may_control(user: Option<&str>, agents: &Agents, target: &str) -> bool {
 fn relay_ok(url: &str) -> bool {
     match std::env::var("RELAY_TOKEN") {
         Ok(t) if !t.is_empty() => query_param(url, "tok").as_deref() == Some(t.as_str()),
+        _ => true,
+    }
+}
+
+/// MCP-client auth for the SSO-bypassed /m paths. Open when MCP_TOKEN is unset.
+fn mcp_ok(url: &str) -> bool {
+    match std::env::var("MCP_TOKEN") {
+        Ok(t) if !t.is_empty() => query_param(url, "mtok").as_deref() == Some(t.as_str()),
         _ => true,
     }
 }
@@ -445,6 +482,21 @@ fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
     match dev_unary(target, "POST", "/exec", Some(("application/json".into(), payload))) {
         Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "application/json")),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "device unreachable"})),
+    }
+}
+
+fn proxy_input(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
+    if !may_control(user, agents, target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    let ev = v.get("ev").cloned().unwrap_or_else(|| serde_json::json!({}));
+    match dev_unary(target, "POST", "/input", Some(("application/json".into(), ev.to_string().into_bytes()))) {
+        Some(_) => Response::from_string("").with_status_code(204),
         None => json_resp(&serde_json::json!({"ok": false, "error": "device unreachable"})),
     }
 }
