@@ -266,6 +266,33 @@ the local MCP at it with `HAIVE_HUB=https://<app-url>`, `HIVE_MCP_TOKEN=<token>`
 `HIVE_OWNER=<your-email>` (optional). The MCP runs on your Mac; only its HTTP calls to the hub cross
 the network.
 
+## Device management & fleet actions
+
+Beyond raw control, the hub exposes canned management actions (run the right OS command
+per device, no agent change) — as dashboard buttons, `/x/sys` + `/m/sys` endpoints, and MCP
+tools:
+
+- **System reports** — hardware, antivirus status, disk-encryption status, firewall,
+  processes, services, network (ARP), installed packages, available updates, power.
+- **Actions** — reboot / shutdown / sleep / logoff, firewall on/off, USB-storage lock/unlock
+  (Windows), message the logged-in user, install/uninstall a package (winget / brew / apt),
+  apply all updates.
+- **Compliance posture** — one click scores a device (disk encryption, firewall, AV, OS
+  updates) into an A–F grade with per-check pass/fail.
+- **Fleet run** — the sidebar's **⚡ Fleet run** runs any shell command (or a report) on
+  **every device you own, in parallel**, and shows each device's output. MCP: `fleet_run`,
+  `fleet_report`.
+- A **search box** above the device list filters by name / host / OS / IP.
+
+## Identity & owner scoping
+
+A device's owner is a **stable id derived from the owner's email** (`UUIDv5(namespace,
+lower(trim(email)))`) — deterministic across redeploys and hub instances, with no dependence
+on any machine MAC/hostname (which is ephemeral in containers) and no persistence needed.
+Emails, pre-hashed ids, and the SSO identity all canonicalize to the same key. The owner id
+is only a **scope selector** — the MCP/relay **token is the auth boundary**, so its
+guessability is harmless. `HIVE_OWNER` is optional (unset = see all the token reaches).
+
 ## Reverse-tunnel relay (control beyond the LAN)
 
 The default model is **pull**: the hub reaches *into* each device at its IP. That only

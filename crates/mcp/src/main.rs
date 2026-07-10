@@ -92,6 +92,39 @@ struct CameraArgs {
     #[serde(default)]
     index: Option<u32>,
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ReportArgs {
+    device: String,
+    /// one of: hardware, av, encryption, firewall, processes, services, network, packages
+    kind: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ActionArgs {
+    device: String,
+    /// one of: reboot, shutdown, sleep, logoff, firewall_on, firewall_off, usb_lock, usb_unlock
+    action: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct MessageArgs {
+    device: String,
+    text: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct PackageArgs {
+    device: String,
+    /// package id (winget id on Windows, brew formula on macOS, apt package on Linux)
+    package: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FleetRunArgs {
+    /// shell command to run on every device you own, in parallel
+    command: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct FleetReportArgs {
+    /// one of: hardware, av, encryption, firewall, processes, services, network, packages
+    kind: String,
+}
 
 #[derive(Clone)]
 struct Srv {
@@ -333,6 +366,86 @@ impl Srv {
         self.input(&target, serde_json::json!({"type":"key","action":"down","key":a.key})).await?;
         self.input(&target, serde_json::json!({"type":"key","action":"up","key":a.key})).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(format!("pressed {}", a.key))]))
+    }
+
+    async fn sys(&self, device: &str, kind: &str, arg: &str) -> Result<String, ErrorData> {
+        let target = self.resolve(device).await.map_err(err)?;
+        let mut extra = format!("kind={}&target={}", urlencode(kind), urlencode(&target));
+        if !arg.is_empty() {
+            extra.push_str(&format!("&arg={}", urlencode(arg)));
+        }
+        let v: serde_json::Value = self.client.get(self.m("sys", &extra)).send().await.map_err(err)?.json().await.map_err(err)?;
+        Ok(v["output"].as_str().or_else(|| v["error"].as_str()).unwrap_or("failed").to_string())
+    }
+
+    #[tool(description = "Get a system report from a device. kind: hardware, av (antivirus status), encryption (disk encryption), firewall, processes, services, network (ARP neighbors), packages (installed software).")]
+    async fn system_report(&self, Parameters(a): Parameters<ReportArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, &a.kind, "").await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Run a device action: reboot, shutdown, sleep, logoff, firewall_on, firewall_off, usb_lock, usb_unlock (USB storage lock is Windows-only).")]
+    async fn device_action(&self, Parameters(a): Parameters<ActionArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, &a.action, "").await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}: {}", a.action, out))]))
+    }
+
+    #[tool(description = "Show a popup message to the logged-in user on the device.")]
+    async fn message_user(&self, Parameters(a): Parameters<MessageArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, "message", &a.text).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Install a software package on the device (winget on Windows, brew on macOS, apt on Linux).")]
+    async fn install_package(&self, Parameters(a): Parameters<PackageArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, "install", &a.package).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Uninstall a software package from the device (winget/brew/apt).")]
+    async fn uninstall_package(&self, Parameters(a): Parameters<PackageArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, "uninstall", &a.package).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Check for available OS/app updates on the device (winget upgrade / softwareupdate -l / apt upgradable). Use device_action 'update_all' to apply them.")]
+    async fn check_updates(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, "updates", "").await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Run a security compliance check on the device (disk encryption, firewall, antivirus, OS updates) and return a score/grade with per-check pass/fail.")]
+    async fn compliance_posture(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve(&a.device).await.map_err(err)?;
+        let v: serde_json::Value = self.client.get(self.m("sys", &format!("kind=posture&target={}", urlencode(&target)))).send().await.map_err(err)?.json().await.map_err(err)?;
+        let mut s = format!("Compliance: {} ({}/100)\n", v["grade"].as_str().unwrap_or("?"), v["score"].as_i64().unwrap_or(0));
+        if let Some(cs) = v["checks"].as_array() {
+            for c in cs {
+                s.push_str(&format!("  [{}] {}\n", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or("")));
+            }
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
+    }
+
+    async fn fleet(&self, extra: &str) -> Result<String, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("fleet", extra)).send().await.map_err(err)?.json().await.map_err(err)?;
+        let out = v["results"]
+            .as_array()
+            .map(|arr| arr.iter().map(|r| format!("### {}\n{}", r["device"].as_str().unwrap_or("?"), r["output"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n"))
+            .unwrap_or_else(|| "no devices".to_string());
+        Ok(out)
+    }
+
+    #[tool(description = "Run a shell command on EVERY device you own, in parallel, and return each device's output.")]
+    async fn fleet_run(&self, Parameters(a): Parameters<FleetRunArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.fleet(&format!("kind=exec&cmd={}", urlencode(&a.command))).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Run a system report (hardware, av, encryption, firewall, processes, services, network, packages) on EVERY device you own, in parallel.")]
+    async fn fleet_report(&self, Parameters(a): Parameters<FleetReportArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.fleet(&format!("kind={}", urlencode(&a.kind))).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 }
 
