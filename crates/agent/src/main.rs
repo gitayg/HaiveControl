@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-const VERSION: &str = "2.2.6";
+const VERSION: &str = "2.2.7";
 
 #[derive(Parser)]
 #[command(name = "HaiveControl", version = VERSION,
