@@ -177,6 +177,11 @@ that sets up the MCP for that device (the `claude mcp add …` line with the hub
 `MCP_TOKEN`, and your owner pre-filled) plus a few example prompts. Hand it to your AI agent
 and it can drive that machine.
 
+**Live MCP activity.** When an AI agent is accessing a device through the MCP, the hub
+shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's detail pane shows
+an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
+run command, input, …) and which owner made them. So you can watch agents work in real time.
+
 ## Run commands from the Mac (API + CLI)
 
 Everything the browser does is a plain HTTP API on the agent, so you can drive a
@@ -242,7 +247,9 @@ agent directly), so the same setup works for LAN *and* cloud/relay devices. Conf
 (set in your MCP client, or export before launch):
 - `HAIVE_HUB` — hub base URL (default `http://localhost:8770`; a cloud hub's `https://…`).
 - `HIVE_MCP_TOKEN` — token for the hub's `/m` API (must match the hub's `MCP_TOKEN`).
-- `HIVE_OWNER` — the owner id to act as, so a multi-user hub scopes tools to your devices.
+- `HIVE_OWNER` — **optional.** Scope the tools to one owner's devices on a multi-user hub;
+  omit it to see every device the token can reach. (The hub can also set `MCP_OWNER` so a
+  token maps to an owner server-side — then clients never need `HIVE_OWNER`.)
 - `HAIVE_CAFILE` — optional PEM to verify a self-signed hub cert.
 
 Then just ask: *"take a screenshot of mymac"*, *"run `ipconfig` on mymac"*,
@@ -251,7 +258,7 @@ Then just ask: *"take a screenshot of mymac"*, *"run `ipconfig` on mymac"*,
 **Against a cloud hub (crane.glick.run):** set `MCP_TOKEN` on the hub and add `/m` to
 `auth_bypass_paths` (a headless MCP can't pass SSO — same reason as the agent). Then point
 the local MCP at it with `HAIVE_HUB=https://<app-url>`, `HIVE_MCP_TOKEN=<token>`,
-`HIVE_OWNER=<your-email>`. The MCP runs on your Mac; only its HTTP calls to the hub cross
+`HIVE_OWNER=<your-email>` (optional). The MCP runs on your Mac; only its HTTP calls to the hub cross
 the network.
 
 ## Reverse-tunnel relay (control beyond the LAN)

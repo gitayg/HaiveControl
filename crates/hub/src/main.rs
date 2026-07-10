@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.5";
+const VERSION: &str = "2.2.6";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -80,7 +80,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // belongs to an owner and you can only see/drive your own. No owner header
     // (LAN / dev) = full access. exec carries its target in the body, so it's
     // checked inside proxy_exec instead of here.
-    let user = req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User"));
+    // Empty owner = no scope (see all), never "owner equals empty string" — an
+    // unset HIVE_OWNER on the MCP must not silently hide every device.
+    let user = req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User")).filter(|s| !s.is_empty());
     if path.starts_with("/x/") && path != "/x/exec" {
         if let Some(t) = query_param(&url, "target") {
             if !may_control(user.as_deref(), agents, &t) {
@@ -92,7 +94,12 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // /m/* is the token-authed MCP API (a headless MCP can't pass SSO either, so
     // it's SSO-bypassed and carries ?mtok=<MCP_TOKEN>&owner=<user>). Ownership is
     // scoped by the caller-supplied owner; exec/input carry their target in the body.
-    let mowner = query_param(&url, "owner");
+    // MCP owner: the client's owner param, else a server-configured MCP_OWNER
+    // (so a single token "is" that owner), else none (unscoped — the token is
+    // the auth; owner is only a per-user filter).
+    let mowner = query_param(&url, "owner")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("MCP_OWNER").ok().filter(|s| !s.is_empty()));
     if path.starts_with("/m/") {
         if !mcp_ok(&url) {
             let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
@@ -104,6 +111,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                     return;
                 }
+                record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""));
             }
         }
     }
@@ -155,7 +163,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
-        (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref()),
+        (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url),
         (Method::Get, "/x/shell/read") => proxy_shell_read(&url),
         (Method::Post, "/x/shell/input") => proxy_shell_input(&mut req, &url),
@@ -173,7 +181,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/agents") => json_agents(agents, mowner.as_deref()),
         (Method::Get, "/m/frame") => proxy_frame(&url),
         (Method::Get, "/m/camera") => proxy_camera(&url),
-        (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref()),
+        (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref(), true),
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
         (Method::Get, "/m/download") => proxy_download(&url),
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
@@ -193,13 +201,51 @@ fn req_header(req: &Request, name: &'static str) -> Option<String> {
     req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
 }
 
-/// The `owner` a device (relay id or LAN ip, parsed from a proxy target) registered under.
-fn device_owner(agents: &Agents, target: &str) -> Option<String> {
-    let key = match target.strip_prefix("relay://") {
+/// The agents-map key for a proxy target: `relay:id` or the LAN ip.
+fn device_key(target: &str) -> String {
+    match target.strip_prefix("relay://") {
         Some(id) => format!("relay:{}", id.trim_end_matches('/')),
         None => target.split("://").nth(1).and_then(|s| s.split(':').next()).unwrap_or("").to_string(),
-    };
-    agents.lock().unwrap().get(&key).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from))
+    }
+}
+
+/// The `owner` a device registered under.
+fn device_owner(agents: &Agents, target: &str) -> Option<String> {
+    agents.lock().unwrap().get(&device_key(target)).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from))
+}
+
+type AccessEvent = (Instant, String, String); // (when, action, owner)
+
+/// Recent MCP (/m) accesses per device, newest first — drives the dashboard's
+/// live "agent accessing" indicator + activity log.
+fn access_log() -> &'static Mutex<HashMap<String, std::collections::VecDeque<AccessEvent>>> {
+    static A: std::sync::OnceLock<Mutex<HashMap<String, std::collections::VecDeque<AccessEvent>>>> = std::sync::OnceLock::new();
+    A.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_mcp_access(target: &str, action: &str, owner: &str) {
+    let key = device_key(target);
+    if key.is_empty() {
+        return;
+    }
+    let mut m = access_log().lock().unwrap();
+    let dq = m.entry(key).or_default();
+    dq.push_front((Instant::now(), action.to_string(), owner.to_string()));
+    dq.truncate(8);
+}
+
+fn mcp_action(path: &str) -> &'static str {
+    match path {
+        "/m/frame" => "screenshot",
+        "/m/camera" => "camera",
+        "/m/download" => "download",
+        "/m/upload" => "upload",
+        "/m/update" => "update agent",
+        "/m/dissolve" => "dissolve",
+        "/m/exec" => "run command",
+        "/m/input" => "input",
+        _ => "access",
+    }
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -470,13 +516,16 @@ fn proxy_camera(url: &str) -> Resp {
     }
 }
 
-fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
+fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
     if !may_control(user, agents, target) {
         return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    if via_mcp {
+        record_mcp_access(target, "run command", user.unwrap_or(""));
     }
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
     let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
@@ -494,6 +543,7 @@ fn proxy_input(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     if !may_control(user, agents, target) {
         return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
     }
+    record_mcp_access(target, "input", user.unwrap_or(""));
     let ev = v.get("ev").cloned().unwrap_or_else(|| serde_json::json!({}));
     match dev_unary(target, "POST", "/input", Some(("application/json".into(), ev.to_string().into_bytes()))) {
         Some(_) => Response::from_string("").with_status_code(204),
@@ -643,22 +693,31 @@ fn register(req: &mut Request, agents: &Agents) {
 
 fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
     let now = Instant::now();
-    agents
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|a| now.duration_since(a.last) < STALE)
-        .filter(|a| match user {
+    let guard = agents.lock().unwrap();
+    let alog = access_log().lock().unwrap();
+    guard
+        .iter()
+        .filter(|(_, a)| now.duration_since(a.last) < STALE)
+        .filter(|(_, a)| match user {
             None => true,
             Some(u) => a.data.get("owner").and_then(|o| o.as_str()) == Some(u),
         })
-        .map(|a| {
+        .map(|(key, a)| {
             let mut d = a.data.clone();
             if let Some(o) = d.as_object_mut() {
-                o.insert(
-                    "last_seen_secs".to_string(),
-                    serde_json::json!(now.duration_since(a.last).as_secs()),
-                );
+                o.insert("last_seen_secs".to_string(), serde_json::json!(now.duration_since(a.last).as_secs()));
+                if let Some(events) = alog.get(key) {
+                    // Only surface accesses within the last 5 minutes.
+                    let recent: Vec<serde_json::Value> = events
+                        .iter()
+                        .map(|(at, act, own)| (now.duration_since(*at).as_secs(), act, own))
+                        .filter(|(secs, _, _)| *secs < 300)
+                        .map(|(secs, act, own)| serde_json::json!({"action": act, "owner": own, "secs": secs}))
+                        .collect();
+                    let active = events.front().map(|(at, _, _)| now.duration_since(*at).as_secs() < 10).unwrap_or(false);
+                    o.insert("mcp_active".to_string(), serde_json::json!(active));
+                    o.insert("mcp_log".to_string(), serde_json::json!(recent));
+                }
             }
             d
         })
@@ -723,6 +782,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
 <a class=\"dh-open\" id=\"d-open\" target=\"_blank\">Open agent&nbsp;↗</a></div>\
 <div class=\"specs\" id=\"d-specs\"></div>\
+<div id=\"d-activity\"></div>\
 <div class=\"controls\" id=\"d-controls\"></div>\
 <div class=\"viewport\" id=\"viewport\"><div class=\"vp-hint\" id=\"vp-hint\">Press <b>Live screen</b>, <b>Screenshot</b>, or a <b>Camera</b> action — it renders here.</div><img id=\"view\" alt=\"\" style=\"display:none\"><div class=\"vp-tools\" id=\"vp-tools\" style=\"display:none\"><button class=\"b\" onclick=\"stopView()\">Stop</button><button class=\"b\" onclick=\"openTab()\">Open in tab&nbsp;↗</button></div></div>\
 <div class=\"term\" id=\"terminal\" style=\"display:none\"><div class=\"term-head\"><span>interactive shell</span><button class=\"b\" onclick=\"closeShell()\">Close shell</button></div><div id=\"xterm\" class=\"xterm-host\"></div></div>\
@@ -763,6 +823,17 @@ pre{margin:0}
 .dl-load{flex:none;font-size:11px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums}
 .agi{flex:none;background:none;border:0;cursor:pointer;font-size:14px;line-height:1;opacity:.55;padding:2px 3px;border-radius:6px;transition:opacity .12s,background .12s}
 .agi:hover{opacity:1;background:var(--surface2)}
+@keyframes mcppulse{0%,100%{opacity:.4}50%{opacity:1}}
+.mcp-live{flex:none;font-size:11px;color:var(--accent);white-space:nowrap;animation:mcppulse 1s ease-in-out infinite}
+.activity{background:rgba(91,157,255,.06);border:1px solid var(--line);border-radius:10px;padding:9px 12px;margin-top:2px}
+.act-head{display:flex;align-items:center;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:4px}
+.act-dot{width:8px;height:8px;border-radius:50%;background:var(--muted2);display:inline-block;margin-right:8px;flex:none}
+.act-head.live{color:var(--accent)}
+.act-head.live .act-dot{background:var(--on);box-shadow:0 0 8px var(--on);animation:mcppulse 1s ease-in-out infinite}
+.act-row{display:flex;gap:12px;font-size:12px;color:var(--muted);padding:2px 0}
+.act-act{color:#c3c9d8;min-width:120px}
+.act-by{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.act-ago{font-variant-numeric:tabular-nums;flex:none}
 .dl-load.warn{color:var(--idle)}
 .dl-load.hot{color:var(--danger)}
 .empty-li{color:var(--muted);font-size:12px;padding:14px 11px}
@@ -851,14 +922,15 @@ function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
 function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
-function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
+function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
+function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){return '<div class="act-row"><span class="act-act">'+esc2(e.action)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
 function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
-function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);}
+function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
