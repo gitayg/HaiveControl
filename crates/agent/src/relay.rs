@@ -44,32 +44,41 @@ fn hello_payload(relay_id: &str, name: &str, sysinfo: &serde_json::Value) -> Vec
     d.to_string().into_bytes()
 }
 
-fn post_hello(base: &str, relay_id: &str, name: &str, sysinfo: &serde_json::Value) -> bool {
-    ureq::post(&format!("{base}/relay/hello"))
+/// `&tok=…` (or empty) to authenticate against a token-protected relay.
+fn tok_q(token: &str) -> String {
+    if token.is_empty() {
+        String::new()
+    } else {
+        format!("&tok={}", urlencode(token))
+    }
+}
+
+fn post_hello(base: &str, relay_id: &str, name: &str, sysinfo: &serde_json::Value, token: &str) -> bool {
+    ureq::post(&format!("{base}/relay/hello?id={}{}", urlencode(relay_id), tok_q(token)))
         .timeout(Duration::from_secs(10))
         .send_bytes(&hello_payload(relay_id, name, sysinfo))
         .is_ok()
 }
 
-pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_json::Value) {
+pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_json::Value, token: String) {
     let base = normalize(&hub);
 
     // Register (retry until the hub is reachable) before polling.
-    while !post_hello(&base, &relay_id, &name, &sysinfo) {
+    while !post_hello(&base, &relay_id, &name, &sysinfo, &token) {
         std::thread::sleep(Duration::from_secs(3));
     }
     println!("relay: connected to {base} as {relay_id}");
 
     // Heartbeat: re-send HELLO (fresh CPU/RAM) so the hub keeps us live.
     {
-        let (b, rid, nm, si) = (base.clone(), relay_id.clone(), name.clone(), sysinfo.clone());
+        let (b, rid, nm, si, tk) = (base.clone(), relay_id.clone(), name.clone(), sysinfo.clone(), token.clone());
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(15));
-            let _ = post_hello(&b, &rid, &nm, &si);
+            let _ = post_hello(&b, &rid, &nm, &si, &tk);
         });
     }
 
-    let poll_url = format!("{base}/relay/poll?id={}", urlencode(&relay_id));
+    let poll_url = format!("{base}/relay/poll?id={}{}", urlencode(&relay_id), tok_q(&token));
     loop {
         match ureq::get(&poll_url).timeout(Duration::from_secs(35)).call() {
             Ok(resp) => {
@@ -78,8 +87,8 @@ pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_js
                 }
                 let mut body = String::new();
                 if resp.into_reader().read_to_string(&mut body).is_ok() && !body.is_empty() {
-                    let (b, rid) = (base.clone(), relay_id.clone());
-                    std::thread::spawn(move || handle_req(&b, &rid, &body));
+                    let (b, rid, tk) = (base.clone(), relay_id.clone(), token.clone());
+                    std::thread::spawn(move || handle_req(&b, &rid, &tk, &body));
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_secs(3)),
@@ -87,7 +96,7 @@ pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_js
     }
 }
 
-fn handle_req(base: &str, relay_id: &str, body: &str) {
+fn handle_req(base: &str, relay_id: &str, token: &str, body: &str) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let req_id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
     let method = v.get("m").and_then(|x| x.as_str()).unwrap_or("GET").to_uppercase();
@@ -99,7 +108,7 @@ fn handle_req(base: &str, relay_id: &str, body: &str) {
         .filter(|s| !s.is_empty())
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
 
-    let reply = |status: u16, ctype: &str| format!("{base}/relay/reply?id={}&req={}&st={}&ct={}", urlencode(relay_id), req_id, status, urlencode(ctype));
+    let reply = |status: u16, ctype: &str| format!("{base}/relay/reply?id={}&req={}&st={}&ct={}{}", urlencode(relay_id), req_id, status, urlencode(ctype), tok_q(token));
 
     let lp = crate::http::loopback_port();
     if lp == 0 {

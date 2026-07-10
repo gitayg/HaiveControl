@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-const VERSION: &str = "2.2.1";
+const VERSION: &str = "2.2.2";
 
 #[derive(Parser)]
 #[command(name = "HaiveControl", version = VERSION,
@@ -40,10 +40,13 @@ struct Args {
     /// remove autostart and exit
     #[arg(long)]
     uninstall: bool,
-    /// dial OUT to a (possibly cloud) hub relay at HOST[:PORT] (default port 8771),
+    /// dial OUT to a (possibly cloud) hub relay URL (e.g. https://hub.example.com),
     /// so the hub can reach this device through NAT
-    #[arg(long, value_name = "HOST[:PORT]")]
+    #[arg(long, value_name = "URL")]
     relay: Option<String>,
+    /// token required by a token-protected relay (or set HIVE_RELAY_TOKEN)
+    #[arg(long, value_name = "TOKEN")]
+    relay_token: Option<String>,
 }
 
 fn relay_id(name: &str) -> String {
@@ -283,8 +286,9 @@ fn main() {
     if let Some(relay_addr) = args.relay.clone() {
         let rid = relay_id(&name);
         let (nm, si) = (name.clone(), sysinfo.clone());
+        let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
         println!("   relay: dialing {relay_addr} as {rid}");
-        std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si));
+        std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
     let registering = if mac_id.is_some() { format!("registering to '{mac_id_disp}'") } else { "relay-only".to_string() };

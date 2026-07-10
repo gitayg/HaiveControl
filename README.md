@@ -267,22 +267,27 @@ in the current agent binaries (served at `/bin/*`). The hub reads `PORT`, expose
 `/api/health` → `{status, version}`, and — when `HUB_PUBLIC_URL` is set — shows relay-mode
 install commands in the dashboard. Recipe:
 
-1. Create the app from this repo (custom Dockerfile is auto-detected).
-2. Set env: `HUB_PUBLIC_URL=https://<your-app-url>` (and, for a cleaner product, a custom
-   domain).
-3. **Bypass SSO on the agent-facing paths** so devices (which carry no browser cookie) can
-   reach the tunnel and downloads, and long-lived connections aren't buffered or cut:
-   `auth_bypass_paths=["/relay","/bin"]`. On AppCrane this sets `flush_interval -1` and
-   zero read/write timeouts. **Keep `/x/*` behind SSO** — that's the device-control surface
-   and should require an authenticated admin. TLS is terminated at the platform edge
-   (`https`), so the tunnel is encrypted even though it speaks plain HTTP inside.
-4. Deploy, then on each device run the relay command the dashboard shows
-   (`./airm --relay https://<your-app-url> --name <device>`).
+A **headless agent can't pass SSO** (no browser, no login), so the agent-facing paths must
+be SSO-bypassed — and the hub then authenticates the agent itself with a shared token.
 
-> **Before exposing publicly:** the `/relay` endpoints are currently unauthenticated —
-> fine on a trusted network, but on the open internet an attacker who guesses a device's
-> relay id could hijack its tunnel. A shared `RELAY_TOKEN` (agent sends it, hub checks it)
-> is the recommended hardening and is the intended next addition.
+1. Create the app from this repo (custom Dockerfile is auto-detected).
+2. Set env / secrets:
+   - `HUB_PUBLIC_URL=https://<your-app-url>` — makes the dashboard show relay-mode install
+     commands (add a custom domain for a cleaner product).
+   - `RELAY_TOKEN=<a long random secret>` — **the agent's credential**; it replaces SSO on
+     `/relay`, and the dashboard bakes it into the shown install command.
+3. **Bypass SSO on the agent-facing paths** (`auth_bypass_paths=["/relay","/bin"]`) so
+   devices can reach the tunnel + downloads and long-lived connections aren't buffered or
+   cut — on AppCrane this sets `flush_interval -1` and zero read/write timeouts. **Keep
+   `/x/*` behind SSO** — that's the device-control surface, admin-only. TLS is terminated at
+   the platform edge, so the tunnel is encrypted even though it's plain HTTP inside. `/bin`
+   serves only public binaries, so it needs no token.
+4. Deploy, then on each device run the relay command the dashboard shows
+   (`./airm --relay https://<your-app-url> --relay-token <token> --name <device>`).
+
+**Relay auth:** with `RELAY_TOKEN` set, every `/relay/*` call must carry `?tok=<token>` —
+the agent sends it (`--relay-token` or `HIVE_RELAY_TOKEN`); wrong/absent → `401`. Unset =
+open (trusted LAN / dev). Query-string tokens on bypass paths aren't logged by the proxy.
 
 ## Config (environment variables)
 
