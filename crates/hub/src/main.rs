@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.0";
+const VERSION: &str = "2.2.1";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -34,7 +34,12 @@ struct Args {}
 
 fn main() {
     Args::parse();
-    let port: u16 = std::env::var("HUB_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8770);
+    // PORT is what PaaS platforms (AppCrane) inject; HUB_PORT is the local name.
+    let port: u16 = std::env::var("PORT")
+        .or_else(|_| std::env::var("HUB_PORT"))
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8770);
     let mid = mac_id();
     let ip = local_ip();
     let _mdns = advertise(&mid, port, &ip);
@@ -83,6 +88,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             Response::from_string("").with_status_code(204)
         }
         (Method::Get, "/agents") => json_agents(agents),
+        (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
         (Method::Post, "/relay/hello") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
@@ -556,10 +562,26 @@ fn json_agents(agents: &Agents) -> Resp {
 }
 
 fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16) -> Resp {
-    let hub = format!("{hub_ip}:{hub_port}");
-    let win = cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe http://{hub}/bin/HaiveControl-windows.exe\n.\\airm.exe {hub} --id {mac_id}"));
-    let mac = cmd_block("macOS", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-macos && chmod +x airm\n./airm {hub} --id {mac_id}"));
-    let lin = cmd_block("Linux", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-linux && chmod +x airm\n./airm {hub} --id {mac_id}"));
+    // When the hub is reachable at a public URL (a cloud deploy), show relay-mode
+    // install commands (device dials out); otherwise LAN-mode (hub reaches in).
+    let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+        Some(pub_url) => {
+            let b = pub_url.trim_end_matches('/').to_string();
+            (
+                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b} --name my-pc")),
+                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b} --name my-mac")),
+                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b} --name my-box")),
+            )
+        }
+        None => {
+            let hub = format!("{hub_ip}:{hub_port}");
+            (
+                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe http://{hub}/bin/HaiveControl-windows.exe\n.\\airm.exe {hub} --id {mac_id}")),
+                cmd_block("macOS", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-macos && chmod +x airm\n./airm {hub} --id {mac_id}")),
+                cmd_block("Linux", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-linux && chmod +x airm\n./airm {hub} --id {mac_id}")),
+            )
+        }
+    };
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\

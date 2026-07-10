@@ -260,12 +260,29 @@ HaiveControl <mac-id> --relay http://192.168.1.10:8770         # or any reachabl
 - Relay devices show up in the dashboard like any other, tagged `relay`, with live
   CPU/RAM.
 
-**Deploying the hub on a PaaS (e.g. AppCrane / crane.glick.run):** put the tunnel + proxy
-paths behind an SSO-bypass prefix so agents (which carry no browser cookie) can reach them
-and long-lived connections aren't buffered or timed out — on AppCrane that's
-`auth_bypass_paths=["/relay","/x","/bin"]`, which sets `flush_interval -1` and disables
-read/write timeouts. TLS is terminated at the platform edge (`wss`/`https`), so the tunnel
-is encrypted end-to-end even though it speaks plain HTTP inside.
+### Deploy the hub on AppCrane (crane.glick.run)
+
+The repo ships a `Dockerfile` + `deployhub.json` that build the hub from source and bake
+in the current agent binaries (served at `/bin/*`). The hub reads `PORT`, exposes
+`/api/health` → `{status, version}`, and — when `HUB_PUBLIC_URL` is set — shows relay-mode
+install commands in the dashboard. Recipe:
+
+1. Create the app from this repo (custom Dockerfile is auto-detected).
+2. Set env: `HUB_PUBLIC_URL=https://<your-app-url>` (and, for a cleaner product, a custom
+   domain).
+3. **Bypass SSO on the agent-facing paths** so devices (which carry no browser cookie) can
+   reach the tunnel and downloads, and long-lived connections aren't buffered or cut:
+   `auth_bypass_paths=["/relay","/bin"]`. On AppCrane this sets `flush_interval -1` and
+   zero read/write timeouts. **Keep `/x/*` behind SSO** — that's the device-control surface
+   and should require an authenticated admin. TLS is terminated at the platform edge
+   (`https`), so the tunnel is encrypted even though it speaks plain HTTP inside.
+4. Deploy, then on each device run the relay command the dashboard shows
+   (`./airm --relay https://<your-app-url> --name <device>`).
+
+> **Before exposing publicly:** the `/relay` endpoints are currently unauthenticated —
+> fine on a trusted network, but on the open internet an attacker who guesses a device's
+> relay id could hijack its tunnel. A shared `RELAY_TOKEN` (agent sends it, hub checks it)
+> is the recommended hardening and is the intended next addition.
 
 ## Config (environment variables)
 
