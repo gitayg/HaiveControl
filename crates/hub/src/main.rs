@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.2";
+const VERSION: &str = "2.2.3";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -76,6 +76,19 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     let method = req.method().clone();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("/").to_string();
+    // On a multi-user hub, AppCrane forwards the authenticated user; a device
+    // belongs to an owner and you can only see/drive your own. No owner header
+    // (LAN / dev) = full access. exec carries its target in the body, so it's
+    // checked inside proxy_exec instead of here.
+    let user = req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User"));
+    if path.starts_with("/x/") && path != "/x/exec" {
+        if let Some(t) = query_param(&url, "target") {
+            if !may_control(user.as_deref(), agents, &t) {
+                let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
+                return;
+            }
+        }
+    }
     // Live MJPEG streams pipe an endless reqwest body straight through tiny_http,
     // so they bypass the `Resp` match below (which expects a finite Cursor body).
     if method == Method::Get && (path == "/x/stream" || path == "/x/camstream") {
@@ -94,7 +107,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             register(&mut req, agents);
             Response::from_string("").with_status_code(204)
         }
-        (Method::Get, "/agents") => json_agents(agents),
+        (Method::Get, "/agents") => json_agents(agents, user.as_deref()),
         (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
         (Method::Post, "/relay/hello") => {
             let mut body = String::new();
@@ -124,7 +137,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
-        (Method::Post, "/x/exec") => proxy_exec(&mut req),
+        (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref()),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url),
         (Method::Get, "/x/shell/read") => proxy_shell_read(&url),
         (Method::Post, "/x/shell/input") => proxy_shell_input(&mut req, &url),
@@ -137,7 +150,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/list") => proxy_list(&url),
         (Method::Post, "/x/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/live") => live_page(&url),
-        (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port),
+        (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref()),
         _ => Response::from_string("not found").with_status_code(404),
     };
     let _ = req.respond(resp);
@@ -145,6 +158,27 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
 
 fn text_resp(body: String, ct: &str) -> Resp {
     Response::from_string(body).with_header(hdr("Content-Type", ct))
+}
+
+fn req_header(req: &Request, name: &'static str) -> Option<String> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+}
+
+/// The `owner` a device (relay id or LAN ip, parsed from a proxy target) registered under.
+fn device_owner(agents: &Agents, target: &str) -> Option<String> {
+    let key = match target.strip_prefix("relay://") {
+        Some(id) => format!("relay:{}", id.trim_end_matches('/')),
+        None => target.split("://").nth(1).and_then(|s| s.split(':').next()).unwrap_or("").to_string(),
+    };
+    agents.lock().unwrap().get(&key).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from))
+}
+
+/// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
+fn may_control(user: Option<&str>, agents: &Agents, target: &str) -> bool {
+    match user {
+        None => true,
+        Some(u) => device_owner(agents, target).as_deref() == Some(u),
+    }
 }
 
 /// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset.
@@ -399,11 +433,14 @@ fn proxy_camera(url: &str) -> Resp {
     }
 }
 
-fn proxy_exec(req: &mut Request) -> Resp {
+fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
     let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
+    if !may_control(user, agents, target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
     let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
     match dev_unary(target, "POST", "/exec", Some(("application/json".into(), payload))) {
@@ -552,13 +589,17 @@ fn register(req: &mut Request, agents: &Agents) {
     }
 }
 
-fn live(agents: &Agents) -> Vec<serde_json::Value> {
+fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
     let now = Instant::now();
     agents
         .lock()
         .unwrap()
         .values()
         .filter(|a| now.duration_since(a.last) < STALE)
+        .filter(|a| match user {
+            None => true,
+            Some(u) => a.data.get("owner").and_then(|o| o.as_str()) == Some(u),
+        })
         .map(|a| {
             let mut d = a.data.clone();
             if let Some(o) = d.as_object_mut() {
@@ -572,11 +613,11 @@ fn live(agents: &Agents) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn json_agents(agents: &Agents) -> Resp {
-    json_resp(&serde_json::json!({"agents": live(agents)}))
+fn json_agents(agents: &Agents, user: Option<&str>) -> Resp {
+    json_resp(&serde_json::json!({"agents": live(agents, user)}))
 }
 
-fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16) -> Resp {
+fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: Option<&str>) -> Resp {
     // When the hub is reachable at a public URL (a cloud deploy), show relay-mode
     // install commands (device dials out); otherwise LAN-mode (hub reaches in).
     let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
@@ -586,10 +627,13 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16) -> Res
                 Ok(t) if !t.is_empty() => format!(" --relay-token {t}"),
                 _ => String::new(),
             };
+            // Tag the device with the logged-in user so it lists only for them.
+            let own = user.map(|u| format!(" --owner {u}")).unwrap_or_default();
+            let ex = format!("{tok}{own}");
             (
-                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{tok} --name my-pc")),
-                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{tok} --name my-mac")),
-                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{tok} --name my-box")),
+                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --name my-pc")),
+                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --name my-mac")),
+                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{ex} --name my-box")),
             )
         }
         None => {

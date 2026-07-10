@@ -289,6 +289,17 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
 the agent sends it (`--relay-token` or `HIVE_RELAY_TOKEN`); wrong/absent → `401`. Unset =
 open (trusted LAN / dev). Query-string tokens on bypass paths aren't logged by the proxy.
 
+**Per-user devices (multi-user hub).** When AppCrane forwards the authenticated user
+(`X-AppCrane-User-Email`), the hub scopes everything to that user: the device list
+(`/agents` + dashboard) shows only devices they own, and device actions (`/x/*`) are
+refused (`403`) on devices they don't. Ownership comes from the `owner` a device registered
+with — the dashboard bakes `--owner <you>` into the install command it shows, so a device a
+user enrolls is automatically theirs. No user header (LAN/dev) = full access, as before.
+
+> The `owner` is self-asserted by the agent, so it's a **visibility/soft boundary** — a
+> holder of the shared `RELAY_TOKEN` could plant a device under another owner. Per-user
+> relay tokens (token → identity) would make it a hard boundary; a reasonable next step.
+
 ## Config (environment variables)
 
 | Var              | Default    | Meaning                                      |

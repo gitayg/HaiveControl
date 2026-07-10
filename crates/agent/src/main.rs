@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-const VERSION: &str = "2.2.2";
+const VERSION: &str = "2.2.3";
 
 #[derive(Parser)]
 #[command(name = "HaiveControl", version = VERSION,
@@ -47,6 +47,9 @@ struct Args {
     /// token required by a token-protected relay (or set HIVE_RELAY_TOKEN)
     #[arg(long, value_name = "TOKEN")]
     relay_token: Option<String>,
+    /// owner id this device belongs to (multi-user hub); or set HIVE_OWNER
+    #[arg(long, value_name = "ID")]
+    owner: Option<String>,
 }
 
 fn relay_id(name: &str) -> String {
@@ -270,7 +273,12 @@ fn main() {
     let (tx, rx) = mpsc::channel::<input::Ev>();
     std::thread::spawn(move || input::run(rx, geo));
 
-    let sysinfo = collect_sysinfo();
+    let mut sysinfo = collect_sysinfo();
+    if let Some(owner) = args.owner.clone().or_else(|| std::env::var("HIVE_OWNER").ok()).filter(|s| !s.is_empty()) {
+        if let Some(o) = sysinfo.as_object_mut() {
+            o.insert("owner".into(), serde_json::json!(owner));
+        }
+    }
     if let Some(mid) = mac_id.clone() {
         let (primary, fid, nm, si) = (mid.clone(), args.id.clone(), name.clone(), sysinfo.clone());
         std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, si));
