@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.8";
+const VERSION: &str = "2.3.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -82,7 +82,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // checked inside proxy_exec instead of here.
     // Empty owner = no scope (see all), never "owner equals empty string" — an
     // unset HIVE_OWNER on the MCP must not silently hide every device.
-    let user = req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User")).filter(|s| !s.is_empty());
+    let user = req_header(&req, "X-AppCrane-User-Email")
+        .or_else(|| req_header(&req, "X-AppCrane-User"))
+        .filter(|s| !s.is_empty())
+        .map(|e| canon_owner(&e));
     if path.starts_with("/x/") && path != "/x/exec" {
         if let Some(t) = query_param(&url, "target") {
             if !may_control(user.as_deref(), agents, &t) {
@@ -102,13 +105,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // the auth; owner is only a per-user filter).
     let mowner = query_param(&url, "owner")
         .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("MCP_OWNER").ok().filter(|s| !s.is_empty()));
+        .or_else(|| std::env::var("MCP_OWNER").ok().filter(|s| !s.is_empty()))
+        .map(|o| canon_owner(&o));
     if path.starts_with("/m/") {
         if !mcp_ok(&url) {
             let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
             return;
         }
-        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input") {
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys") {
             if let Some(t) = query_param(&url, "target") {
                 if !may_control(mowner.as_deref(), agents, &t) {
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
@@ -190,6 +194,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/camera") => proxy_camera(&url),
         (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref(), true),
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
+        (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
+        (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
+        (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
+        (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
         (Method::Get, "/m/download") => proxy_download(&url),
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
@@ -206,6 +214,26 @@ fn text_resp(body: String, ct: &str) -> Resp {
 
 fn req_header(req: &Request, name: &'static str) -> Option<String> {
     req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
+}
+
+/// Stable, deterministic owner id from an email (UUIDv5) — same email always
+/// yields the same id, across redeploys and hub instances, no persistence and
+/// no dependence on any churning machine identity (MAC/hostname). It's a *scope*
+/// key, not the auth boundary — the MCP token is the credential.
+fn owner_id(email: &str) -> String {
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, email.trim().to_lowercase().as_bytes()).to_string()
+}
+
+/// Canonicalize any owner value: an email → its UUIDv5, anything else unchanged.
+/// Applied at every entry (SSO header, MCP ?owner=, device --owner) so emails and
+/// pre-hashed ids interoperate and all resolve to one stable key.
+pub(crate) fn canon_owner(s: &str) -> String {
+    let t = s.trim();
+    if t.contains('@') {
+        owner_id(t)
+    } else {
+        t.to_string()
+    }
 }
 
 /// The agents-map key for a proxy target: `relay:id` or the LAN ip.
@@ -580,6 +608,211 @@ fn proxy_camera(url: &str) -> Resp {
     }
 }
 
+fn device_platform(agents: &Agents, target: &str) -> String {
+    agents
+        .lock()
+        .unwrap()
+        .get(&device_key(target))
+        .and_then(|a| a.data.get("platform").and_then(|p| p.as_str()).map(String::from))
+        .unwrap_or_default()
+}
+
+fn shell_arg(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || "._+-:/@".contains(*c)).collect()
+}
+
+/// The OS-appropriate shell command for a canned management action, or None if
+/// unsupported on that platform. `arg` = message text / package id where used.
+fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
+    let cmd: String = match (kind, platform) {
+        ("hardware", "windows") => "systeminfo".into(),
+        ("hardware", "macos") => "system_profiler SPHardwareDataType".into(),
+        ("hardware", "linux") => "lscpu; echo; free -h; echo; lsblk".into(),
+        ("av", "windows") => "powershell -NoProfile -Command \"Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMRunningMode | Format-List\"".into(),
+        ("av", "macos") => "echo 'Gatekeeper:'; spctl --status; echo 'XProtect present:'; ls /Library/Apple/System/Library/CoreServices/XProtect.bundle >/dev/null 2>&1 && echo yes || echo no".into(),
+        ("av", "linux") => "clamscan --version 2>/dev/null || echo 'no clamav installed'".into(),
+        ("encryption", "windows") => "manage-bde -status C:".into(),
+        ("encryption", "macos") => "fdesetup status".into(),
+        ("encryption", "linux") => "lsblk -o NAME,FSTYPE,MOUNTPOINT | grep -i crypt || echo 'no LUKS volumes detected'".into(),
+        ("firewall", "windows") => "netsh advfirewall show allprofiles state".into(),
+        ("firewall", "macos") => "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate".into(),
+        ("firewall", "linux") => "ufw status 2>/dev/null || echo 'ufw not present'".into(),
+        ("firewall_on", "windows") => "netsh advfirewall set allprofiles state on".into(),
+        ("firewall_on", "macos") => "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on".into(),
+        ("firewall_on", "linux") => "sudo ufw enable".into(),
+        ("firewall_off", "windows") => "netsh advfirewall set allprofiles state off".into(),
+        ("firewall_off", "macos") => "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off".into(),
+        ("firewall_off", "linux") => "sudo ufw disable".into(),
+        ("processes", "windows") => "tasklist".into(),
+        ("processes", _) => "ps aux 2>/dev/null | sort -rk3 | head -25".into(),
+        ("services", "windows") => "powershell -NoProfile -Command \"Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 40 Name,DisplayName | Format-Table -Auto\"".into(),
+        ("services", "macos") => "launchctl list | head -40".into(),
+        ("services", "linux") => "systemctl list-units --type=service --state=running --no-pager | head -40".into(),
+        ("network", _) => "arp -a".into(),
+        ("packages", "windows") => "winget list".into(),
+        ("packages", "macos") => "brew list --versions 2>/dev/null || ls /Applications".into(),
+        ("packages", "linux") => "apt list --installed 2>/dev/null | head -60 || dpkg -l | head -60".into(),
+        ("reboot", "windows") => "shutdown /r /t 5".into(),
+        ("reboot", _) => "sudo shutdown -r +1 2>/dev/null || shutdown -r +1".into(),
+        ("shutdown", "windows") => "shutdown /s /t 5".into(),
+        ("shutdown", _) => "sudo shutdown -h +1 2>/dev/null || shutdown -h +1".into(),
+        ("sleep", "windows") => "rundll32.exe powrprof.dll,SetSuspendState 0,1,0".into(),
+        ("sleep", "macos") => "pmset sleepnow".into(),
+        ("sleep", "linux") => "systemctl suspend".into(),
+        ("logoff", "windows") => "shutdown /l".into(),
+        ("logoff", "macos") => "osascript -e 'tell application \"System Events\" to log out'".into(),
+        ("logoff", "linux") => "loginctl terminate-user \"$USER\"".into(),
+        ("usb_lock", "windows") => "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\USBSTOR\" /v Start /t REG_DWORD /d 4 /f".into(),
+        ("usb_unlock", "windows") => "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\USBSTOR\" /v Start /t REG_DWORD /d 3 /f".into(),
+        ("message", "windows") => format!("msg * \"{}\"", arg.replace('"', "'")),
+        ("message", "macos") => format!("osascript -e 'display dialog \"{}\" buttons {{\"OK\"}} with title \"HaiveControl\"'", arg.replace('"', "'").replace('\'', "’")),
+        ("message", "linux") => format!("notify-send \"HaiveControl\" \"{}\"", arg.replace('"', "'")),
+        ("install", "windows") => format!("winget install --silent --accept-package-agreements --accept-source-agreements {}", shell_arg(arg)),
+        ("install", "macos") => format!("brew install {}", shell_arg(arg)),
+        ("install", "linux") => format!("sudo apt-get install -y {}", shell_arg(arg)),
+        ("uninstall", "windows") => format!("winget uninstall --silent {}", shell_arg(arg)),
+        ("uninstall", "macos") => format!("brew uninstall {}", shell_arg(arg)),
+        ("uninstall", "linux") => format!("sudo apt-get remove -y {}", shell_arg(arg)),
+        ("updates", "windows") => "winget upgrade".into(),
+        ("updates", "macos") => "softwareupdate -l".into(),
+        ("updates", "linux") => "apt list --upgradable 2>/dev/null".into(),
+        ("update_all", "windows") => "winget upgrade --all --silent --accept-package-agreements --accept-source-agreements".into(),
+        ("update_all", "macos") => "softwareupdate -ia".into(),
+        ("update_all", "linux") => "sudo apt-get update && sudo apt-get upgrade -y".into(),
+        ("power_report", "windows") => "powercfg /getactivescheme & powercfg /batteryreport /output %TEMP%\\haive-battery.html & echo saved to %TEMP%\\haive-battery.html".into(),
+        ("power_report", "macos") => "pmset -g custom | head -25".into(),
+        ("power_report", "linux") => "upower -d 2>/dev/null | head -30 || echo 'upower not present'".into(),
+        _ => return None,
+    };
+    Some(cmd)
+}
+
+/// (name, proxy-target, platform) for every device owned by `user`.
+fn owned_targets(agents: &Agents, user: Option<&str>) -> Vec<(String, String, String)> {
+    live(agents, user)
+        .iter()
+        .filter_map(|d| {
+            let name = d.get("name").and_then(|x| x.as_str())?.to_string();
+            let scheme = d.get("scheme").and_then(|x| x.as_str())?;
+            let ip = d.get("ip").and_then(|x| x.as_str())?;
+            let port = d.get("port").and_then(|x| x.as_u64()).unwrap_or(0);
+            let platform = d.get("platform").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let target = if scheme == "relay" { format!("relay://{ip}") } else { format!("{scheme}://{ip}:{port}") };
+            Some((name, target, platform))
+        })
+        .collect()
+}
+
+fn exec_output(target: &str, cmd: &str) -> String {
+    let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
+    match dev_unary(target, "POST", "/exec", Some(("application/json".into(), payload))) {
+        Some((_, _, b)) => {
+            let v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_default();
+            let s = format!("{}{}", v.get("stdout").and_then(|x| x.as_str()).unwrap_or(""), v.get("stderr").and_then(|x| x.as_str()).unwrap_or(""));
+            if s.trim().is_empty() { format!("(exit {})", v.get("code").and_then(|x| x.as_i64()).unwrap_or(0)) } else { s }
+        }
+        None => "(device unreachable)".to_string(),
+    }
+}
+
+/// Heuristic pass/fail from a check's command output (best-effort across OSes).
+fn posture_pass(kind: &str, out: &str) -> bool {
+    let o = out.to_lowercase();
+    match kind {
+        "encryption" => o.contains("filevault is on") || o.contains("protection on") || o.contains("percentage encrypted: 100") || o.contains("crypt"),
+        "firewall" => o.contains("state = 1") || o.contains("state on") || o.contains("firewall is enabled") || o.contains("status: active"),
+        "av" => o.contains("antivirusenabled  : true") || o.contains("realtimeprotectionenabled : true") || o.contains("assessments enabled"),
+        "updates" => o.contains("no new software") || o.contains("no applicable") || o.contains("no installed package") || out.lines().count() <= 2,
+        _ => false,
+    }
+}
+
+fn grade(score: i64) -> &'static str {
+    match score {
+        s if s >= 90 => "A",
+        s if s >= 75 => "B",
+        s if s >= 50 => "C",
+        s if s >= 25 => "D",
+        _ => "F",
+    }
+}
+
+/// One canned management action on one device.
+fn proxy_sys(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    let kind = query_param(url, "kind").unwrap_or_default();
+    let arg = query_param(url, "arg").unwrap_or_default();
+    if !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    let platform = device_platform(agents, &target);
+    // Compliance posture (63): run the security checks and score them.
+    if kind == "posture" {
+        let dev = device_name(agents, &target);
+        record_mcp_access(&target, "posture", user.unwrap_or(""), "compliance check");
+        audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, "posture", &dev, "compliance check");
+        let checks = [("disk encryption", "encryption"), ("firewall", "firewall"), ("antivirus", "av"), ("OS updates", "updates")];
+        let mut items = Vec::new();
+        let mut pass_n = 0;
+        for (label, k) in checks {
+            let out = os_command(&platform, k, "").map(|c| exec_output(&target, &c)).unwrap_or_else(|| "n/a".into());
+            let pass = posture_pass(k, &out);
+            if pass {
+                pass_n += 1;
+            }
+            items.push(serde_json::json!({"check": label, "pass": pass, "output": out.chars().take(240).collect::<String>()}));
+        }
+        let score = (pass_n as f64 / checks.len() as f64 * 100.0).round() as i64;
+        return json_resp(&serde_json::json!({"ok": true, "device": dev, "score": score, "grade": grade(score), "checks": items}));
+    }
+    let cmd = match os_command(&platform, &kind, &arg) {
+        Some(c) => c,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": format!("'{kind}' not supported on {platform}")})),
+    };
+    let dev = device_name(agents, &target);
+    let detail = if arg.is_empty() { cmd.clone() } else { format!("{kind} {arg}") };
+    record_mcp_access(&target, &kind, user.unwrap_or(""), &detail);
+    audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, &kind, &dev, &detail);
+    let out = exec_output(&target, &cmd);
+    json_resp(&serde_json::json!({"ok": true, "device": dev, "kind": kind, "output": out}))
+}
+
+/// Run a command (kind=exec, cmd=…) or a canned action (kind=…, arg=…) on ALL of
+/// the user's devices, concurrently, and return per-device results.
+fn proxy_fleet(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
+    let kind = query_param(url, "kind").unwrap_or_else(|| "exec".into());
+    let cmd = query_param(url, "cmd").unwrap_or_default();
+    let arg = query_param(url, "arg").unwrap_or_default();
+    let targets = owned_targets(agents, user);
+    audit(
+        user.unwrap_or(""),
+        if via_mcp { "mcp" } else { "browser" },
+        "fleet",
+        &format!("all ({})", targets.len()),
+        &if kind == "exec" { cmd.clone() } else { format!("{kind} {arg}") },
+    );
+    let out = std::sync::Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let mut handles = Vec::new();
+    for (name, target, platform) in targets {
+        let (out, kind, cmd, arg) = (out.clone(), kind.clone(), cmd.clone(), arg.clone());
+        handles.push(std::thread::spawn(move || {
+            let command = if kind == "exec" { cmd } else { os_command(&platform, &kind, &arg).unwrap_or_default() };
+            let text = if command.is_empty() {
+                format!("(unsupported on {platform})")
+            } else {
+                exec_output(&target, &command)
+            };
+            out.lock().unwrap().push(serde_json::json!({"device": name, "output": text}));
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let mut results = std::sync::Arc::try_unwrap(out).unwrap().into_inner().unwrap();
+    results.sort_by(|a, b| a["device"].as_str().unwrap_or("").cmp(b["device"].as_str().unwrap_or("")));
+    json_resp(&serde_json::json!({"ok": true, "count": results.len(), "results": results}))
+}
+
 fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
@@ -751,6 +984,9 @@ fn register(req: &mut Request, agents: &Agents) {
             .map(|s| s.to_string())
             .or(remote_ip)
             .unwrap_or_default();
+        if let Some(o) = v.get("owner").and_then(|x| x.as_str()).map(canon_owner) {
+            v.as_object_mut().unwrap().insert("owner".to_string(), serde_json::json!(o));
+        }
         if let Some(obj) = v.as_object_mut() {
             obj.insert("ip".to_string(), serde_json::Value::String(ip.clone()));
         }
@@ -860,7 +1096,9 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <aside class=\"side\">\
 <div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code>{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
 <div class=\"legend\"><span><span class=\"dot on\"></span>online</span><span><span class=\"dot idle\"></span>idle</span><span><span class=\"dot off\"></span>stale</span></div>\
+<input id=\"devsearch\" class=\"devsearch\" type=\"search\" placeholder=\"Search devices…\" autocomplete=\"off\" oninput=\"SEARCH=this.value.toLowerCase();renderSide(LAST);\">\
 <ul id=\"devlist\" class=\"devlist\"></ul>\
+<button class=\"addbtn\" onclick=\"showFleet()\">⚡ Fleet run</button>\
 <button class=\"addbtn\" onclick=\"showAudit()\">📋 Audit log</button>\
 <button class=\"addbtn\" onclick=\"toggleReg()\">+ Register a device</button>\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><p class=\"reg-hint\">Download the agent, then run it:</p>{win}{mac}{lin}</div>\
@@ -868,6 +1106,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <main class=\"stage\">\
 <div class=\"stage-empty\" id=\"stage-empty\">Select a device from the left to control it.</div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account</span></div><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
+<div id=\"fleet-view\" style=\"display:none\"><div class=\"aud-head\">Fleet run <span class=\"dim2\">— run on all your devices, in parallel</span></div><div class=\"fleet-bar\"><input id=\"fleet-cmd\" class=\"devsearch\" placeholder=\"shell command to run on every device…\" autocomplete=\"off\"><button class=\"b\" onclick=\"runFleet()\">Run on all</button></div><div id=\"fleet-results\"></div></div>\
 <div id=\"detail\" style=\"display:none\">\
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
 <a class=\"dh-open\" id=\"d-open\" target=\"_blank\">Open agent&nbsp;↗</a></div>\
@@ -938,6 +1177,13 @@ pre{margin:0}
 .aud-dev{color:#c3c9d8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .aud-detail{color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .aud-empty{color:var(--muted2);padding:18px 8px;font-size:13px}
+.devsearch{width:100%;margin:0 0 8px;background:var(--surface2);border:1px solid var(--line2);color:#d7dbe6;border-radius:8px;padding:8px 11px;font-size:13px;outline:none}
+.devsearch:focus{border-color:var(--accent)}
+.fleet-bar{display:flex;gap:8px;margin-bottom:14px}
+.fleet-bar .devsearch{margin:0;flex:1}
+.fleet-card{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
+.fleet-dev{background:var(--surface2);padding:7px 12px;font-weight:600;font-size:12px;color:#d7dbe6}
+.fleet-out{margin:0;padding:10px 12px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.5;color:#c3c9d8;white-space:pre-wrap;max-height:200px;overflow:auto}
 .dl-load.warn{color:var(--idle)}
 .dl-load.hot{color:var(--danger)}
 .empty-li{color:var(--muted);font-size:12px;padding:14px 11px}
@@ -1021,30 +1267,38 @@ function attrEsc(s){return esc2(s).replace(/"/g,'&quot;');}
 function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(1)+' GB';}
 function toggleReg(){var r=document.getElementById('reg');r.style.display=(r.style.display==='none')?'block':'none';}
 /* ---- devices ---- */
-var DEV={},SEL=null;
+var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
-function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
+function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
+function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
 function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
 var AUDIT_ON=false;
 function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function showAudit(){AUDIT_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
+function showAudit(){AUDIT_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
+function sysCall(kind,arg){var u='/x/sys?target='+enc(SEL)+'&kind='+enc(kind);if(arg)u+='&arg='+enc(arg);out(kind+' …');fetch(u).then(function(r){return r.json();}).then(function(j){out(j.output||('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
+function doSys(){var k=prompt('Report — hardware / av / encryption / firewall / processes / services / network / packages / updates / power_report','hardware');if(k)sysCall(k.trim(),'');}
+function doPower(){var a=prompt('Action — reboot / shutdown / sleep / logoff / update_all / firewall_on / firewall_off / usb_lock / usb_unlock','sleep');if(!a)return;a=a.trim();if(!confirm(a+' — run on this device?'))return;sysCall(a,'');}
+function doMsg(){var t=prompt('Message to show the logged-in user:');if(t)sysCall('message',t);}
+function doInstall(){var p=prompt('Package to install (winget id / brew formula / apt package):');if(p)sysCall('install',p.trim());}
+function doPosture(){out('checking compliance…');fetch('/x/sys?target='+enc(SEL)+'&kind=posture').then(function(r){return r.json();}).then(function(j){if(!j.ok){out('[error] '+(j.error||'failed'));return;}var s='Compliance: '+j.grade+' ('+j.score+'/100)\n';(j.checks||[]).forEach(function(c){s+='  ['+(c.pass?'PASS':'FAIL')+'] '+c.check+'\n';});out(s);}).catch(function(e){out('error: '+e);});}
+function showFleet(){AUDIT_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
+function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch('/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){var ev=j.audit||[];var el=document.getElementById('audit-rows');if(!ev.length){el.innerHTML='<div class="aud-empty">No device actions recorded yet.</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}).catch(function(){});}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){AUDIT_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){AUDIT_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
 function specHtml(d){function sp(l,v){return (v!=null&&v!=='')?('<span class="spec"><span class="sl">'+l+'</span><span class="sv">'+esc2(v)+'</span></span>'):'';}var ifs='';(d.interfaces||[]).forEach(function(i){if(!i.addr||i.addr.indexOf('fe80')===0||i.addr==='::1'||i.addr.indexOf('127.')===0)return;ifs+='<span class="chip"><b>'+esc2(i.name)+'</b> '+esc2(i.addr)+'</span>';});var mics='';(d.microphones||[]).forEach(function(m){mics+='<span class="chip mic">🎙 '+esc2(m)+'</span>';});var chips=(ifs||mics)?('<div class="chiprow">'+ifs+mics+'</div>'):'';return sp('OS',(d.os||'')+(d.arch?(' ('+d.arch+')'):''))+sp('User',d.user)+sp('CPU',d.cpu)+sp('Cores',d.cores)+sp('Memory',d.mem_gb?(d.mem_gb+' GB total'):'')+metersHtml(d)+chips;}
 function camSelect(d){var o='';d.cameras.forEach(function(c,i){o+='<option value="'+i+'">'+esc2(c)+'</option>';});return '<select class="campick" id="campick" title="select camera">'+o+'</select>';}
-function buildControls(d){var cam=d.cameras&&d.cameras.length;var h='';h+='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button>';h+='<button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';if(cam){h+=camSelect(d);h+='<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button>';h+='<button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{h+='<span class="chip off">no camera</span>';}h+='<button class="b" onclick="doRun()" title="run one command">Run…</button>';h+='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';h+='<button class="b" onclick="doGet()" title="download a file">Get file</button>';h+='<button class="b" onclick="doPut()" title="upload a file">Put file</button>';h+='<button class="b subtle" onclick="doUpd()" title="update agent">Update</button>';h+='<button class="b danger" onclick="doDis()" title="dissolve agent">Dissolve</button>';return h;}
+function buildControls(d){var cam=d.cameras&&d.cameras.length;var h='';h+='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button>';h+='<button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';if(cam){h+=camSelect(d);h+='<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button>';h+='<button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{h+='<span class="chip off">no camera</span>';}h+='<button class="b" onclick="doRun()" title="run one command">Run…</button>';h+='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';h+='<button class="b" onclick="doSys()" title="system report">System…</button>';h+='<button class="b" onclick="doPower()" title="power action">Power…</button>';h+='<button class="b" onclick="doMsg()" title="message the logged-in user">Message…</button>';h+='<button class="b" onclick="doInstall()" title="install a package">Install…</button>';h+='<button class="b" onclick="doPosture()" title="security compliance check">Compliance</button>';h+='<button class="b" onclick="doGet()" title="download a file">Get file</button>';h+='<button class="b" onclick="doPut()" title="upload a file">Put file</button>';h+='<button class="b subtle" onclick="doUpd()" title="update agent">Update</button>';h+='<button class="b danger" onclick="doDis()" title="dissolve agent">Dissolve</button>';return h;}
 function camI(){var s=document.getElementById('campick');return (s&&s.value)?s.value:'0';}
 function setView(url){var v=document.getElementById('view');v.src=url;v.style.display='block';document.getElementById('vp-hint').style.display='none';document.getElementById('vp-tools').style.display='flex';}
 function stopView(){var v=document.getElementById('view');v.removeAttribute('src');v.style.display='none';document.getElementById('vp-hint').style.display='block';document.getElementById('vp-tools').style.display='none';}
@@ -1076,6 +1330,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 /* ---- init + live poll (no full reload, so streams keep playing) ---- */
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
+document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
 (function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
 </script>"#;
 
