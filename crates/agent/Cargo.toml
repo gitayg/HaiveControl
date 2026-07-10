@@ -23,6 +23,7 @@ ureq = { version = "2", features = ["json"] }
 sysinfo = "0.33"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 self-replace = "1"
+portable-pty = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

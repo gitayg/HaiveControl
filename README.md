@@ -154,14 +154,17 @@ the right. Pick a device and everything happens in place — no new tabs. The si
 polls every few seconds so status dots (online / idle / stale) and last-seen stay live
 without reloading (an active stream keeps playing).
 
-Per selected device you get its details (OS, CPU, memory, user, IPs, cameras, mics) and
-an action bar that renders results **in the stage viewport**:
+Per selected device you get its details (OS, CPU, memory, user, IPs, cameras, mics),
+**live CPU-load and free-RAM meters** (re-sampled every cycle), and an action bar that
+renders results **in the stage viewport**:
 
 - **● Live screen** — the full screen streams live (MJPEG).
 - **● Cam live** — live webcam video. A **camera picker** chooses which camera; the
   same picker feeds **Camera shot**.
 - **Screenshot** / **Camera shot** — a single fresh frame.
-- **Run…** — enter a command; stdout/stderr print to the inline console.
+- **Run…** — enter a single command; stdout/stderr print to the inline console.
+- **Shell** — a full **interactive terminal** (xterm.js over a real PTY): colors,
+  `Ctrl-C`, arrows, tab-completion, `top`/`vim`, live resize.
 - **Get file / Put file** — a remote **file browser** to download or upload.
 - **Update** — hot-update this agent to the hub's latest build.
 - **Dissolve** — stop the agent and remove its autostart (does not delete the binary).
@@ -236,6 +239,34 @@ Config via env (set in your MCP client, or export before launch): `HAIVE_HUB`
 Then just ask: *"take a screenshot of mymac"*, *"run `ipconfig` on mymac"*,
 *"download C:\logs\app.log from mymac"*.
 
+## Reverse-tunnel relay (control beyond the LAN)
+
+The default model is **pull**: the hub reaches *into* each device at its IP. That only
+works when the hub can route to the device — same LAN. To control devices **across NAT**
+or from a **cloud-hosted hub**, run the agent in **relay mode**: it dials *out* to the
+hub and holds the connection, and the hub drives it back down that channel. The device
+never needs a public address.
+
+```bash
+HaiveControl <mac-id> --relay https://your-hub.example.com     # cloud hub
+HaiveControl <mac-id> --relay http://192.168.1.10:8770         # or any reachable hub
+```
+
+- The tunnel is **HTTP long-poll on the hub's normal port** (`/relay/hello`, `/relay/poll`,
+  `/relay/reply`) — no extra port, no WebSocket — so it rides a single HTTPS endpoint.
+  Every action (screenshot, live video, shell, files, update, dissolve) works over it:
+  the agent satisfies each request by calling its own loopback server and streams the
+  result back.
+- Relay devices show up in the dashboard like any other, tagged `relay`, with live
+  CPU/RAM.
+
+**Deploying the hub on a PaaS (e.g. AppCrane / crane.glick.run):** put the tunnel + proxy
+paths behind an SSO-bypass prefix so agents (which carry no browser cookie) can reach them
+and long-lived connections aren't buffered or timed out — on AppCrane that's
+`auth_bypass_paths=["/relay","/x","/bin"]`, which sets `flush_interval -1` and disables
+read/write timeouts. TLS is terminated at the platform edge (`wss`/`https`), so the tunnel
+is encrypted end-to-end even though it speaks plain HTTP inside.
+
 ## Config (environment variables)
 
 | Var              | Default    | Meaning                                      |
@@ -272,12 +303,15 @@ point the shortcut at a small `.bat` that does `set SCREEN_PW=… & HaiveControl
 ## Layout (Rust workspace)
 - `crates/agent` → **`HaiveControl`** — the agent (Windows/macOS/Linux): screen capture,
   `/frame`, `/stream` (live MJPEG), `/camera` + `/camstream` (webcam), `/input`, `/exec`,
-  `/upload`, `/download`, `/list`, `/update`, `/dissolve`; registers to the hub and
-  reports full sysinfo. Modules: `capture` (xcap + nokhwa), `input` (enigo), `tls`
-  (rcgen), `discovery` (mdns-sd, self-update), `persistence`, `http`.
+  `/shell/*` (interactive PTY shell), `/upload`, `/download`, `/list`, `/update`,
+  `/dissolve`; registers to the hub and reports full sysinfo + live CPU/RAM. Modules:
+  `capture` (xcap + nokhwa), `input` (enigo), `shell` (portable-pty), `tls` (rcgen),
+  `discovery` (mdns-sd, self-update), `relay` (outbound long-poll tunnel), `http`
+  (which also runs a loopback twin the relay self-calls), `persistence`.
 - `crates/hub` → **`HaiveHub`** — the Mac hub: Bonjour advertise, `/register`, `/agents`,
-  the single-page dashboard, hosts the agent binaries (`/bin/*`), and proxies device
-  actions (`/x/*`, incl. live-stream passthrough).
+  the single-page dashboard (with a bundled xterm.js terminal at `/assets/*`), hosts the
+  agent binaries (`/bin/*`), proxies device actions (`/x/*`, incl. live-stream
+  passthrough), and terminates the reverse tunnel (`/relay/*`, see `relay.rs`).
 - `crates/cli` → **`haivectl`** — Mac CLI: `list` / `exec` / `get` / `put` by device name.
 - `crates/mcp` → **`haive-mcp`** — Mac MCP server: `list_devices` / `screenshot` /
   `run_command` / `download_file` / `upload_file` tools (rmcp).

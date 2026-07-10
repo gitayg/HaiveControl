@@ -22,9 +22,16 @@ pub fn local_ip() -> String {
 pub fn register_loop(primary: String, fallback_id: Option<String>, name: String, port: u16, scheme: &'static str, info: serde_json::Value) {
     let mut enrolled = false;
     loop {
+        // Merge freshly-sampled CPU load + free RAM into the static sysinfo each cycle.
+        let mut payload = info.clone();
+        if let (Some(obj), Some(metrics)) = (payload.as_object_mut(), crate::live_metrics().as_object()) {
+            for (k, v) in metrics {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
         let mut ok = false;
         if let Some((ip, hport)) = direct_addr(&primary) {
-            ok = post_register(&ip, hport, &name, port, scheme, &info);
+            ok = post_register(&ip, hport, &name, port, scheme, &payload);
         }
         if !ok {
             let id = if direct_addr(&primary).is_some() {
@@ -34,7 +41,7 @@ pub fn register_loop(primary: String, fallback_id: Option<String>, name: String,
             };
             if let Some(id) = id {
                 if let Some((ip, hport)) = mdns_resolve(id) {
-                    ok = post_register(&ip, hport, &name, port, scheme, &info);
+                    ok = post_register(&ip, hport, &name, port, scheme, &payload);
                 }
             }
         }

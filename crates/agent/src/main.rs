@@ -6,6 +6,8 @@ mod discovery;
 mod http;
 mod input;
 mod persistence;
+mod relay;
+mod shell;
 mod tls;
 
 use std::sync::{mpsc, Arc};
@@ -13,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-const VERSION: &str = "2.1.0";
+const VERSION: &str = "2.2.0";
 
 #[derive(Parser)]
 #[command(name = "HaiveControl", version = VERSION,
@@ -38,6 +40,18 @@ struct Args {
     /// remove autostart and exit
     #[arg(long)]
     uninstall: bool,
+    /// dial OUT to a (possibly cloud) hub relay at HOST[:PORT] (default port 8771),
+    /// so the hub can reach this device through NAT
+    #[arg(long, value_name = "HOST[:PORT]")]
+    relay: Option<String>,
+}
+
+fn relay_id(name: &str) -> String {
+    let base: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    format!("{base}-{}", std::process::id())
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -85,6 +99,25 @@ fn collect_sysinfo() -> serde_json::Value {
         "cameras": cameras,
         "microphones": microphones,
     })
+}
+
+/// Live, per-cycle metrics (re-sampled on every re-registration): CPU load % and
+/// free RAM. Kept separate from the static sysinfo gathered once at startup.
+pub(crate) fn live_metrics() -> serde_json::Value {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_cpu_all();
+    let cpus = sys.cpus();
+    let cpu_pct = if cpus.is_empty() {
+        0.0
+    } else {
+        (cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / cpus.len() as f64 * 10.0).round() / 10.0
+    };
+    sys.refresh_memory();
+    let free_gb = (sys.available_memory() as f64 / 1_073_741_824.0 * 10.0).round() / 10.0;
+    serde_json::json!({ "cpu_pct": cpu_pct, "free_gb": free_gb })
 }
 
 #[cfg(target_os = "macos")]
@@ -177,13 +210,12 @@ fn main() {
         return;
     }
 
-    let mac_id = match args.mac_id.clone().or_else(|| std::env::var("SCREEN_HUB").ok()) {
-        Some(m) => m,
-        None => {
-            eprintln!("usage: HaiveControl <mac-id> [password] [--name N] [--persist | --ttl MIN]");
-            std::process::exit(2);
-        }
-    };
+    let mac_id = args.mac_id.clone().or_else(|| std::env::var("SCREEN_HUB").ok());
+    if mac_id.is_none() && args.relay.is_none() {
+        eprintln!("usage: HaiveControl <mac-id> [password] [--name N] [--persist | --ttl MIN] [--relay HOST[:PORT]]");
+        std::process::exit(2);
+    }
+    let mac_id_disp = mac_id.clone().unwrap_or_default();
 
     let password = args.password.clone().unwrap_or_else(|| env_or("SCREEN_PW", ""));
     let port: u16 = env_or("SCREEN_PORT", "8765").parse().unwrap_or(8765);
@@ -203,7 +235,7 @@ fn main() {
     let geo = grabber.geometry();
 
     let lifetime = if args.persist {
-        persistence::install(&persistence::boot_args(&mac_id, &args.password, &args.name));
+        persistence::install(&persistence::boot_args(&mac_id_disp, &args.password, &args.name));
         "persistent (starts on boot)".to_string()
     } else if let Some(mins) = args.ttl {
         std::thread::spawn(move || {
@@ -236,22 +268,27 @@ fn main() {
     std::thread::spawn(move || input::run(rx, geo));
 
     let sysinfo = collect_sysinfo();
-    {
-        let (primary, fid, nm) = (mac_id.clone(), args.id.clone(), name.clone());
-        std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, sysinfo));
-    }
-    {
+    if let Some(mid) = mac_id.clone() {
+        let (primary, fid, nm, si) = (mid.clone(), args.id.clone(), name.clone(), sysinfo.clone());
+        std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, si));
         let asset = match std::env::consts::OS {
             "windows" => "HaiveControl-windows.exe",
             "macos" => "HaiveControl-macos",
             _ => "HaiveControl-linux",
         }
         .to_string();
-        let (primary, fid) = (mac_id.clone(), args.id.clone());
-        std::thread::spawn(move || discovery::auto_update_loop(primary, fid, asset));
+        let fid = args.id.clone();
+        std::thread::spawn(move || discovery::auto_update_loop(mid, fid, asset));
+    }
+    if let Some(relay_addr) = args.relay.clone() {
+        let rid = relay_id(&name);
+        let (nm, si) = (name.clone(), sysinfo.clone());
+        println!("   relay: dialing {relay_addr} as {rid}");
+        std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si));
     }
 
-    println!("HaiveControl {VERSION} — serving '{name}' on {scheme}://…:{port}, registering to '{mac_id}'");
+    let registering = if mac_id.is_some() { format!("registering to '{mac_id_disp}'") } else { "relay-only".to_string() };
+    println!("HaiveControl {VERSION} — serving '{name}' on {scheme}://…:{port}, {registering}");
     println!("   lifetime: {lifetime}");
     println!(
         "   tls: {} | password: {} | exec: {}",
