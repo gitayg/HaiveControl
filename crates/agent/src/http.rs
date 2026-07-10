@@ -11,6 +11,14 @@ use crate::input::Ev;
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
+/// Port of the plaintext loopback server (127.0.0.1 only) the relay self-calls.
+/// 0 until `serve` has bound it.
+static LOOPBACK_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+pub fn loopback_port() -> u16 {
+    LOOPBACK_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Config {
     pub password: String,
     pub port: u16,
@@ -24,6 +32,26 @@ pub struct Config {
 }
 
 pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
+    // A plaintext, loopback-only twin of the main server. It reuses the same
+    // handler, so the relay can self-call every endpoint over 127.0.0.1 without
+    // dealing with the self-signed TLS cert. Bound to 127.0.0.1 → not remotely
+    // reachable; loopback requests are treated as authorized in `handle`.
+    if let Ok(lb) = Server::http("127.0.0.1:0") {
+        if let Some(addr) = lb.server_addr().to_ip() {
+            LOOPBACK_PORT.store(addr.port(), std::sync::atomic::Ordering::Relaxed);
+        }
+        let lb = Arc::new(lb);
+        for _ in 0..16 {
+            let (s, c, tx) = (lb.clone(), cfg.clone(), input_tx.clone());
+            std::thread::spawn(move || loop {
+                match s.recv() {
+                    Ok(req) => handle(req, &c, &tx),
+                    Err(_) => break,
+                }
+            });
+        }
+    }
+
     let server = Arc::new(build_server(&cfg));
     let mut handles = Vec::new();
     for _ in 0..8 {
@@ -90,7 +118,9 @@ fn json_resp(v: &serde_json::Value, code: u16) -> Resp {
 }
 
 fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
-    if !authorized(&req, cfg) {
+    // Loopback (the relay self-call and local tools) is implicitly trusted.
+    let is_local = req.remote_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
+    if !is_local && !authorized(&req, cfg) {
         let _ = req.respond(
             Response::from_string("Authentication required")
                 .with_status_code(401)
@@ -124,6 +154,20 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
             Response::from_string("").with_status_code(204)
         }
         (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Post, "/shell/open") => shell_open_ep(cfg),
+        (Method::Get, "/shell/read") => shell_read_ep(&url),
+        (Method::Post, "/shell/input") => shell_input_ep(&mut req, &url),
+        (Method::Post, "/shell/resize") => {
+            let sid = query_val(&url, "sid").unwrap_or_default();
+            let cols = query_val(&url, "cols").and_then(|v| v.parse().ok()).unwrap_or(120);
+            let rows = query_val(&url, "rows").and_then(|v| v.parse().ok()).unwrap_or(30);
+            crate::shell::resize(&sid, cols, rows);
+            Response::from_string("").with_status_code(204)
+        }
+        (Method::Post, "/shell/close") => {
+            crate::shell::close(&query_val(&url, "sid").unwrap_or_default());
+            Response::from_string("closed")
+        }
         (Method::Post, "/update") => update_ep(&mut req),
         (Method::Post, "/dissolve") => dissolve_ep(),
         (Method::Get, "/download") => download_ep(&url, cfg),
@@ -200,6 +244,41 @@ fn query_index(url: &str) -> u32 {
         .find_map(|kv| kv.strip_prefix("index="))
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(0)
+}
+
+fn query_val(url: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    url.split('?').nth(1)?.split('&').find_map(|kv| kv.strip_prefix(&prefix)).map(|s| s.to_string())
+}
+
+fn shell_open_ep(cfg: &Config) -> Resp {
+    if !cfg.exec_enabled {
+        return json_resp(&serde_json::json!({"ok": false, "error": "shell disabled"}), 403);
+    }
+    match crate::shell::open() {
+        Some(sid) => json_resp(&serde_json::json!({"ok": true, "sid": sid}), 200),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "failed to start shell"}), 500),
+    }
+}
+
+fn shell_input_ep(req: &mut Request, url: &str) -> Resp {
+    let sid = query_val(url, "sid").unwrap_or_default();
+    let mut body = Vec::new();
+    let _ = req.as_reader().read_to_end(&mut body);
+    if crate::shell::input(&sid, &body) {
+        Response::from_string("").with_status_code(204)
+    } else {
+        Response::from_string("no session").with_status_code(404)
+    }
+}
+
+fn shell_read_ep(url: &str) -> Resp {
+    let sid = query_val(url, "sid").unwrap_or_default();
+    let from = query_val(url, "from").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    match crate::shell::read_from(&sid, from, std::time::Duration::from_secs(10)) {
+        Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "text/plain; charset=utf-8")),
+        None => Response::from_string("no shell session").with_status_code(404),
+    }
 }
 
 /// Boundary header for one JPEG frame in a multipart/x-mixed-replace stream.
