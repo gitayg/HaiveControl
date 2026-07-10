@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.7";
+const VERSION: &str = "2.2.8";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -114,7 +114,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                     return;
                 }
-                record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""));
+                record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""), "");
                 if auditable(&path) {
                     audit(mowner.as_deref().unwrap_or(""), "mcp", action_label(&path), &device_name(agents, &t), "");
                 }
@@ -221,7 +221,7 @@ fn device_owner(agents: &Agents, target: &str) -> Option<String> {
     agents.lock().unwrap().get(&device_key(target)).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from))
 }
 
-type AccessEvent = (Instant, String, String); // (when, action, owner)
+type AccessEvent = (Instant, String, String, String); // (when, action, owner, detail)
 
 /// Recent MCP (/m) accesses per device, newest first — drives the dashboard's
 /// live "agent accessing" indicator + activity log.
@@ -230,14 +230,14 @@ fn access_log() -> &'static Mutex<HashMap<String, std::collections::VecDeque<Acc
     A.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_mcp_access(target: &str, action: &str, owner: &str) {
+fn record_mcp_access(target: &str, action: &str, owner: &str, detail: &str) {
     let key = device_key(target);
     if key.is_empty() {
         return;
     }
     let mut m = access_log().lock().unwrap();
     let dq = m.entry(key).or_default();
-    dq.push_front((Instant::now(), action.to_string(), owner.to_string()));
+    dq.push_front((Instant::now(), action.to_string(), owner.to_string(), detail.chars().take(180).collect()));
     dq.truncate(8);
 }
 
@@ -588,10 +588,10 @@ fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: b
     if !may_control(user, agents, target) {
         return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
     }
-    if via_mcp {
-        record_mcp_access(target, "run command", user.unwrap_or(""));
-    }
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
+    if via_mcp {
+        record_mcp_access(target, "run command", user.unwrap_or(""), cmd);
+    }
     audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, "run command", &device_name(agents, target), cmd);
     let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
     match dev_unary(target, "POST", "/exec", Some(("application/json".into(), payload))) {
@@ -608,9 +608,9 @@ fn proxy_input(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     if !may_control(user, agents, target) {
         return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
     }
-    record_mcp_access(target, "input", user.unwrap_or(""));
     let ev = v.get("ev").cloned().unwrap_or_else(|| serde_json::json!({}));
     let ev_kind = ev.get("type").and_then(|x| x.as_str()).unwrap_or("input");
+    record_mcp_access(target, "input", user.unwrap_or(""), ev_kind);
     audit(user.unwrap_or(""), "mcp", "input", &device_name(agents, target), ev_kind);
     match dev_unary(target, "POST", "/input", Some(("application/json".into(), ev.to_string().into_bytes()))) {
         Some(_) => Response::from_string("").with_status_code(204),
@@ -777,11 +777,11 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
                     // Only surface accesses within the last 5 minutes.
                     let recent: Vec<serde_json::Value> = events
                         .iter()
-                        .map(|(at, act, own)| (now.duration_since(*at).as_secs(), act, own))
-                        .filter(|(secs, _, _)| *secs < 300)
-                        .map(|(secs, act, own)| serde_json::json!({"action": act, "owner": own, "secs": secs}))
+                        .map(|(at, act, own, det)| (now.duration_since(*at).as_secs(), act, own, det))
+                        .filter(|(secs, ..)| *secs < 300)
+                        .map(|(secs, act, own, det)| serde_json::json!({"action": act, "owner": own, "secs": secs, "detail": det}))
                         .collect();
-                    let active = events.front().map(|(at, _, _)| now.duration_since(*at).as_secs() < 10).unwrap_or(false);
+                    let active = events.front().map(|(at, ..)| now.duration_since(*at).as_secs() < 10).unwrap_or(false);
                     o.insert("mcp_active".to_string(), serde_json::json!(active));
                     o.insert("mcp_log".to_string(), serde_json::json!(recent));
                 }
@@ -920,9 +920,10 @@ pre{margin:0}
 .act-dot{width:8px;height:8px;border-radius:50%;background:var(--muted2);display:inline-block;margin-right:8px;flex:none}
 .act-head.live{color:var(--accent)}
 .act-head.live .act-dot{background:var(--on);box-shadow:0 0 8px var(--on);animation:mcppulse 1s ease-in-out infinite}
-.act-row{display:flex;gap:12px;font-size:12px;color:var(--muted);padding:2px 0}
-.act-act{color:#c3c9d8;min-width:120px}
-.act-by{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.act-row{display:flex;gap:12px;font-size:12px;color:var(--muted);padding:3px 0;cursor:default}
+.act-act{color:#c3c9d8;min-width:110px;flex:none}
+.act-det{flex:1;min-width:0;font-family:ui-monospace,Menlo,monospace;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.act-by{flex:none;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .act-ago{font-variant-numeric:tabular-nums;flex:none}
 .aud-head{font-size:16px;font-weight:700;margin-bottom:12px}
 .aud-cols,.aud-row{display:grid;grid-template-columns:78px 62px 130px 130px 150px 1fr;gap:12px;align-items:center;padding:7px 8px}
@@ -1026,7 +1027,7 @@ function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;retur
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
 function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});renderSide(arr);if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;showEmpty();}if(!SEL&&arr.length){select(baseOf(arr[0]));}}).catch(function(){});}
 function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');if(!arr.length){el.innerHTML='<li class="empty-li">No devices yet — register one below.</li>';return;}var h='';arr.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
-function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){return '<div class="act-row"><span class="act-act">'+esc2(e.action)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
+function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
 function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='block';}
