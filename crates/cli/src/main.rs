@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
 
 #[derive(Parser)]
-#[command(name = "haivectl", version = "2.2.2",
+#[command(name = "haivectl", version = "2.2.3",
     about = "Drive a HaiveControl device from the Mac (resolved by hub name).")]
 struct Cli {
     /// hub URL
