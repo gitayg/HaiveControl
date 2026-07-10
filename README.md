@@ -232,12 +232,22 @@ Runs on the Mac next to the hub. Register the binary:
 claude mcp add haive -- /full/path/to/haive-mcp
 ```
 
-Config via env (set in your MCP client, or export before launch): `HAIVE_HUB`
-(default `http://localhost:8770`), `SCREEN_PW` (if the agent set one), `HAIVE_CAFILE`
-(agent `cert.pem` to verify TLS — otherwise unverified, LAN only).
+The MCP drives devices **entirely through the hub's `/m` API** (it never talks to an
+agent directly), so the same setup works for LAN *and* cloud/relay devices. Config via env
+(set in your MCP client, or export before launch):
+- `HAIVE_HUB` — hub base URL (default `http://localhost:8770`; a cloud hub's `https://…`).
+- `HIVE_MCP_TOKEN` — token for the hub's `/m` API (must match the hub's `MCP_TOKEN`).
+- `HIVE_OWNER` — the owner id to act as, so a multi-user hub scopes tools to your devices.
+- `HAIVE_CAFILE` — optional PEM to verify a self-signed hub cert.
 
 Then just ask: *"take a screenshot of mymac"*, *"run `ipconfig` on mymac"*,
 *"download C:\logs\app.log from mymac"*.
+
+**Against a cloud hub (crane.glick.run):** set `MCP_TOKEN` on the hub and add `/m` to
+`auth_bypass_paths` (a headless MCP can't pass SSO — same reason as the agent). Then point
+the local MCP at it with `HAIVE_HUB=https://<app-url>`, `HIVE_MCP_TOKEN=<token>`,
+`HIVE_OWNER=<your-email>`. The MCP runs on your Mac; only its HTTP calls to the hub cross
+the network.
 
 ## Reverse-tunnel relay (control beyond the LAN)
 
@@ -276,7 +286,8 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
      commands (add a custom domain for a cleaner product).
    - `RELAY_TOKEN=<a long random secret>` — **the agent's credential**; it replaces SSO on
      `/relay`, and the dashboard bakes it into the shown install command.
-3. **Bypass SSO on the agent-facing paths** (`auth_bypass_paths=["/relay","/bin"]`) so
+3. **Bypass SSO on the agent-facing paths** (`auth_bypass_paths=["/relay","/bin","/m"]`;
+   add `/m` only if you use the MCP) so
    devices can reach the tunnel + downloads and long-lived connections aren't buffered or
    cut — on AppCrane this sets `flush_interval -1` and zero read/write timeouts. **Keep
    `/x/*` behind SSO** — that's the device-control surface, admin-only. TLS is terminated at
