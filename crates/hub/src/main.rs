@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.2.1";
+const VERSION: &str = "2.2.2";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -82,6 +82,13 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         proxy_stream(req, &url, &path);
         return;
     }
+    // Agents can't pass the PaaS SSO (headless), so /relay is SSO-bypassed — which
+    // means the hub must authenticate them itself. If RELAY_TOKEN is set, every
+    // /relay call must carry ?tok=<token>. Unset = open (trusted LAN / dev).
+    if path.starts_with("/relay/") && !relay_ok(&url) {
+        let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+        return;
+    }
     let resp = match (&method, path.as_str()) {
         (Method::Post, "/register") => {
             register(&mut req, agents);
@@ -138,6 +145,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
 
 fn text_resp(body: String, ct: &str) -> Resp {
     Response::from_string(body).with_header(hdr("Content-Type", ct))
+}
+
+/// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset.
+fn relay_ok(url: &str) -> bool {
+    match std::env::var("RELAY_TOKEN") {
+        Ok(t) if !t.is_empty() => query_param(url, "tok").as_deref() == Some(t.as_str()),
+        _ => true,
+    }
 }
 
 // xterm.js terminal, bundled into the binary and served same-origin (no CDN).
@@ -567,10 +582,14 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16) -> Res
     let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
         Some(pub_url) => {
             let b = pub_url.trim_end_matches('/').to_string();
+            let tok = match std::env::var("RELAY_TOKEN") {
+                Ok(t) if !t.is_empty() => format!(" --relay-token {t}"),
+                _ => String::new(),
+            };
             (
-                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b} --name my-pc")),
-                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b} --name my-mac")),
-                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b} --name my-box")),
+                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{tok} --name my-pc")),
+                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{tok} --name my-mac")),
+                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{tok} --name my-box")),
             )
         }
         None => {
