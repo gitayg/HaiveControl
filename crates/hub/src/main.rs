@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.2";
+const VERSION: &str = "2.11.3";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -1205,7 +1205,19 @@ fn plugins_dir() -> std::path::PathBuf {
     let _ = std::fs::create_dir_all(&d);
     d
 }
+fn plugins_cache() -> &'static Mutex<Option<Vec<serde_json::Value>>> {
+    static C: std::sync::OnceLock<Mutex<Option<Vec<serde_json::Value>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+fn invalidate_plugins() {
+    *plugins_cache().lock().unwrap() = None;
+}
 fn load_plugins() -> Vec<serde_json::Value> {
+    // Cached in memory — resolved per-device inside proxy_fleet + per action in
+    // proxy_sys, so avoid a dir read+parse each time. Invalidated on add/delete.
+    if let Some(v) = plugins_cache().lock().unwrap().as_ref() {
+        return v.clone();
+    }
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(plugins_dir()) {
         for e in rd.flatten() {
@@ -1219,6 +1231,7 @@ fn load_plugins() -> Vec<serde_json::Value> {
             }
         }
     }
+    *plugins_cache().lock().unwrap() = Some(out.clone());
     out
 }
 /// Render a plugin's command for the platform, or None if no plugin/os match.
@@ -1271,6 +1284,7 @@ fn plugin_add(req: &mut Request, user: Option<&str>) -> Resp {
     if std::fs::write(plugins_dir().join(format!("{slug}.json")), serde_json::to_string_pretty(&rec).unwrap_or_default()).is_err() {
         return json_resp(&serde_json::json!({"ok": false, "error": "could not save — is HUB_DATA writable?"}));
     }
+    invalidate_plugins();
     audit(user.unwrap_or(""), "browser", "add plugin", &name, &slug);
     json_resp(&serde_json::json!({"ok": true, "id": slug}))
 }
@@ -1279,6 +1293,7 @@ fn plugin_delete(url: &str, user: Option<&str>) -> Resp {
     let slug = sanitize(&query_param(url, "id").unwrap_or_default());
     if !slug.is_empty() {
         let _ = std::fs::remove_file(plugins_dir().join(format!("{slug}.json")));
+        invalidate_plugins();
         audit(user.unwrap_or(""), "browser", "delete plugin", &slug, "");
     }
     json_resp(&serde_json::json!({"ok": true}))
@@ -1412,8 +1427,19 @@ fn cve_lookup(url: &str) -> Resp {
 fn settings_path() -> std::path::PathBuf {
     data_dir().join("settings.json")
 }
+fn settings_cache() -> &'static Mutex<Option<serde_json::Value>> {
+    static C: std::sync::OnceLock<Mutex<Option<serde_json::Value>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
 fn load_settings() -> serde_json::Value {
-    std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| serde_json::json!({}))
+    // Cached in memory — read on every agent's /relay/config poll, so avoid a
+    // disk read+parse per poll. Invalidated in save_setting.
+    if let Some(v) = settings_cache().lock().unwrap().as_ref() {
+        return v.clone();
+    }
+    let v = std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| serde_json::json!({}));
+    *settings_cache().lock().unwrap() = Some(v.clone());
+    v
 }
 fn setting_str(key: &str, default: &str) -> String {
     load_settings().get(key).and_then(|x| x.as_str()).unwrap_or(default).to_string()
@@ -1423,6 +1449,7 @@ fn save_setting(key: &str, val: &str) {
     s[key] = serde_json::json!(val);
     let _ = std::fs::create_dir_all(data_dir());
     let _ = std::fs::write(settings_path(), serde_json::to_string_pretty(&s).unwrap_or_default());
+    *settings_cache().lock().unwrap() = None; // invalidate
 }
 fn settings_get() -> Resp {
     json_resp(&serde_json::json!({"ok": true, "agent_update": setting_str("agent_update", "manual"), "tray": setting_str("tray", "on"), "server_version": VERSION}))
@@ -1576,12 +1603,23 @@ fn now_secs() -> u64 {
 fn schedules_path() -> std::path::PathBuf {
     data_dir().join("schedules.json")
 }
+fn schedules_cache() -> &'static Mutex<Option<Vec<serde_json::Value>>> {
+    static C: std::sync::OnceLock<Mutex<Option<Vec<serde_json::Value>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
 fn load_schedules() -> Vec<serde_json::Value> {
-    std::fs::read_to_string(schedules_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+    // Cached — the scheduler tick + endpoints read it; only writes touch disk.
+    if let Some(v) = schedules_cache().lock().unwrap().as_ref() {
+        return v.clone();
+    }
+    let v: Vec<serde_json::Value> = std::fs::read_to_string(schedules_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    *schedules_cache().lock().unwrap() = Some(v.clone());
+    v
 }
 fn save_schedules(v: &[serde_json::Value]) {
     let _ = std::fs::create_dir_all(data_dir());
     let _ = std::fs::write(schedules_path(), serde_json::to_string_pretty(v).unwrap_or_default());
+    *schedules_cache().lock().unwrap() = Some(v.to_vec()); // keep cache fresh
 }
 /// Next fire time (epoch secs) for a schedule spec: once / interval / daily (UTC).
 fn next_run_from(when: &serde_json::Value) -> u64 {
