@@ -197,7 +197,19 @@ and replayable in **🎬 Recordings** through the bundled terminal, original tim
 everywhere — dropdown, fleet, schedule, and MCP (`list_plugins` / `run_plugin`) — no rebuild.
 
 **Device map.** **🗺 Map** plots each device by approximate location (public-IP geolocation,
-city-level, resolved server-side). LAN/private-IP devices are listed as unlocated.
+city-level, resolved server-side) on a real Leaflet/OpenStreetMap basemap (graticule fallback if
+offline). LAN/private-IP devices are listed as unlocated.
+
+**CVE lookup.** **🔎 CVE lookup** queries NVD for known CVEs of a product/keyword (CVSS-sorted).
+A manual lookup, not an automated scan. Also over MCP as `cve_lookup`.
+
+**Settings & auto-update.** **⚙ Settings** lets an admin choose **Manual** or **Automatic** agent
+updates; on automatic, the hub pushes updates to devices running behind its served build.
+
+**Action discovery.** `GET /actions` (and `/m/actions`) returns a machine-readable catalog of every
+runnable action (built-ins + plugins) with how-to-invoke hints — so a non-MCP agent can discover
+capabilities. Actions are presented per-device as a labeled list (variant dropdown + Execute +
+optional schedule), and the sidebar groups the global views (Fleet / Security / Ops / System).
 
 **Agent version.** The device detail shows the running agent version and whether it's behind the
 hub's served build; the **Update** button shows the target version (`Update → x.y.z`).

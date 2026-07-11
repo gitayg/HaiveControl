@@ -114,3 +114,10 @@ dashboard runner, and MCP `run_command`'s optional `detach`. Pairs with driving 
 `/frame` + `/input`. _Needs the release + agent-update cycle to reach devices (agent change)._
 
 ### (b) _(pending — you said two; send the second and I'll log it here)_
+
+---
+
+## Recently shipped (beyond the original list)
+
+- **NVD CVE-lookup** ✅ — `🔎 CVE lookup` view + `/x|m/cve` + MCP `cve_lookup` (keyword → CVEs, CVSS-sorted). Replaces the dropped OSV scan idea (both weak on Windows; this is an honest manual lookup).
+- **Geo basemap** ✅ — the `🗺 Map` upgraded from a graticule to **Leaflet + OSM tiles** (fetched at build, served at `/bin/leaflet.*`, graticule fallback).

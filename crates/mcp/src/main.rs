@@ -145,6 +145,11 @@ struct RunScriptFleetArgs {
     script: String,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
+struct CveArgs {
+    /// product or keyword to search NVD for (e.g. "openssl 3.0", "Google Chrome", "log4j")
+    query: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
 struct RunPluginArgs {
     device: String,
     /// the plugin id from list_plugins
@@ -524,6 +529,22 @@ impl Srv {
             })
             .unwrap_or_else(|| "no devices".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Look up known CVEs for a product/keyword via the NVD database. Returns CVE id, CVSS score/severity and summary, highest severity first. A lookup, not an automated scan.")]
+    async fn cve_lookup(&self, Parameters(a): Parameters<CveArgs>) -> Result<CallToolResult, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("cve", &format!("q={}", urlencode(&a.query)))).send().await.map_err(err)?.json().await.map_err(err)?;
+        let list = v["cves"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .take(20)
+                    .map(|c| format!("{} [{} {}] {} — {}", c["id"].as_str().unwrap_or(""), c["severity"].as_str().unwrap_or("?"), c["score"].as_f64().map(|s| s.to_string()).unwrap_or_default(), c["published"].as_str().unwrap_or(""), c["summary"].as_str().unwrap_or("")))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} CVEs:\n{}", v["count"].as_i64().unwrap_or(0), list))]))
     }
 
     #[tool(description = "List command-plugins registered on the hub — custom named actions added via JSON manifests. Returns each plugin's id, platforms and name. Run one with run_plugin.")]
