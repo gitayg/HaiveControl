@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.0";
+const VERSION: &str = "2.11.1";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -147,6 +147,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/agents") => json_agents(agents, user.as_deref()),
         (Method::Get, "/audit") => json_audit(user.as_deref()),
         (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
+        (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/hello") => {
             // The device dials out, so the socket (or X-Forwarded-For behind the
             // AppCrane proxy) carries its real public IP — capture it for geo.
@@ -1424,7 +1425,7 @@ fn save_setting(key: &str, val: &str) {
     let _ = std::fs::write(settings_path(), serde_json::to_string_pretty(&s).unwrap_or_default());
 }
 fn settings_get() -> Resp {
-    json_resp(&serde_json::json!({"ok": true, "agent_update": setting_str("agent_update", "manual"), "server_version": VERSION}))
+    json_resp(&serde_json::json!({"ok": true, "agent_update": setting_str("agent_update", "manual"), "tray": setting_str("tray", "on"), "server_version": VERSION}))
 }
 /// POST /x/settings — update an admin setting (SSO).
 fn settings_set(req: &mut Request, user: Option<&str>) -> Resp {
@@ -1437,7 +1438,18 @@ fn settings_set(req: &mut Request, user: Option<&str>) -> Resp {
             audit(user.unwrap_or(""), "browser", "setting", "agent_update", m);
         }
     }
+    if let Some(t) = v.get("tray").and_then(|x| x.as_str()) {
+        if t == "on" || t == "off" {
+            save_setting("tray", t);
+            audit(user.unwrap_or(""), "browser", "setting", "tray", t);
+        }
+    }
     settings_get()
+}
+/// GET /agent-config — device-side config the agent pulls on enrollment + poll,
+/// so the enrollment command stays minimal (everything else comes from here).
+fn agent_config() -> Resp {
+    json_resp(&serde_json::json!({"ok": true, "tray": setting_str("tray", "on") == "on"}))
 }
 
 fn agent_asset(platform: &str) -> Option<&'static str> {
@@ -2079,9 +2091,9 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             let own = user.map(|u| format!(" --owner {u}")).unwrap_or_default();
             let ex = format!("{tok}{own}");
             (
-                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --name my-pc")),
-                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --name my-mac")),
-                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{ex} --name my-box")),
+                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --background")),
+                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --background")),
+                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{ex} --background")),
             )
         }
         None => {
@@ -2142,7 +2154,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
 <div id=\"schedules-view\" style=\"display:none\"><div class=\"aud-head\">Scheduled <span class=\"dim2\">— actions queued to run automatically (times UTC)</span></div><div id=\"sched-list\"></div></div>\
 <div id=\"map-view\" style=\"display:none\"><div class=\"aud-head\">Device map <span class=\"dim2\">— approximate location from public IP · city-level, VPN/NAT skews it</span></div><div id=\"map-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"map-svg\"></div><div id=\"map-un\" class=\"map-un\"></div></div>\
-<div id=\"settings-view\" style=\"display:none\"><div class=\"aud-head\">Settings <span class=\"dim2\">— hub administration</span></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Agent updates</div><div class=\"set-desc\">How out-of-date device agents get updated to the hub's build (<span id=\"set-ver\" class=\"dim2\"></span>). <b>Automatic</b> pushes updates to behind devices on a schedule; <b>Manual</b> updates only when you click Update on a device.</div></div><select id=\"set-au\" class=\"scr-sel\" onchange=\"saveAgentUpdate()\"><option value=\"manual\">Manual</option><option value=\"auto\">Automatic</option></select></div></div>\
+<div id=\"settings-view\" style=\"display:none\"><div class=\"aud-head\">Settings <span class=\"dim2\">— hub administration</span></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Agent updates</div><div class=\"set-desc\">How out-of-date device agents get updated to the hub's build (<span id=\"set-ver\" class=\"dim2\"></span>). <b>Automatic</b> pushes updates to behind devices on a schedule; <b>Manual</b> updates only when you click Update on a device.</div></div><select id=\"set-au\" class=\"scr-sel\" onchange=\"saveSetting('agent_update','set-au')\"><option value=\"manual\">Manual</option><option value=\"auto\">Automatic</option></select></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Device tray icon</div><div class=\"set-desc\">Show a system-tray / menu-bar icon on the device while the agent is running (Windows & macOS). Devices pull this from the hub, so it takes effect on next agent poll.</div></div><select id=\"set-tray\" class=\"scr-sel\" onchange=\"saveSetting('tray','set-tray')\"><option value=\"on\">Show</option><option value=\"off\">Hide</option></select></div></div>\
 <div id=\"cve-view\" style=\"display:none\"><div class=\"aud-head\">CVE lookup <span class=\"dim2\">— known CVEs for a product, via NVD · a lookup, not an automated scan</span></div><div class=\"fleet-bar\"><input id=\"cve-q\" class=\"devsearch\" placeholder=\"Product / keyword — e.g. openssl 3.0, Google Chrome, log4j\" autocomplete=\"off\"><button class=\"b\" onclick=\"searchCVE()\">Search</button></div><div id=\"cve-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"cve-list\"></div></div>\
 <div id=\"recordings-view\" style=\"display:none\"><div class=\"aud-head\">Recordings <span class=\"dim2\">— replay past interactive shell sessions</span></div><div id=\"rec-player\" class=\"rec-player\" style=\"display:none\"><div class=\"rec-pbar\"><span id=\"rec-title\" class=\"dim2\"></span><button class=\"b subtle\" onclick=\"stopPlay()\">Close player</button></div><div id=\"rec-term\" class=\"rec-term\"></div></div><div id=\"rec-list\"></div></div>\
 <div id=\"compliance-view\" style=\"display:none\"><div class=\"aud-head\">Compliance <span class=\"dim2\">— posture across the fleet, mapped to a framework</span></div><div class=\"fleet-bar\"><select id=\"cmp-fw\" class=\"scr-sel\" title=\"framework to show control IDs for\" onchange=\"renderCompliance()\"></select><button class=\"b\" onclick=\"runCompliance()\">Run across fleet ▶</button></div><div id=\"cmp-note\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\">Indicative control references to orient you — not certified audit evidence.</div><div class=\"ov-scroll\"><table class=\"ov-tbl cmp-tbl\"><thead id=\"cmp-head\"></thead><tbody id=\"cmp-body\"></tbody></table></div></div>\
@@ -2496,8 +2508,8 @@ function searchCVE(){var q=document.getElementById('cve-q').value.trim();if(!q)r
 function renderCVE(arr){document.getElementById('cve-count').textContent=arr.length+' CVEs';var el=document.getElementById('cve-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No CVEs found for that term.</div>';return;}el.innerHTML=arr.map(function(c){var sc=(c.score!=null)?c.score:'—';return '<div class="cve-row"><div class="cve-head"><a class="cve-id" href="https://nvd.nist.gov/vuln/detail/'+encodeURIComponent(c.id)+'" target="_blank" rel="noopener">'+esc2(c.id)+'</a><span class="cve-sev '+sevCls(c.severity)+'">'+esc2(c.severity||'—')+' '+sc+'</span><span class="dim2">'+esc2(c.published||'')+'</span></div><div class="cve-sum">'+esc2(c.summary||'')+'</div></div>';}).join('');}
 var SET_ON=false;
 function showSettings(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=true;SEL=null;highlight();hideViews();document.getElementById('settings-view').style.display='block';setNav('settings');loadSettings();}
-function loadSettings(){fetch('/x/settings').then(function(r){return r.json();}).then(function(j){document.getElementById('set-au').value=j.agent_update||'manual';document.getElementById('set-ver').textContent='serving v'+(j.server_version||'');}).catch(function(){});}
-function saveAgentUpdate(){var m=document.getElementById('set-au').value;fetch('/x/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_update:m})}).then(function(r){return r.json();}).then(function(){}).catch(function(){});}
+function loadSettings(){fetch('/x/settings').then(function(r){return r.json();}).then(function(j){document.getElementById('set-au').value=j.agent_update||'manual';document.getElementById('set-tray').value=j.tray||'on';document.getElementById('set-ver').textContent='serving v'+(j.server_version||'');}).catch(function(){});}
+function saveSetting(key,el){var body={};body[key]=document.getElementById(el).value;fetch('/x/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(){}).catch(function(){});}
 var CMP_CHECKS=[['disk encryption','encryption'],['firewall','firewall'],['antivirus','av'],['OS updates','updates']];
 var CMP_FW=['CIS','NIST 800-53','PCI-DSS','HIPAA','ISO 27001','Essential Eight'];
 function showCompliance(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;COMPLIANCE_ON=true;SEL=null;highlight();hideViews();document.getElementById('compliance-view').style.display='block';setNav('compliance');var s=document.getElementById('cmp-fw');if(!s.options.length){s.innerHTML=CMP_FW.map(function(f){return '<option>'+esc2(f)+'</option>';}).join('');}renderCompliance();}
