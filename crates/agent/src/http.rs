@@ -430,8 +430,18 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
 
     if detach {
-        // Spawn detached and return immediately — the child is orphaned, not waited on.
-        return match std::process::Command::new(prog).arg(flag).arg(&cmd).spawn() {
+        // Spawn detached and return immediately — the child is orphaned, not waited
+        // on. Redirect stdio to NUL so a launched GUI grandchild can't inherit an
+        // exec pipe write-end (which would wedge a captured command's read-to-EOF).
+        let mut c = std::process::Command::new(prog);
+        c.arg(flag).arg(&cmd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            c.creation_flags(0x0000_0008 | 0x0800_0000 | 0x0000_0200);
+        }
+        return match c.spawn() {
             Ok(child) => json_resp(&serde_json::json!({"ok": true, "detached": true, "pid": child.id()}), 200),
             Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
         };

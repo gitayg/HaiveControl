@@ -113,7 +113,22 @@ protects **every** exec path (sys/scripts/fleet/run) automatically. Plumbed thro
 dashboard runner, and MCP `run_command`'s optional `detach`. Pairs with driving the GUI via
 `/frame` + `/input`. _Needs the release + agent-update cycle to reach devices (agent change)._
 
-### (b) _(pending — you said two; send the second and I'll log it here)_
+### (b) `/exec` capture wedges on GUI grandchildren (handle inheritance)  ·  ✅ ADDRESSED
+Root cause (Windows, classic): the agent captured output by spawning `cmd /c <cmd>` with
+**inherited pipe handles** and reading stdout/stderr to EOF. When the command launches a
+long-running **GUI grandchild** (`start "" App.exe`, an installer's runAfterFinish), the
+grandchild **inherits the write-end of the exec pipe**. `cmd.exe` exits, but the pipe never
+reaches EOF (the app still holds the write handle and doesn't quit) → the read blocks forever →
+the single exec worker stays wedged and every later exec times out (heartbeat is a separate
+channel, so the device still shows "online"). `start ""` doesn't help — it detaches the console
+but does **not** stop handle inheritance. A command that exits cleanly (e.g.
+`AgentClubBuilder --dispatch KEY`) is fine because its pipe closes.
+**Fix:** for launches, spawn **detached, stdio → NUL, non-inheritable**. Implemented in
+`exec_ep`'s `detach` path — `Stdio::null()` on all three streams + Windows
+`DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` creation flags — so no exec pipe
+can leak into a GUI grandchild. Combined with fix (a)'s timeout, a captured command can no longer
+wedge the channel. Use **Launch an app (no wait)** / `detach:true` for anything that starts a GUI.
+_(Needs the release + agent-update cycle to reach devices.)_
 
 ---
 
