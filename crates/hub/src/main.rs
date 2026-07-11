@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.7";
+const VERSION: &str = "2.11.8";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -2311,6 +2311,8 @@ pre{margin:0}
 @keyframes rfspin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
 .scope-hint{margin-top:8px;font-size:11px;color:var(--dim2,#8a91a3)}
 .scope-hint code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:10px}
+.output.flash{animation:outflash .7s ease-out}
+@keyframes outflash{0%{box-shadow:0 0 0 2px var(--accent,#5b9dff) inset}100%{box-shadow:0 0 0 0 transparent inset}}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
 .ov-nm{font-weight:600;color:var(--text)}
 .ov-num{text-align:right;font-variant-numeric:tabular-nums}
@@ -2673,7 +2675,7 @@ function doLive(){setView('/x/stream?target='+enc(SEL));}
 function doCamLive(){setView('/x/camstream?target='+enc(SEL)+'&index='+camI());}
 function doShot(){setView('/x/frame?target='+enc(SEL)+'&_t='+Date.now());}
 function doCamSnap(){setView('/x/camera?target='+enc(SEL)+'&index='+camI()+'&_t='+Date.now());}
-function out(t){var o=document.getElementById('out');o.style.display='block';o.textContent=t;}
+function out(t){var o=document.getElementById('out');o.style.display='block';o.textContent=t;o.scrollIntoView({behavior:'smooth',block:'nearest'});o.classList.remove('flash');void o.offsetWidth;o.classList.add('flash');}
 function doRun(){var c=prompt('Command to run:');if(!c)return;out('$ '+c+'\n…');fetch('/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:c})}).then(function(r){return r.json();}).then(function(j){out('$ '+c+'\n'+(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed'))));}).catch(function(e){out('error: '+e);});}
 var SHSID=null,SHOFF=0,TERM=null,FIT=null;
 function ensureTerm(){if(TERM)return;TERM=new Terminal({fontSize:12,fontFamily:'ui-monospace,SFMono-Regular,Menlo,monospace',cursorBlink:true,theme:{background:'#0b0d13',foreground:'#d3d8e4'}});FIT=new FitAddon.FitAddon();TERM.loadAddon(FIT);TERM.open(document.getElementById('xterm'));TERM.onData(function(d){if(SHSID)fetch('/x/shell/input?target='+enc(SEL)+'&sid='+enc(SHSID),{method:'POST',body:d});});}
