@@ -21,10 +21,13 @@ RUN mkdir -p /app/dist \
       curl -fsSL "https://github.com/gitayg/HaiveControl/releases/latest/download/$a" -o "/app/dist/$a"; \
     done
 ENV HUB_DIST=/app/dist
+# Persistent, writable data dir (custom scripts, schedules, recordings, plugins).
+# Point at the AppCrane persistent volume so it survives redeploys.
+ENV HUB_DATA=/data
 COPY deployhub.json ./
 # Must match deployhub.json "port"; the hub binds $PORT (AppCrane injects it).
 EXPOSE 8770
 # AppCrane requires a non-root runtime user.
-RUN useradd -m -u 1000 hive && chown -R hive:hive /app
+RUN useradd -m -u 1000 hive && mkdir -p /data && chown -R hive:hive /app /data
 USER hive
 CMD ["/app/HaiveHub"]

@@ -404,27 +404,57 @@ fn parse_ev(v: &serde_json::Value) -> Option<Ev> {
     })
 }
 
+/// Kill a process tree by PID (used when a captured command exceeds its timeout).
+fn kill_pid(id: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).output();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("kill").args(["-9", &id.to_string()]).output();
+}
+
 fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     if !cfg.exec_enabled {
         return json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403);
     }
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
-    let cmd = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default();
-    let cmd = cmd.trim().to_string();
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or_default().trim().to_string();
     if cmd.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "empty command"}), 400);
     }
-    let out = if cfg!(windows) {
-        std::process::Command::new("cmd").arg("/C").arg(&cmd).output()
-    } else {
-        std::process::Command::new("sh").arg("-c").arg(&cmd).output()
+    // Fire-and-forget launch (e.g. a GUI app) must NOT block the exec/relay channel.
+    let detach = v.get("detach").and_then(|x| x.as_bool()).unwrap_or(false);
+    // Cap captured commands so a hung/GUI-spawning process can't wedge the channel.
+    let timeout = v.get("timeout").and_then(|x| x.as_u64()).unwrap_or(60).clamp(1, 300);
+    let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+
+    if detach {
+        // Spawn detached and return immediately — the child is orphaned, not waited on.
+        return match std::process::Command::new(prog).arg(flag).arg(&cmd).spawn() {
+            Ok(child) => json_resp(&serde_json::json!({"ok": true, "detached": true, "pid": child.id()}), 200),
+            Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+        };
+    }
+
+    // Run-and-capture, but bounded: wait on a worker thread and time out + kill.
+    let child = std::process::Command::new(prog)
+        .arg(flag)
+        .arg(&cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
     };
-    match out {
-        Ok(o) => json_resp(
+    let id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(timeout)) {
+        Ok(Ok(o)) => json_resp(
             &serde_json::json!({
                 "ok": true,
                 "code": o.status.code().unwrap_or(-1),
@@ -433,7 +463,11 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
             }),
             200,
         ),
-        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+        Ok(Err(e)) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+        Err(_) => {
+            kill_pid(id);
+            json_resp(&serde_json::json!({"ok": false, "timed_out": true, "error": format!("command exceeded {timeout}s and was terminated (use detach for GUI apps / long tasks)")}), 200)
+        }
     }
 }
 

@@ -182,6 +182,29 @@ shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's det
 an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
 run command, input, …) and which owner made them. So you can watch agents work in real time.
 
+**Action runner.** Per device, non-interactive actions are a single consistent control: an
+**action dropdown** (Reports · Security · Software · Power · Notify · Run) → a **description** →
+an input only when needed → **Execute**. Tick **Schedule** to run it later instead — **once in N
+min**, **every N min**, or **daily at HH:MM (UTC)**; queued runs fire server-side and appear in
+the **⏰ Scheduled** view (with next-run + cancel). GUI apps / long tasks use **Launch an app (no
+wait)** so they can't block the channel.
+
+**Session recording.** Every interactive **Shell** session is auto-recorded (asciinema `.cast`)
+and replayable in **🎬 Recordings** through the bundled terminal, original timing preserved.
+
+**Command plugins.** Drop a JSON manifest in `HUB_DATA/plugins/`
+(`{id,name,description,group,cmd:{windows,macos,linux}}`) and it becomes a first-class action
+everywhere — dropdown, fleet, schedule, and MCP (`list_plugins` / `run_plugin`) — no rebuild.
+
+**Device map.** **🗺 Map** plots each device by approximate location (public-IP geolocation,
+city-level, resolved server-side). LAN/private-IP devices are listed as unlocated.
+
+**Agent version.** The device detail shows the running agent version and whether it's behind the
+hub's served build; the **Update** button shows the target version (`Update → x.y.z`).
+
+Everything persistent (custom scripts, schedules, recordings, plugins) lives under `HUB_DATA`
+(set it to a persistent, writable volume — `/data` in the shipped image).
+
 **Compliance.** The sidebar's **🛡 Compliance** runs the security-posture checks
 (disk encryption, firewall, antivirus, OS updates) across **every** device in parallel and
 shows a matrix — one row per device, a ✓/✗ per check, and an A–F grade. Pick a framework
