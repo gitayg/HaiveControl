@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.10.1";
+const VERSION: &str = "2.11.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -1609,17 +1609,34 @@ fn schedule_add(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp 
         return json_resp(&serde_json::json!({"ok": false, "error": "kind required"}));
     }
     let when = v.get("when").cloned().unwrap_or_else(|| serde_json::json!({"type":"once","mins":0}));
+    let arg = v.get("arg").and_then(|x| x.as_str()).unwrap_or("");
+    let id = format!("s{}-{}", now_secs(), sched_counter());
+    // Push the resolved command to the AGENT so it fires at the set time even while
+    // disconnected. os_command/plugin/exec resolve to a shell command; composites
+    // (posture) and scripts stay hub-side (agent_owned=false → hub fires as fallback).
+    let platform = device_platform(agents, &target);
+    let command = if kind == "exec" {
+        arg.to_string()
+    } else {
+        os_command(&platform, &kind, arg).or_else(|| plugin_command(&platform, &kind, arg)).unwrap_or_default()
+    };
+    let mut agent_owned = false;
+    if !command.is_empty() {
+        let payload = serde_json::json!({"id": id, "command": command, "when": when}).to_string().into_bytes();
+        agent_owned = dev_unary(&target, "POST", "/schedule/add", Some(("application/json".into(), payload))).is_some();
+    }
     let rec = serde_json::json!({
-        "id": format!("s{}-{}", now_secs(), sched_counter()),
+        "id": id,
         "owner": user.unwrap_or(""),
         "target": target,
         "device": device_name(agents, &target),
         "kind": kind,
-        "arg": v.get("arg").and_then(|x| x.as_str()).unwrap_or(""),
+        "arg": arg,
         "label": v.get("label").and_then(|x| x.as_str()).unwrap_or(""),
         "when": when.clone(),
         "next_run": next_run_from(&when),
         "created": now_secs(),
+        "agent_owned": agent_owned,
     });
     let mut all = load_schedules();
     all.push(rec.clone());
@@ -1642,6 +1659,11 @@ fn schedules_list(user: Option<&str>) -> Resp {
 fn schedule_delete(url: &str, user: Option<&str>) -> Resp {
     let id = query_param(url, "id").unwrap_or_default();
     let mut all = load_schedules();
+    // Tell the owning agent to drop it too (best-effort).
+    if let Some(target) = all.iter().find(|s| s.get("id").and_then(|x| x.as_str()) == Some(id.as_str())).and_then(|s| s.get("target").and_then(|x| x.as_str())) {
+        let payload = serde_json::json!({"id": id}).to_string().into_bytes();
+        let _ = dev_unary(target, "POST", "/schedule/del", Some(("application/json".into(), payload)));
+    }
     all.retain(|s| !(s.get("id").and_then(|x| x.as_str()) == Some(id.as_str()) && (user.is_none() || s.get("owner").and_then(|x| x.as_str()) == user)));
     save_schedules(&all);
     json_resp(&serde_json::json!({"ok": true}))
@@ -1680,7 +1702,11 @@ fn start_scheduler(agents: Arc<Agents>, hub_ip: String, hub_port: u16) {
                 continue;
             }
             let s = all[i].clone();
-            run_scheduled(&agents, &s);
+            // Agent-owned schedules fire on the device itself; the hub only advances
+            // the display copy. Others (posture/scripts, or push-failed) fire here.
+            if !s.get("agent_owned").and_then(|x| x.as_bool()).unwrap_or(false) {
+                run_scheduled(&agents, &s);
+            }
             let when = s.get("when").cloned().unwrap_or_default();
             if when.get("type").and_then(|x| x.as_str()).unwrap_or("once") == "once" {
                 all.remove(i);
@@ -2082,7 +2108,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\
 <nav class=\"rail\">\
-<div class=\"rail-top\">📡 <span class=\"rail-name\">Haive</span></div>\
+<div class=\"rail-top\"><div class=\"rail-brand\">📡 <span class=\"rail-name\">Haive</span><span class=\"pill\" id=\"count\">…</span></div><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div>\
+<button class=\"railadd\" onclick=\"toggleReg()\" title=\"register a new device\">+ Add device</button>\
 <div class=\"navsec\">Overview</div>\
 <button class=\"navb\" data-nav=\"inventory\" onclick=\"showInventory()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z\"/><path d=\"M12 22V12\"/><path d=\"m3.3 7 8.7 5 8.7-5\"/><path d=\"m7.5 4.27 9 5.15\"/></svg></span>Inventory<span class=\"nbadge\" id=\"inv-badge\"></span></button>\
 <button class=\"navb\" data-nav=\"dashboard\" onclick=\"showDashboard()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"7\" height=\"7\" x=\"3\" y=\"3\" rx=\"1\"/><rect width=\"7\" height=\"7\" x=\"14\" y=\"3\" rx=\"1\"/><rect width=\"7\" height=\"7\" x=\"14\" y=\"14\" rx=\"1\"/><rect width=\"7\" height=\"7\" x=\"3\" y=\"14\" rx=\"1\"/></svg></span>Dashboard</button>\
@@ -2094,16 +2121,16 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"navsec\">Ops</div>\
 <button class=\"navb\" data-nav=\"scripts\" onclick=\"showScripts()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"m7 11 2-2-2-2\"/><path d=\"M11 13h4\"/><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/></svg></span>Scripts</button>\
 <button class=\"navb\" data-nav=\"sched\" onclick=\"showSchedules()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><polyline points=\"12 6 12 12 16 14\"/></svg></span>Scheduled</button>\
+<div class=\"navsec\">Audit</div>\
+<button class=\"navb\" data-nav=\"audit\" onclick=\"showAudit()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M8 6h13\"/><path d=\"M8 12h13\"/><path d=\"M8 18h13\"/><path d=\"M3 6h.01\"/><path d=\"M3 12h.01\"/><path d=\"M3 18h.01\"/></svg></span>Audit log</button>\
 <button class=\"navb\" data-nav=\"recs\" onclick=\"showRecordings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"m16 13 5.22 3.48a.5.5 0 0 0 .78-.42V7.94a.5.5 0 0 0-.78-.42L16 11\"/><rect x=\"2\" y=\"6\" width=\"14\" height=\"12\" rx=\"2\"/></svg></span>Recordings</button>\
 <div class=\"navsec\">System</div>\
-<button class=\"navb\" data-nav=\"audit\" onclick=\"showAudit()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M8 6h13\"/><path d=\"M8 12h13\"/><path d=\"M8 18h13\"/><path d=\"M3 6h.01\"/><path d=\"M3 12h.01\"/><path d=\"M3 18h.01\"/></svg></span>Audit log</button>\
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <aside class=\"side\">\
-<div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
+<div class=\"dev-head\"><span class=\"navsec\">Devices</span></div>\
 <div class=\"legend\"><span><span class=\"dot on\"></span>online</span><span><span class=\"dot idle\"></span>idle</span><span><span class=\"dot off\"></span>stale</span></div>\
 <input id=\"devsearch\" class=\"devsearch\" type=\"search\" placeholder=\"Search devices…\" autocomplete=\"off\" oninput=\"SEARCH=this.value.toLowerCase();renderSide(LAST);\">\
-<div class=\"dev-head\"><span class=\"navsec\">Devices</span><button class=\"miniadd\" onclick=\"toggleReg()\" title=\"register a new device\">+ Add</button></div>\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><p class=\"reg-hint\">Download the agent, then run it:</p>{win}{mac}{lin}</div>\
 <ul id=\"devlist\" class=\"devlist\"></ul>\
 </aside>\
@@ -2261,8 +2288,13 @@ pre{margin:0}
 .navb.active{background:var(--surface2);color:var(--text);box-shadow:inset 2px 0 0 var(--accent)}
 .navb .ni{font-size:13px;width:16px;text-align:center;flex:none}
 .rail{width:178px;flex:none;border-right:1px solid var(--line);display:flex;flex-direction:column;gap:1px;background:#0e111a;padding:10px 8px;overflow-y:auto}
-.rail-top{font-size:15px;font-weight:700;padding:4px 8px 10px;display:flex;align-items:center;gap:6px}
-.rail-name{font-size:13px;color:var(--text)}
+.rail-top{display:flex;flex-direction:column;gap:5px;padding:4px 8px 8px}
+.rail-brand{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:700}
+.rail-name{font-size:14px;color:var(--text)}
+.rail-brand .pill{margin-left:auto;font-size:10px;padding:1px 8px}
+.rail-top .hubid{font-size:10px;color:var(--muted2);margin:0;align-self:flex-start;border-bottom:1px dotted var(--muted2);cursor:help}
+.railadd{margin:0 4px 8px;background:transparent;border:1px dashed var(--line2);color:var(--muted);border-radius:8px;padding:6px;font-size:12px;cursor:pointer;transition:color .12s,border-color .12s}
+.railadd:hover{color:var(--accent);border-color:var(--accent)}
 .rail .navb{margin:0}
 .nbadge{margin-left:auto;background:var(--accent);color:#08111f;font-size:10px;font-weight:700;border-radius:10px;padding:1px 7px;min-width:16px;text-align:center}
 .inv-bar{display:flex;align-items:center;gap:14px}
@@ -2411,7 +2443,7 @@ var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);updInvBadge();if(OVERVIEW_ON)renderOverview(arr);if(DASH_ON)renderDashboard();var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||DASH_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!BOOTED&&arr.length){BOOTED=true;showInventory();}}).catch(function(){});}
+function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);updInvBadge();if(OVERVIEW_ON)renderOverview(arr);if(DASH_ON)renderDashboard();var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||DASH_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!BOOTED){BOOTED=true;showDashboard();}}).catch(function(){});}
 function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'Recent Activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+'<div class="act-rows">'+rows+'</div></div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
@@ -2434,7 +2466,7 @@ function showSchedules(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPL
 function loadSchedules(){fetch('/x/schedules').then(function(r){return r.json();}).then(function(j){renderSchedules((j&&j.schedules)||[]);}).catch(function(){document.getElementById('sched-list').innerHTML='<div class="aud-empty">Could not load schedules.</div>';});}
 function schedEvery(w){w=w||{};return w.type==='once'?('once, in '+(w.mins||0)+'m'):w.type==='interval'?('every '+(w.mins||0)+'m'):('daily at '+(w.hhmm||'')+' UTC');}
 function nextIn(secs){if(secs==null)return '';var now=Math.floor(Date.now()/1000);var d=secs-now;if(d<=0)return 'due';return d<60?(d+'s'):d<3600?(Math.round(d/60)+'m'):d<86400?(Math.round(d/3600)+'h'):(Math.round(d/86400)+'d');}
-function renderSchedules(arr){var el=document.getElementById('sched-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No scheduled actions. Open a device → pick an action → tick “Schedule”.</div>';return;}el.innerHTML=arr.map(function(s){return '<div class="sched-row"><div class="sched-main"><div class="sched-nm">'+esc2(s.label||s.kind)+(s.arg?(' <span class="dim2">'+esc2(s.arg)+'</span>'):'')+'</div><div class="sched-meta">'+esc2(s.device||'?')+' · '+esc2(schedEvery(s.when))+' · next in '+nextIn(s.next_run)+(s.last_run?(' · last '+recWhen(s.last_run)):'')+'</div></div><button class="b danger" onclick="delSchedule(\''+attrEsc(s.id)+'\')">Cancel</button></div>';}).join('');}
+function renderSchedules(arr){var el=document.getElementById('sched-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No scheduled actions. Open a device → pick an action → tick “Schedule”.</div>';return;}el.innerHTML=arr.map(function(s){return '<div class="sched-row"><div class="sched-main"><div class="sched-nm">'+esc2(s.label||s.kind)+(s.arg?(' <span class="dim2">'+esc2(s.arg)+'</span>'):'')+'</div><div class="sched-meta">'+esc2(s.device||'?')+' · '+esc2(schedEvery(s.when))+' · next in '+nextIn(s.next_run)+(s.last_run?(' · last '+recWhen(s.last_run)):'')+(s.agent_owned?' · <span class="chip cust">on-device</span>':' · hub-run')+'</div></div><button class="b danger" onclick="delSchedule(\''+attrEsc(s.id)+'\')">Cancel</button></div>';}).join('');}
 function delSchedule(id){fetch('/x/schedule-delete?id='+encodeURIComponent(id)).then(function(r){return r.json();}).then(function(){loadSchedules();}).catch(function(){});}
 var RECS_ON=false,REC_TIMERS=[];
 function showRecordings(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;RECS_ON=true;SEL=null;highlight();hideViews();document.getElementById('recordings-view').style.display='block';setNav('recs');stopPlay();loadRecordings();}
@@ -2449,7 +2481,7 @@ var MAP_ON=false,LMAP=null,INV_MODE=null,DASH_ON=false,BOOTED=false;
 function showInventory(){AUDIT_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;CVE_ON=false;SET_ON=false;DASH_ON=false;SEL=null;highlight();hideViews();setNav('inventory');document.getElementById('inv-toggle').style.display='flex';invView(INV_MODE||'table');}
 function invView(m){INV_MODE=m;document.getElementById('invb-table').classList.toggle('active',m==='table');document.getElementById('invb-map').classList.toggle('active',m==='map');if(m==='table'){document.getElementById('map-view').style.display='none';MAP_ON=false;document.getElementById('overview-view').style.display='block';OVERVIEW_ON=true;renderOverview(LAST);}else{document.getElementById('overview-view').style.display='none';OVERVIEW_ON=false;document.getElementById('map-view').style.display='block';MAP_ON=true;document.getElementById('map-svg').innerHTML='<div class="dim2" style="font-size:12px">Locating devices…</div>';ensureLeaflet(loadMap);}}
 function showDashboard(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;DASH_ON=true;SEL=null;highlight();hideViews();setNav('dashboard');document.getElementById('dashboard-view').style.display='block';renderDashboard();}
-function renderDashboard(){var arr=LAST||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';function card(n,v,c){return '<div class="dcard"><div class="dcard-v '+(c||'')+'">'+v+'</div><div class="dcard-n">'+esc2(n)+'</div></div>';}var cards=card('Devices',arr.length,'')+card('Online',on,'cmp-A')+card('Idle',idle,'cmp-C')+card('Stale',off,off?'cmp-F':'')+card('Avg CPU',avg,'')+card('MCP active',mcp,mcp?'sev-high':'');var quick='<div class="dquick"><button class="b" onclick="showInventory()">📦 Inventory</button><button class="b" onclick="showCompliance()">🛡 Compliance</button><button class="b" onclick="showFleet()">⚡ Fleet run</button><button class="b" onclick="showScripts()">🧰 Scripts</button><button class="b" onclick="showRecordings()">🎬 Recordings</button></div>';document.getElementById('dashboard-view').innerHTML='<div class="aud-head">Dashboard <span class="dim2">— fleet at a glance</span></div><div class="dgrid">'+cards+'</div>'+quick;}
+function renderDashboard(){var arr=LAST||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';function card(n,v,c){return '<div class="dcard"><div class="dcard-v '+(c||'')+'">'+v+'</div><div class="dcard-n">'+esc2(n)+'</div></div>';}var cards=card('Devices',arr.length,'')+card('Online',on,'cmp-A')+card('Idle',idle,'cmp-C')+card('Stale',off,off?'cmp-F':'')+card('Avg CPU',avg,'')+card('MCP active',mcp,mcp?'sev-high':'');document.getElementById('dashboard-view').innerHTML='<div class="aud-head">Dashboard <span class="dim2">— fleet at a glance</span></div><div class="dgrid">'+cards+'</div>';}
 function updInvBadge(){var arr=LAST||[];var act=0;arr.forEach(function(d){if(statusOf(d)!=='off')act++;});var b=document.getElementById('inv-badge');if(b)b.textContent=act?(''+act):'';}
 function ensureLeaflet(cb){if(window.L||window.__lfTried){cb();return;}window.__lfTried=true;var css=document.createElement('link');css.rel='stylesheet';css.href='/bin/leaflet.css';document.head.appendChild(css);var s=document.createElement('script');s.src='/bin/leaflet.js';s.onload=cb;s.onerror=cb;document.head.appendChild(s);}
 function showMap(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;CVE_ON=false;SET_ON=false;MAP_ON=true;SEL=null;highlight();hideViews();document.getElementById('map-view').style.display='block';setNav('map');document.getElementById('map-svg').innerHTML='<div class="dim2" style="font-size:12px">Locating devices…</div>';ensureLeaflet(loadMap);}

@@ -7,6 +7,7 @@ mod http;
 mod input;
 mod persistence;
 mod relay;
+mod schedule;
 mod shell;
 mod tls;
 
@@ -321,5 +322,6 @@ fn main() {
         grabber,
         cert,
     });
+    schedule::run_scheduler();
     http::serve(cfg, tx);
 }
