@@ -140,7 +140,10 @@ pub fn request(agent_id: &str, method: &str, path: &str, body: Option<(String, V
     tunnel.queue.lock().unwrap().push_back(Outgoing { id, m: method.to_string(), p: path.to_string(), ct, b });
     tunnel.qcv.notify_one();
 
-    match rx.recv_timeout(Duration::from_secs(20)) {
+    // Wait longer than the agent's own 60s exec cap: slow reports (e.g. Windows
+    // `systeminfo`) don't reply until the command finishes, so a 20s wait gave up
+    // on them and surfaced "(device unreachable)".
+    match rx.recv_timeout(Duration::from_secs(65)) {
         Ok(Msg::Head(status, ctype)) => Some(RelayResponse { status, ctype, rx, tunnel, id, buf: Vec::new(), pos: 0, done: false }),
         _ => {
             tunnel.pending.lock().unwrap().remove(&id);
