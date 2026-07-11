@@ -48,6 +48,9 @@ struct DeviceArg {
 struct RunArgs {
     device: String,
     command: String,
+    /// launch fire-and-forget (don't wait for output) — use for GUI apps or long tasks that would otherwise block
+    #[serde(default)]
+    detach: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DownloadArgs {
@@ -140,6 +143,15 @@ struct RunScriptArgs {
 struct RunScriptFleetArgs {
     /// the script filename returned by search_scripts, to run on every device you own
     script: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RunPluginArgs {
+    device: String,
+    /// the plugin id from list_plugins
+    plugin: String,
+    /// optional argument passed to the plugin's {{arg}} placeholder
+    #[serde(default)]
+    arg: String,
 }
 
 #[derive(Clone)]
@@ -256,14 +268,16 @@ impl Srv {
         let out: serde_json::Value = self
             .client
             .post(self.m("exec", ""))
-            .json(&serde_json::json!({"target": target, "cmd": a.command}))
+            .json(&serde_json::json!({"target": target, "cmd": a.command, "detach": a.detach}))
             .send()
             .await
             .map_err(err)?
             .json()
             .await
             .map_err(err)?;
-        let text = if out["ok"].as_bool().unwrap_or(false) {
+        let text = if out["detached"].as_bool().unwrap_or(false) {
+            format!("launched (pid {})", out["pid"].as_i64().unwrap_or(0))
+        } else if out["ok"].as_bool().unwrap_or(false) {
             let s = format!("{}{}", out["stdout"].as_str().unwrap_or(""), out["stderr"].as_str().unwrap_or(""));
             if s.is_empty() { format!("(exit {})", out["code"].as_i64().unwrap_or(0)) } else { s }
         } else {
@@ -509,6 +523,30 @@ impl Srv {
                     .join("\n")
             })
             .unwrap_or_else(|| "no devices".to_string());
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "List command-plugins registered on the hub — custom named actions added via JSON manifests. Returns each plugin's id, platforms and name. Run one with run_plugin.")]
+    async fn list_plugins(&self) -> Result<CallToolResult, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("plugins", "")).send().await.map_err(err)?.json().await.map_err(err)?;
+        let list = v["plugins"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|p| {
+                        let plats = p["platforms"].as_array().map(|x| x.iter().filter_map(|y| y.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                        format!("- {} ({}) — {}", p["id"].as_str().unwrap_or(""), plats, p["name"].as_str().unwrap_or(""))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} plugins:\n{}", v["count"].as_i64().unwrap_or(0), list))]))
+    }
+
+    #[tool(description = "Run a hub command-plugin (from list_plugins) on the named device. Pass the plugin id and an optional arg.")]
+    async fn run_plugin(&self, Parameters(a): Parameters<RunPluginArgs>) -> Result<CallToolResult, ErrorData> {
+        let out = self.sys(&a.device, &a.plugin, &a.arg).await?;
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 

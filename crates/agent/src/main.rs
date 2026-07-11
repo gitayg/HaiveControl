@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-const VERSION: &str = "2.3.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(name = "HaiveControl", version = VERSION,
@@ -96,6 +96,7 @@ fn collect_sysinfo() -> serde_json::Value {
         "os": os,
         "arch": std::env::consts::ARCH,
         "platform": std::env::consts::OS,
+        "agent_version": VERSION,
         "hostname": host,
         "user": user,
         "cpu": cpu,

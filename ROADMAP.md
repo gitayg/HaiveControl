@@ -96,3 +96,21 @@ for winget/Windows** — scope the MVP to Linux and say so. Dashboard: a CVE lis
 4. **Compliance → standards** and **Session recording** — independent, parallelizable.
 5. **Geo + map view** — self-contained, ship when the above settle.
 6. **OSV** — last; Linux-only value.
+
+---
+
+## Known fixes to make (surfaced in use)
+
+### (a) `/exec` must be non-blocking / per-command isolated  ·  ✅ IMPLEMENTED
+The agent's `/exec` used to `.output()` (spawn **and wait**), so a spawned GUI/long-running
+process wedged the whole exec/relay channel — surfaced launching an app remotely (every `.exe`
+dropped the relay). **Fix shipped:** `exec_ep` now (1) supports **`detach:true`** — spawn
+fire-and-forget, return `{detached, pid}` immediately (for GUI apps); and (2) bounds
+run-and-capture with a **timeout** (default 60s, `timeout` overridable ≤300s) on a worker thread
+that kills the process on expiry — so a hung command can't wedge the channel. The default timeout
+protects **every** exec path (sys/scripts/fleet/run) automatically. Plumbed through the hub
+`proxy_exec` (`detach`/`timeout` passthrough), a **"Launch an app (no wait)"** action in the
+dashboard runner, and MCP `run_command`'s optional `detach`. Pairs with driving the GUI via
+`/frame` + `/input`. _Needs the release + agent-update cycle to reach devices (agent change)._
+
+### (b) _(pending — you said two; send the second and I'll log it here)_
