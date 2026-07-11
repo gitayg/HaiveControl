@@ -182,6 +182,14 @@ shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's det
 an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
 run command, input, …) and which owner made them. So you can watch agents work in real time.
 
+**Compliance.** The sidebar's **🛡 Compliance** runs the security-posture checks
+(disk encryption, firewall, antivirus, OS updates) across **every** device in parallel and
+shows a matrix — one row per device, a ✓/✗ per check, and an A–F grade. Pick a framework
+(**CIS · NIST 800-53 · PCI-DSS · HIPAA · ISO 27001 · Essential Eight**) and each check column
+shows its mapped control ID. These are *indicative* references to orient an operator, not
+certified audit evidence. Per-device compliance is also on the device's **Compliance** button,
+and over MCP as `compliance_posture` (one device) and `fleet_compliance` (all, with grades).
+
 **Script library.** The sidebar's **🧰 Script library** exposes the
 [TacticalRMM community-scripts](https://github.com/amidaware/community-scripts) repo (130+
 maintenance/diagnostic scripts). Search by name/description/category, pick a target (one device
