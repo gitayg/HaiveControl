@@ -491,6 +491,27 @@ impl Srv {
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 
+    #[tool(description = "Run the security-compliance posture check (disk encryption, firewall, antivirus, OS updates) on EVERY device you own, in parallel. Returns each device's grade + per-check pass/fail. Checks map to CIS / NIST 800-53 / PCI-DSS / HIPAA / ISO 27001 / Essential Eight controls.")]
+    async fn fleet_compliance(&self) -> Result<CallToolResult, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("compliance-fleet", "")).send().await.map_err(err)?.json().await.map_err(err)?;
+        let out = v["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|d| {
+                        let checks = d["checks"]
+                            .as_array()
+                            .map(|cs| cs.iter().map(|c| format!("{} {}", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default();
+                        format!("{} — {} ({}/100): {}", d["device"].as_str().unwrap_or("?"), d["grade"].as_str().unwrap_or("?"), d["score"].as_i64().unwrap_or(0), checks)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "no devices".to_string());
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
     #[tool(description = "Run a community script (from search_scripts) on EVERY device you own, in parallel. Pass the script filename.")]
     async fn run_script_fleet(&self, Parameters(a): Parameters<RunScriptFleetArgs>) -> Result<CallToolResult, ErrorData> {
         let v: serde_json::Value = self.client.get(self.m("script-fleet", &format!("file={}", urlencode(&a.script)))).send().await.map_err(err)?.json().await.map_err(err)?;

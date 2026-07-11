@@ -63,7 +63,7 @@ Standardized app deploy/uninstall on Windows. Because installs exceed the 65s ti
 
 ## Standalone tracks (independent of plugins)
 
-### Compliance → standards mapping  ·  ~2–3 days
+### Compliance → standards mapping  ·  ✅ SHIPPED v2.6.0
 Extend the existing `posture` composite: more checks, then map results to control IDs across
 **CIS / NIST 800-53 / PCI-DSS / HIPAA / ISO 27001 / Essential Eight**. Dashboard: a compliance matrix
 per device + fleet roll-up with grade; MCP: `compliance_report(standard)`.
