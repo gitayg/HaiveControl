@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.4";
+const VERSION: &str = "2.11.5";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -139,6 +139,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
         return;
     }
+    let gz = req_header(&req, "Accept-Encoding").map(|e| e.to_lowercase().contains("gzip")).unwrap_or(false);
     let resp = match (&method, path.as_str()) {
         (Method::Post, "/register") => {
             register(&mut req, agents);
@@ -194,9 +195,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/x/shell/input") => proxy_shell_input(&mut req, &url),
         (Method::Post, "/x/shell/resize") => proxy_shell_resize(&url),
         (Method::Post, "/x/shell/close") => proxy_shell_close(&url),
-        (Method::Get, "/assets/xterm.js") => asset(XTERM_JS, "text/javascript; charset=utf-8"),
-        (Method::Get, "/assets/xterm.css") => asset(XTERM_CSS, "text/css; charset=utf-8"),
-        (Method::Get, "/assets/addon-fit.js") => asset(ADDON_FIT, "text/javascript; charset=utf-8"),
+        (Method::Get, "/assets/xterm.js") => asset(XTERM_JS, "text/javascript; charset=utf-8", gz),
+        (Method::Get, "/assets/xterm.css") => asset(XTERM_CSS, "text/css; charset=utf-8", gz),
+        (Method::Get, "/assets/addon-fit.js") => asset(ADDON_FIT, "text/javascript; charset=utf-8", gz),
         (Method::Get, "/x/download") => proxy_download(&url),
         (Method::Get, "/x/list") => proxy_list(&url),
         (Method::Post, "/x/upload") => proxy_upload(&mut req, &url),
@@ -241,7 +242,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
-        (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref()),
+        (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
     };
     let _ = req.respond(resp);
@@ -249,6 +250,20 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
 
 fn text_resp(body: String, ct: &str) -> Resp {
     Response::from_string(body).with_header(hdr("Content-Type", ct))
+}
+/// Serve bytes, gzip-compressed when the client accepts it (worth it only for the
+/// big responses — the dashboard HTML and the bundled xterm.js).
+fn maybe_gzip(body: Vec<u8>, ct: &str, gz: bool) -> Resp {
+    if gz && body.len() > 900 {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        if enc.write_all(&body).is_ok() {
+            if let Ok(c) = enc.finish() {
+                return Response::from_data(c).with_header(hdr("Content-Type", ct)).with_header(hdr("Content-Encoding", "gzip"));
+            }
+        }
+    }
+    Response::from_data(body).with_header(hdr("Content-Type", ct))
 }
 
 fn req_header(req: &Request, name: &'static str) -> Option<String> {
@@ -408,10 +423,8 @@ const XTERM_JS: &[u8] = include_bytes!("../assets/xterm.js");
 const XTERM_CSS: &[u8] = include_bytes!("../assets/xterm.css");
 const ADDON_FIT: &[u8] = include_bytes!("../assets/addon-fit.js");
 
-fn asset(bytes: &'static [u8], ct: &str) -> Resp {
-    Response::from_data(bytes.to_vec())
-        .with_header(hdr("Content-Type", ct))
-        .with_header(hdr("Cache-Control", "max-age=86400"))
+fn asset(bytes: &'static [u8], ct: &str, gz: bool) -> Resp {
+    maybe_gzip(bytes.to_vec(), ct, gz).with_header(hdr("Cache-Control", "max-age=86400"))
 }
 
 fn serve_bin(name: &str) -> Resp {
@@ -2124,7 +2137,7 @@ fn json_audit(user: Option<&str>) -> Resp {
     json_resp(&serde_json::json!({"audit": events}))
 }
 
-fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: Option<&str>) -> Resp {
+fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: Option<&str>, accepts_gzip: bool) -> Resp {
     // When the hub is reachable at a public URL (a cloud deploy), show relay-mode
     // install commands (device dials out); otherwise LAN-mode (hub reaches in).
     let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
@@ -2223,7 +2236,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 </div>{fb}{hb}<script src=\"/assets/xterm.js\"></script><script src=\"/assets/addon-fit.js\"></script>{script}</body></html>",
         cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML
     );
-    Response::from_string(html).with_header(hdr("Content-Type", "text/html"))
+    maybe_gzip(html.into_bytes(), "text/html; charset=utf-8", accepts_gzip)
 }
 
 const CP_CSS: &str = r#"
