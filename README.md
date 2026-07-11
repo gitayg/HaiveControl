@@ -182,6 +182,16 @@ shows it: the sidebar row gets a pulsing **🤖⇄** badge, and the device's det
 an **"AI agent accessing now"** panel with a rolling log of the recent MCP actions (screenshot,
 run command, input, …) and which owner made them. So you can watch agents work in real time.
 
+**Script library.** The sidebar's **🧰 Script library** exposes the
+[TacticalRMM community-scripts](https://github.com/amidaware/community-scripts) repo (130+
+maintenance/diagnostic scripts). Search by name/description/category, pick a target (one device
+or **All devices (fleet)**), and hit **Run ▶**. The script body is fetched from GitHub and
+base64-wrapped into a single `/exec` call — PowerShell via `-EncodedCommand`, `cmd` batch via a
+temp file, `python`/`shell` inline — so nothing is left on the device. A per-OS guard blocks
+running a Windows-only script on a Mac, etc. (Subject to the agent's ~65s `/exec` cap; long
+scripts get truncated — fire-and-forget is a future enhancement.) Also available over MCP as
+`search_scripts`, `run_script`, and `run_script_fleet`.
+
 **Fleet status.** The sidebar's **📊 Fleet status** opens a whole-fleet overview — one row
 per device, every parameter at a glance: status dot, OS/arch, logged-in user, live CPU load,
 free/total RAM, cores, camera/mic counts, address (LAN or relay), last-seen, and a **🤖⇄**
