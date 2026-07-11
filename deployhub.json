@@ -1,6 +1,6 @@
 {
   "name": "haivecontrol",
-  "version": "2.11.2",
+  "version": "2.11.3",
   "port": 8770,
   "be": {
     "health": "/api/health"
