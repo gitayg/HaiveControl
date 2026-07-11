@@ -438,8 +438,12 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            // DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-            c.creation_flags(0x0000_0008 | 0x0800_0000 | 0x0000_0200);
+            // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP — hide cmd's console and
+            // isolate the process group. (DETACHED_PROCESS dropped: it makes
+            // CREATE_NO_WINDOW a no-op and muddies the console semantics; null
+            // stdio + these two are what a fire-and-forget GUI launch actually
+            // needs, and a GUI app opens its own window regardless.)
+            c.creation_flags(0x0800_0000 | 0x0000_0200);
         }
         return match c.spawn() {
             Ok(child) => json_resp(&serde_json::json!({"ok": true, "detached": true, "pid": child.id()}), 200),

@@ -125,8 +125,8 @@ but does **not** stop handle inheritance. A command that exits cleanly (e.g.
 `AgentClubBuilder --dispatch KEY`) is fine because its pipe closes.
 **Fix:** for launches, spawn **detached, stdio → NUL, non-inheritable**. Implemented in
 `exec_ep`'s `detach` path — `Stdio::null()` on all three streams + Windows
-`DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` creation flags — so no exec pipe
-can leak into a GUI grandchild. Combined with fix (a)'s timeout, a captured command can no longer
+`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` creation flags (DETACHED_PROCESS dropped: it makes
+CREATE_NO_WINDOW a no-op) — so no exec pipe can leak into a GUI grandchild. Combined with fix (a)'s timeout, a captured command can no longer
 wedge the channel. Use **Launch an app (no wait)** / `detach:true` for anything that starts a GUI.
 _(Needs the release + agent-update cycle to reach devices.)_
 

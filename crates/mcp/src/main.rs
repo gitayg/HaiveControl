@@ -263,6 +263,18 @@ impl Srv {
     async fn list_devices(&self) -> Result<CallToolResult, ErrorData> {
         let v: serde_json::Value = self.client.get(self.m("agents", "")).send().await.map_err(err)?.json().await.map_err(err)?;
         let agents = v.get("agents").cloned().unwrap_or_else(|| serde_json::json!([]));
+        // Surface the owner-scoping hint on an empty list so it self-diagnoses.
+        if agents.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            let hint = if self.owner.is_empty() {
+                "No devices are registered on the hub yet.".to_string()
+            } else {
+                format!(
+                    "No devices visible for this owner ('{}'). HIVE_OWNER must match the email the device enrolled under (--owner …); unset HIVE_OWNER to see all devices for this token.",
+                    self.owner
+                )
+            };
+            return Ok(CallToolResult::success(vec![ContentBlock::text(hint)]));
+        }
         let text = serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "[]".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
