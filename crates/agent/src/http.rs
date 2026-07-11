@@ -154,6 +154,20 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
             Response::from_string("").with_status_code(204)
         }
         (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Post, "/schedule/add") => {
+            let mut b = String::new();
+            let _ = req.as_reader().read_to_string(&mut b);
+            crate::schedule::add(serde_json::from_str(&b).unwrap_or_default());
+            json_resp(&serde_json::json!({"ok": true}), 200)
+        }
+        (Method::Post, "/schedule/del") => {
+            let mut b = String::new();
+            let _ = req.as_reader().read_to_string(&mut b);
+            let id = serde_json::from_str::<serde_json::Value>(&b).ok().and_then(|v| v.get("id").and_then(|x| x.as_str()).map(String::from)).unwrap_or_default();
+            crate::schedule::del(&id);
+            json_resp(&serde_json::json!({"ok": true}), 200)
+        }
+        (Method::Get, "/schedule/list") => json_resp(&crate::schedule::list(), 200),
         (Method::Post, "/shell/open") => shell_open_ep(cfg),
         (Method::Get, "/shell/read") => shell_read_ep(&url),
         (Method::Post, "/shell/input") => shell_input_ep(&mut req, &url),
