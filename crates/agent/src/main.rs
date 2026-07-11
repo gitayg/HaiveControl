@@ -2,6 +2,7 @@
 // Copyright (C) 2026 The HaiveControl Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 mod capture;
+mod config;
 mod discovery;
 mod http;
 mod input;
@@ -51,6 +52,39 @@ struct Args {
     /// owner id this device belongs to (multi-user hub); or set HIVE_OWNER
     #[arg(long, value_name = "ID")]
     owner: Option<String>,
+    /// re-launch detached and exit, so you can close this window
+    #[arg(long)]
+    background: bool,
+}
+
+/// If `--background` was given, re-spawn ourselves detached (no console, no
+/// inherited stdio) and return true so the caller exits — leaving the real agent
+/// running after this window closes. HAIVE_DETACHED guards against re-spawning.
+fn relaunch_detached() -> bool {
+    if std::env::var("HAIVE_DETACHED").is_ok() {
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let rest: Vec<String> = std::env::args().skip(1).collect();
+    let mut c = std::process::Command::new(exe);
+    c.args(&rest)
+        .env("HAIVE_DETACHED", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, survives window close.
+        c.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    match c.spawn() {
+        Ok(_) => {
+            println!("HaiveControl is now running in the background — you can close this window.");
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn relay_id(name: &str) -> String {
@@ -212,6 +246,10 @@ fn media_devices() -> (Vec<String>, Vec<String>) {
 fn main() {
     let args = Args::parse();
 
+    if args.background && relaunch_detached() {
+        return;
+    }
+
     if args.uninstall {
         persistence::uninstall();
         println!("HaiveControl autostart removed.");
@@ -298,6 +336,7 @@ fn main() {
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
         println!("   relay: dialing {relay_addr} as {rid}");
+        config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
