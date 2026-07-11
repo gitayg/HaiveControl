@@ -20,6 +20,11 @@ RUN mkdir -p /app/dist \
              haive-mcp-linux haive-mcp-macos haive-mcp-windows.exe; do \
       curl -fsSL "https://github.com/gitayg/HaiveControl/releases/latest/download/$a" -o "/app/dist/$a"; \
     done
+# Leaflet for the device map's real basemap (served at /bin/leaflet.*). Non-fatal:
+# if the fetch fails the map falls back to the offline graticule.
+RUN curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" -o /app/dist/leaflet.js \
+ && curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" -o /app/dist/leaflet.css \
+ || echo "leaflet download skipped — map will use the graticule fallback"
 ENV HUB_DIST=/app/dist
 # Persistent, writable data dir (custom scripts, schedules, recordings, plugins).
 # Point at the AppCrane persistent volume so it survives redeploys.

@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.7.0";
+const VERSION: &str = "2.8.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -50,7 +50,7 @@ fn main() {
     println!("   On a device run:  HaiveControl {mid}");
 
     let agents: Arc<Agents> = Arc::new(Mutex::new(HashMap::new()));
-    start_scheduler(agents.clone());
+    start_scheduler(agents.clone(), ip.clone(), port);
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
     // (/relay/hello, /relay/poll, /relay/reply — see relay.rs), so it works
@@ -223,8 +223,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/script-delete") => script_delete(&url, user.as_deref()),
         (Method::Get, "/plugins") => plugins_list(),
         (Method::Get, "/m/plugins") => plugins_list(),
+        (Method::Get, "/actions") => actions_catalog(),
+        (Method::Get, "/m/actions") => actions_catalog(),
         (Method::Get, "/x/geo") => geo_devices(agents, user.as_deref()),
         (Method::Get, "/m/geo") => geo_devices(agents, mowner.as_deref()),
+        (Method::Get, "/x/cve") => cve_lookup(&url),
+        (Method::Get, "/m/cve") => cve_lookup(&url),
+        (Method::Get, "/x/settings") => settings_get(),
+        (Method::Post, "/x/settings") => settings_set(&mut req, user.as_deref()),
         (Method::Post, "/x/plugin-add") => plugin_add(&mut req, user.as_deref()),
         (Method::Get, "/x/plugin-delete") => plugin_delete(&url, user.as_deref()),
         (Method::Post, "/x/schedule-add") => schedule_add(&mut req, agents, user.as_deref()),
@@ -413,7 +419,18 @@ fn serve_bin(name: &str) -> Resp {
     }
     let dir = std::env::var("HUB_DIST").unwrap_or_else(|_| "dist".to_string());
     match std::fs::read(std::path::Path::new(&dir).join(name)) {
-        Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "application/octet-stream")),
+        Ok(bytes) => {
+            let ct = if name.ends_with(".js") {
+                "text/javascript; charset=utf-8"
+            } else if name.ends_with(".css") {
+                "text/css; charset=utf-8"
+            } else if name.ends_with(".svg") {
+                "image/svg+xml"
+            } else {
+                "application/octet-stream"
+            };
+            Response::from_data(bytes).with_header(hdr("Content-Type", ct))
+        }
         Err(_) => Response::from_string("not found").with_status_code(404),
     }
 }
@@ -607,14 +624,11 @@ fn proxy_update(url: &str, agents: &Agents, hub_ip: &str, hub_port: u16) -> Resp
         .get(&key)
         .and_then(|a| a.data.get("platform").and_then(|p| p.as_str()).map(String::from))
         .unwrap_or_default();
-    let asset = match platform.as_str() {
-        "windows" => "HaiveControl-windows.exe",
-        "macos" => "HaiveControl-macos",
-        "linux" => "HaiveControl-linux",
-        _ => return Response::from_string("unknown platform for device").with_status_code(400),
+    let asset = match agent_asset(&platform) {
+        Some(a) => a,
+        None => return Response::from_string("unknown platform for device").with_status_code(400),
     };
-    let dl = format!("http://{hub_ip}:{hub_port}/bin/{asset}");
-    let payload = serde_json::json!({ "url": dl }).to_string().into_bytes();
+    let payload = serde_json::json!({ "url": bin_url(asset, hub_ip, hub_port) }).to_string().into_bytes();
     match dev_unary(&target, "POST", "/update", Some(("application/json".into(), payload))) {
         Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "text/plain")),
         None => Response::from_string("update failed").with_status_code(502),
@@ -1331,6 +1345,216 @@ fn geo_devices(agents: &Agents, user: Option<&str>) -> Resp {
     json_resp(&serde_json::json!({"ok": true, "devices": out}))
 }
 
+// ── CVE lookup (NVD) ─────────────────────────────────────────────────────────
+// Manual keyword lookup against the NVD 2.0 API — "show CVEs for product X".
+// A lookup, not an automated scan (Windows software→CVE mapping is unreliable).
+fn cve_cache() -> &'static Mutex<HashMap<String, serde_json::Value>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, serde_json::Value>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn cvss_of(c: &serde_json::Value) -> (Option<f64>, String) {
+    for k in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"] {
+        if let Some(m) = c["metrics"][k].as_array().and_then(|a| a.first()) {
+            let score = m["cvssData"]["baseScore"].as_f64();
+            if score.is_some() {
+                let sev = m["cvssData"]["baseSeverity"].as_str().or_else(|| m["baseSeverity"].as_str()).unwrap_or("").to_string();
+                return (score, sev);
+            }
+        }
+    }
+    (None, String::new())
+}
+/// GET /x|m/cve?q=<keyword> — CVEs matching a product/keyword (NVD, cached).
+fn cve_lookup(url: &str) -> Resp {
+    let q = query_param(url, "q").unwrap_or_default().trim().to_string();
+    if q.is_empty() {
+        return json_resp(&serde_json::json!({"ok": true, "count": 0, "cves": []}));
+    }
+    if let Some(v) = cve_cache().lock().unwrap().get(&q) {
+        return json_resp(v);
+    }
+    let api = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=20", urlencode(&q));
+    let resp = http().get(&api).header("User-Agent", "HaiveControl").send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
+    let cves: Vec<serde_json::Value> = resp
+        .as_ref()
+        .and_then(|v| v["vulnerabilities"].as_array())
+        .map(|arr| {
+            let mut list: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|w| {
+                    let c = &w["cve"];
+                    let desc = c["descriptions"].as_array().and_then(|d| d.iter().find(|x| x["lang"].as_str() == Some("en"))).and_then(|x| x["value"].as_str()).unwrap_or("");
+                    let (score, sev) = cvss_of(c);
+                    serde_json::json!({
+                        "id": c["id"].as_str().unwrap_or(""),
+                        "published": c["published"].as_str().unwrap_or("").chars().take(10).collect::<String>(),
+                        "score": score,
+                        "severity": sev,
+                        "summary": desc.chars().take(320).collect::<String>(),
+                    })
+                })
+                .collect();
+            // Highest CVSS first.
+            list.sort_by(|a, b| b["score"].as_f64().unwrap_or(-1.0).partial_cmp(&a["score"].as_f64().unwrap_or(-1.0)).unwrap_or(std::cmp::Ordering::Equal));
+            list
+        })
+        .unwrap_or_default();
+    let out = serde_json::json!({"ok": true, "count": cves.len(), "cves": cves});
+    cve_cache().lock().unwrap().insert(q, out.clone());
+    json_resp(&out)
+}
+
+// ── Hub settings + agent auto-update ─────────────────────────────────────────
+// Admin-configurable settings persisted to HUB_DATA/settings.json. The
+// `agent_update` mode ("manual" default | "auto") controls whether the hub
+// pushes agent updates to out-of-date devices on its own.
+fn settings_path() -> std::path::PathBuf {
+    data_dir().join("settings.json")
+}
+fn load_settings() -> serde_json::Value {
+    std::fs::read_to_string(settings_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| serde_json::json!({}))
+}
+fn setting_str(key: &str, default: &str) -> String {
+    load_settings().get(key).and_then(|x| x.as_str()).unwrap_or(default).to_string()
+}
+fn save_setting(key: &str, val: &str) {
+    let mut s = load_settings();
+    s[key] = serde_json::json!(val);
+    let _ = std::fs::create_dir_all(data_dir());
+    let _ = std::fs::write(settings_path(), serde_json::to_string_pretty(&s).unwrap_or_default());
+}
+fn settings_get() -> Resp {
+    json_resp(&serde_json::json!({"ok": true, "agent_update": setting_str("agent_update", "manual"), "server_version": VERSION}))
+}
+/// POST /x/settings — update an admin setting (SSO).
+fn settings_set(req: &mut Request, user: Option<&str>) -> Resp {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    if let Some(m) = v.get("agent_update").and_then(|x| x.as_str()) {
+        if m == "auto" || m == "manual" {
+            save_setting("agent_update", m);
+            audit(user.unwrap_or(""), "browser", "setting", "agent_update", m);
+        }
+    }
+    settings_get()
+}
+
+fn agent_asset(platform: &str) -> Option<&'static str> {
+    match platform {
+        "windows" => Some("HaiveControl-windows.exe"),
+        "macos" => Some("HaiveControl-macos"),
+        "linux" => Some("HaiveControl-linux"),
+        _ => None,
+    }
+}
+/// Public URL for a served binary — HUB_PUBLIC_URL when set (so relay devices can
+/// reach it), else the local address.
+fn bin_url(asset: &str, hub_ip: &str, hub_port: u16) -> String {
+    match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+        Some(base) => format!("{}/bin/{asset}", base.trim_end_matches('/')),
+        None => format!("http://{hub_ip}:{hub_port}/bin/{asset}"),
+    }
+}
+/// Tell a device to self-update to the hub-served build for its platform.
+fn trigger_update(target: &str, platform: &str, hub_ip: &str, hub_port: u16) -> bool {
+    let Some(asset) = agent_asset(platform) else { return false };
+    let payload = serde_json::json!({ "url": bin_url(asset, hub_ip, hub_port) }).to_string().into_bytes();
+    dev_unary(target, "POST", "/update", Some(("application/json".into(), payload))).is_some()
+}
+fn update_cooldown() -> &'static Mutex<HashMap<String, Instant>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// When agent_update=auto, push updates to devices whose reported agent version
+/// is behind the hub's served build (5-min per-device cooldown).
+fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
+    if setting_str("agent_update", "manual") != "auto" {
+        return;
+    }
+    let stale: Vec<(String, String)> = {
+        let guard = agents.lock().unwrap();
+        guard
+            .values()
+            .filter_map(|a| {
+                let d = &a.data;
+                let ver = d.get("agent_version").and_then(|x| x.as_str())?;
+                if ver == VERSION {
+                    return None;
+                }
+                let platform = d.get("platform").and_then(|x| x.as_str())?.to_string();
+                let ip = d.get("ip").and_then(|x| x.as_str()).unwrap_or("");
+                let target = if d.get("scheme").and_then(|x| x.as_str()) == Some("relay") {
+                    format!("relay://{ip}")
+                } else {
+                    format!("{}://{ip}:{}", d.get("scheme").and_then(|x| x.as_str()).unwrap_or("http"), d.get("port").and_then(|x| x.as_i64()).unwrap_or(0))
+                };
+                Some((target, platform))
+            })
+            .collect()
+    };
+    let now = Instant::now();
+    for (target, platform) in stale {
+        {
+            let mut cd = update_cooldown().lock().unwrap();
+            if cd.get(&target).map(|t| now.duration_since(*t) < std::time::Duration::from_secs(300)).unwrap_or(false) {
+                continue;
+            }
+            cd.insert(target.clone(), now);
+        }
+        if trigger_update(&target, &platform, hub_ip, hub_port) {
+            audit("", "auto", "auto-update", &target, VERSION);
+        }
+    }
+}
+
+/// GET /actions and /m/actions — machine-readable catalog of runnable actions
+/// (built-in canned actions + plugins) so a non-MCP agent can discover what it
+/// can do and how to invoke it.
+fn actions_catalog() -> Resp {
+    let builtin = serde_json::json!([
+        {"kind":"hardware","name":"Hardware inventory","group":"report"},
+        {"kind":"packages","name":"Installed software","group":"report"},
+        {"kind":"services","name":"Running services","group":"report"},
+        {"kind":"processes","name":"Top processes","group":"report"},
+        {"kind":"network","name":"Network neighbors (ARP)","group":"report"},
+        {"kind":"updates","name":"Available updates","group":"report"},
+        {"kind":"power_report","name":"Power / battery report","group":"report"},
+        {"kind":"encryption","name":"Disk-encryption status","group":"security"},
+        {"kind":"firewall","name":"Firewall status","group":"security"},
+        {"kind":"av","name":"Antivirus status","group":"security"},
+        {"kind":"posture","name":"Compliance posture (scored A–F)","group":"security","composite":true},
+        {"kind":"firewall_on","name":"Firewall — enable","group":"security","danger":true},
+        {"kind":"firewall_off","name":"Firewall — disable","group":"security","danger":true},
+        {"kind":"usb_lock","name":"Lock USB storage (Windows)","group":"security","danger":true},
+        {"kind":"usb_unlock","name":"Unlock USB storage (Windows)","group":"security"},
+        {"kind":"install","name":"Install a package","group":"software","arg":"package id"},
+        {"kind":"uninstall","name":"Uninstall a package","group":"software","arg":"package id"},
+        {"kind":"update_all","name":"Install all updates","group":"software","danger":true},
+        {"kind":"reboot","name":"Restart","group":"power","danger":true},
+        {"kind":"shutdown","name":"Shut down","group":"power","danger":true},
+        {"kind":"sleep","name":"Sleep","group":"power"},
+        {"kind":"logoff","name":"Log off","group":"power","danger":true},
+        {"kind":"message","name":"Message the logged-in user","group":"notify","arg":"message text"},
+    ]);
+    let plugins: Vec<serde_json::Value> = load_plugins()
+        .iter()
+        .map(|p| serde_json::json!({"kind": p.get("id").and_then(|x| x.as_str()).unwrap_or(""), "name": p.get("name").and_then(|x| x.as_str()).unwrap_or(""), "group": "plugin", "arg": p.get("arg").and_then(|x| x.as_str()).unwrap_or("")}))
+        .collect();
+    json_resp(&serde_json::json!({
+        "ok": true,
+        "how_to_run": {
+            "one_device": "GET /m/sys?mtok=<t>&owner=<o>&target=<device>&kind=<kind>&arg=<arg>",
+            "all_devices": "GET /m/fleet?mtok=<t>&owner=<o>&kind=<kind>&arg=<arg>",
+            "arbitrary_command": "POST /m/exec {target,cmd,detach?,timeout?}",
+            "scripts": "GET /m/scripts?q=<query>, then GET /m/script?target=&file=",
+            "schedule": "POST /x/schedule-add {target,kind,arg,when:{type:once|interval|daily, mins|hhmm}}"
+        },
+        "actions": builtin,
+        "plugins": plugins
+    }))
+}
+
 // ── Scheduled actions ────────────────────────────────────────────────────────
 // Persist scheduled runs to HUB_DATA/schedules.json; a background tick fires the
 // due ones through the same exec path the dashboard/MCP use. Times are UTC.
@@ -1442,9 +1666,10 @@ fn run_scheduled(agents: &Agents, s: &serde_json::Value) {
     audit(owner, "schedule", kind, &dev, arg);
 }
 /// Background tick: fire due schedules, re-arm recurring ones, drop one-shots.
-fn start_scheduler(agents: Arc<Agents>) {
+fn start_scheduler(agents: Arc<Agents>, hub_ip: String, hub_port: u16) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
+        auto_update_pass(&agents, &hub_ip, hub_port);
         let now = now_secs();
         let mut all = load_schedules();
         let mut changed = false;
@@ -1860,24 +2085,34 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"side-head\"><div><h1>HaiveControl <span class=\"dim2\">hub</span></h1><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div><span class=\"pill\" id=\"count\">…</span></div>\
 <div class=\"legend\"><span><span class=\"dot on\"></span>online</span><span><span class=\"dot idle\"></span>idle</span><span><span class=\"dot off\"></span>stale</span></div>\
 <input id=\"devsearch\" class=\"devsearch\" type=\"search\" placeholder=\"Search devices…\" autocomplete=\"off\" oninput=\"SEARCH=this.value.toLowerCase();renderSide(LAST);\">\
-<ul id=\"devlist\" class=\"devlist\"></ul>\
-<button class=\"addbtn\" onclick=\"showOverview()\">📊 Fleet status</button>\
-<button class=\"addbtn\" onclick=\"showFleet()\">⚡ Fleet run</button>\
-<button class=\"addbtn\" onclick=\"showScripts()\">🧰 Script library</button>\
-<button class=\"addbtn\" onclick=\"showCompliance()\">🛡 Compliance</button>\
-<button class=\"addbtn\" onclick=\"showSchedules()\">⏰ Scheduled</button>\
-<button class=\"addbtn\" onclick=\"showRecordings()\">🎬 Recordings</button>\
-<button class=\"addbtn\" onclick=\"showMap()\">🗺 Map</button>\
-<button class=\"addbtn\" onclick=\"showAudit()\">📋 Audit log</button>\
-<button class=\"addbtn\" onclick=\"toggleReg()\">+ Register a device</button>\
+<div class=\"dev-head\"><span class=\"navsec\">Devices</span><button class=\"miniadd\" onclick=\"toggleReg()\" title=\"register a new device\">+ Add</button></div>\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><p class=\"reg-hint\">Download the agent, then run it:</p>{win}{mac}{lin}</div>\
+<ul id=\"devlist\" class=\"devlist\"></ul>\
+<nav class=\"nav\">\
+<div class=\"navsec\">Fleet</div>\
+<button class=\"navb\" data-nav=\"overview\" onclick=\"showOverview()\"><span class=\"ni\">📊</span>Fleet status</button>\
+<button class=\"navb\" data-nav=\"fleet\" onclick=\"showFleet()\"><span class=\"ni\">⚡</span>Fleet run</button>\
+<div class=\"navsec\">Security</div>\
+<button class=\"navb\" data-nav=\"compliance\" onclick=\"showCompliance()\"><span class=\"ni\">🛡</span>Compliance</button>\
+<button class=\"navb\" data-nav=\"cve\" onclick=\"showCVE()\"><span class=\"ni\">🔎</span>CVE lookup</button>\
+<div class=\"navsec\">Ops</div>\
+<button class=\"navb\" data-nav=\"scripts\" onclick=\"showScripts()\"><span class=\"ni\">🧰</span>Script library</button>\
+<button class=\"navb\" data-nav=\"sched\" onclick=\"showSchedules()\"><span class=\"ni\">⏰</span>Scheduled</button>\
+<button class=\"navb\" data-nav=\"recs\" onclick=\"showRecordings()\"><span class=\"ni\">🎬</span>Recordings</button>\
+<button class=\"navb\" data-nav=\"map\" onclick=\"showMap()\"><span class=\"ni\">🗺</span>Map</button>\
+<div class=\"navsec\">System</div>\
+<button class=\"navb\" data-nav=\"audit\" onclick=\"showAudit()\"><span class=\"ni\">📋</span>Audit log</button>\
+<button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\">⚙</span>Settings</button>\
+</nav>\
 </aside>\
 <main class=\"stage\">\
 <div class=\"stage-empty\" id=\"stage-empty\">Select a device from the left to control it.</div>\
-<div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account</span></div><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
-<div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th></th><th>Device</th><th>OS</th><th>User</th><th class=\"ov-num\">CPU</th><th class=\"ov-num\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th>Last seen</th><th>MCP</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
+<div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account · last 500 events</span></div><input id=\"aud-q\" class=\"devsearch\" placeholder=\"Filter by device / action / who / via…\" autocomplete=\"off\" oninput=\"renderAudit();\"><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
+<div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
 <div id=\"schedules-view\" style=\"display:none\"><div class=\"aud-head\">Scheduled <span class=\"dim2\">— actions queued to run automatically (times UTC)</span></div><div id=\"sched-list\"></div></div>\
 <div id=\"map-view\" style=\"display:none\"><div class=\"aud-head\">Device map <span class=\"dim2\">— approximate location from public IP · city-level, VPN/NAT skews it</span></div><div id=\"map-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"map-svg\"></div><div id=\"map-un\" class=\"map-un\"></div></div>\
+<div id=\"settings-view\" style=\"display:none\"><div class=\"aud-head\">Settings <span class=\"dim2\">— hub administration</span></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Agent updates</div><div class=\"set-desc\">How out-of-date device agents get updated to the hub's build (<span id=\"set-ver\" class=\"dim2\"></span>). <b>Automatic</b> pushes updates to behind devices on a schedule; <b>Manual</b> updates only when you click Update on a device.</div></div><select id=\"set-au\" class=\"scr-sel\" onchange=\"saveAgentUpdate()\"><option value=\"manual\">Manual</option><option value=\"auto\">Automatic</option></select></div></div>\
+<div id=\"cve-view\" style=\"display:none\"><div class=\"aud-head\">CVE lookup <span class=\"dim2\">— known CVEs for a product, via NVD · a lookup, not an automated scan</span></div><div class=\"fleet-bar\"><input id=\"cve-q\" class=\"devsearch\" placeholder=\"Product / keyword — e.g. openssl 3.0, Google Chrome, log4j\" autocomplete=\"off\"><button class=\"b\" onclick=\"searchCVE()\">Search</button></div><div id=\"cve-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"cve-list\"></div></div>\
 <div id=\"recordings-view\" style=\"display:none\"><div class=\"aud-head\">Recordings <span class=\"dim2\">— replay past interactive shell sessions</span></div><div id=\"rec-player\" class=\"rec-player\" style=\"display:none\"><div class=\"rec-pbar\"><span id=\"rec-title\" class=\"dim2\"></span><button class=\"b subtle\" onclick=\"stopPlay()\">Close player</button></div><div id=\"rec-term\" class=\"rec-term\"></div></div><div id=\"rec-list\"></div></div>\
 <div id=\"compliance-view\" style=\"display:none\"><div class=\"aud-head\">Compliance <span class=\"dim2\">— posture across the fleet, mapped to a framework</span></div><div class=\"fleet-bar\"><select id=\"cmp-fw\" class=\"scr-sel\" title=\"framework to show control IDs for\" onchange=\"renderCompliance()\"></select><button class=\"b\" onclick=\"runCompliance()\">Run across fleet ▶</button></div><div id=\"cmp-note\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\">Indicative control references to orient you — not certified audit evidence.</div><div class=\"ov-scroll\"><table class=\"ov-tbl cmp-tbl\"><thead id=\"cmp-head\"></thead><tbody id=\"cmp-body\"></tbody></table></div></div>\
 <div id=\"scripts-view\" style=\"display:none\"><div class=\"aud-head\">Script library <span class=\"dim2\">— TacticalRMM community scripts (amidaware) · runs base64-wrapped, ~65s cap</span></div><div class=\"fleet-bar\"><input id=\"scr-q\" class=\"devsearch\" placeholder=\"Search scripts… (bitlocker, cleanup, defender, choco…)\" autocomplete=\"off\"><select id=\"scr-target\" class=\"scr-sel\" title=\"where to run\"></select><button class=\"b\" onclick=\"toggleScrForm()\" title=\"add your own script\">＋ Add</button></div>\
@@ -1967,6 +2202,8 @@ pre{margin:0}
 .ov-tbl th{text-align:left;padding:9px 12px;color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.5px;border-bottom:1px solid var(--line2);position:sticky;top:0;background:var(--panel,var(--bg));font-weight:600}
 .ov-tbl td{padding:9px 12px;border-bottom:1px solid var(--line2)}
 .ov-tbl tbody tr:last-child td{border-bottom:0}
+.ovh{cursor:pointer;user-select:none}
+.ovh:hover{color:var(--text)}
 .ov-row{cursor:pointer}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
 .ov-nm{font-weight:600;color:var(--text)}
@@ -2009,6 +2246,15 @@ pre{margin:0}
 .empty-li{color:var(--muted);font-size:12px;padding:14px 11px}
 .addbtn{margin:9px;padding:9px;border-radius:9px;background:var(--surface2);border:1px solid var(--line2);color:#d7dbe6;cursor:pointer;font-size:12px;transition:background .15s}
 .addbtn:hover{background:#252b3a}
+.dev-head{display:flex;align-items:center;justify-content:space-between;padding:6px 12px 2px}
+.miniadd{background:transparent;border:1px solid var(--line2);color:var(--muted);border-radius:6px;padding:2px 9px;font-size:11px;cursor:pointer;transition:color .12s,border-color .12s}
+.miniadd:hover{color:var(--text);border-color:var(--accent)}
+.nav{display:flex;flex-direction:column;gap:2px;margin:8px 6px 10px;padding-top:8px;border-top:1px solid var(--line)}
+.navsec{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted2);font-weight:600;padding:7px 6px 3px}
+.navb{display:flex;align-items:center;gap:9px;background:transparent;border:0;color:var(--muted);border-radius:7px;padding:6px 8px;font-size:12.5px;cursor:pointer;text-align:left;width:100%;transition:background .12s,color .12s}
+.navb:hover{background:var(--surface2);color:var(--text)}
+.navb.active{background:var(--surface2);color:var(--text);box-shadow:inset 2px 0 0 var(--accent)}
+.navb .ni{font-size:13px;width:16px;text-align:center;flex:none}
 .reg{padding:10px 14px 14px;border-top:1px solid var(--line)}
 .stage{flex:1;min-width:0;display:flex;flex-direction:column;padding:18px 20px;gap:14px}
 .stage-empty{margin:auto;color:var(--muted2);font-size:13px}
@@ -2056,13 +2302,16 @@ pre{margin:0}
 .bgroup:last-child{padding-right:0;border-right:0}
 .blabel{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted2);font-weight:600}
 .brow{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
-.runner{display:flex;flex-direction:column;gap:7px;padding:12px 0 2px}
-.runner-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.act-selw{max-width:240px}
-.act-arg{margin:0;flex:1;min-width:160px}
-.act-desc{font-size:12px;color:var(--muted)}
-.sched-lbl{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer}
-.sched-box{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px}
+.alist{display:flex;flex-direction:column;gap:6px}
+.arow{display:flex;flex-wrap:wrap;gap:10px 12px;align-items:center;border:1px solid var(--line);border-radius:10px;padding:9px 12px}
+.arow-main{flex:1;min-width:180px}
+.arow-nm{font-weight:600;font-size:13px;color:var(--text)}
+.arow-desc{font-size:11px;color:var(--muted);margin-top:1px}
+.arow-ctl{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
+.arow-ctl .scr-sel{max-width:170px}
+.arow-ctl .arow-arg{margin:0;width:190px}
+.arow-sbtn{padding:6px 9px}
+.arow-sched{flex-basis:100%;display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;padding-top:8px;border-top:1px solid var(--line2)}
 .sch-in{margin:0;width:110px}
 .sched-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
 .sched-main{flex:1;min-width:0}
@@ -2079,6 +2328,22 @@ pre{margin:0}
 .map-un{margin-top:12px}
 .map-unh{font-size:11px;color:var(--muted2);margin-bottom:6px}
 .map-unc{cursor:pointer}
+.cve-row{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.cve-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:4px}
+.cve-id{font-weight:600;font-size:13px;color:var(--accent);text-decoration:none}
+.cve-id:hover{text-decoration:underline}
+.cve-sev{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;text-transform:uppercase;letter-spacing:.4px}
+.sev-crit{background:#5a1a1a;color:#ff8f8f}
+.sev-high{background:#5a2f1a;color:#ffb27a}
+.sev-med{background:#5a501a;color:#f5df7a}
+.sev-low{background:#1a3a5a;color:#8fc4ff}
+.sev-none{background:var(--surface2);color:var(--muted)}
+.cve-sum{font-size:12px;color:var(--muted);line-height:1.4}
+.set-row{display:flex;gap:16px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:10px}
+.set-main{flex:1;min-width:0}
+.set-nm{font-weight:600;font-size:14px;color:var(--text)}
+.set-desc{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
+.set-row .scr-sel{flex:none;height:34px}
 .b{background:var(--surface2);border:1px solid var(--line2);color:#d7dbe6;border-radius:7px;padding:6px 11px;cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
 .b:hover{background:#252b3a;border-color:#3a4258;color:#fff}
 .b:active{background:#2c3346}
@@ -2118,32 +2383,33 @@ var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(OVERVIEW_ON)renderOverview(arr);var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!SEL&&arr.length&&!special){select(baseOf(arr[0]));}}).catch(function(){});}
+function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(OVERVIEW_ON)renderOverview(arr);var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!SEL&&arr.length&&!special){select(baseOf(arr[0]));}}).catch(function(){});}
 function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
-function showEmpty(){hideViews();document.getElementById('stage-empty').style.display='block';}
+function showEmpty(){hideViews();document.getElementById('stage-empty').style.display='block';setNav('');}
 var AUDIT_ON=false;
 function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function hideViews(){stopPlay();var v=['detail','stage-empty','fleet-view','overview-view','audit-view','scripts-view','compliance-view','schedules-view','recordings-view','map-view'];for(var i=0;i<v.length;i++){var el=document.getElementById(v[i]);if(el)el.style.display='none';}}
-function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;SEL=null;highlight();hideViews();document.getElementById('audit-view').style.display='block';loadAudit();}
+function hideViews(){stopPlay();if(LMAP){try{LMAP.remove();}catch(e){}LMAP=null;}var v=['detail','stage-empty','fleet-view','overview-view','audit-view','scripts-view','compliance-view','schedules-view','recordings-view','map-view','cve-view','settings-view'];for(var i=0;i<v.length;i++){var el=document.getElementById(v[i]);if(el)el.style.display='none';}}
+function setNav(n){var b=document.querySelectorAll('.navb');for(var i=0;i<b.length;i++){b[i].classList.toggle('active',b[i].getAttribute('data-nav')===n);}}
+function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('audit-view').style.display='block';setNav('audit');loadAudit();}
 function sysCall(kind,arg){var u='/x/sys?target='+enc(SEL)+'&kind='+enc(kind);if(arg)u+='&arg='+enc(arg);out(kind+' …');fetch(u).then(function(r){return r.json();}).then(function(j){out(j.output||('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
 function doSys(){var k=prompt('Report — hardware / av / encryption / firewall / processes / services / network / packages / updates / power_report','hardware');if(k)sysCall(k.trim(),'');}
 function doPower(){var a=prompt('Action — reboot / shutdown / sleep / logoff / update_all / firewall_on / firewall_off / usb_lock / usb_unlock','sleep');if(!a)return;a=a.trim();if(!confirm(a+' — run on this device?'))return;sysCall(a,'');}
 function doMsg(){var t=prompt('Message to show the logged-in user:');if(t)sysCall('message',t);}
 function doInstall(){var p=prompt('Package to install (winget id / brew formula / apt package):');if(p)sysCall('install',p.trim());}
 function doPosture(){out('checking compliance…');fetch('/x/sys?target='+enc(SEL)+'&kind=posture').then(function(r){return r.json();}).then(function(j){if(!j.ok){out('[error] '+(j.error||'failed'));return;}var s='Compliance: '+j.grade+' ('+j.score+'/100)\n';(j.checks||[]).forEach(function(c){s+='  ['+(c.pass?'PASS':'FAIL')+'] '+c.check+'\n';});out(s);}).catch(function(e){out('error: '+e);});}
-function showFleet(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;SEL=null;highlight();hideViews();document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
+function showFleet(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('fleet-view').style.display='block';setNav('fleet');document.getElementById('fleet-cmd').focus();}
 var OVERVIEW_ON=false,SCRIPTS_ON=false,COMPLIANCE_ON=false,SCHED_ON=false,SCR_T=null,CMP_DATA=null;
-function showSchedules(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;RECS_ON=false;MAP_ON=false;SCHED_ON=true;SEL=null;highlight();hideViews();document.getElementById('schedules-view').style.display='block';loadSchedules();}
+function showSchedules(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SCHED_ON=true;SEL=null;highlight();hideViews();document.getElementById('schedules-view').style.display='block';setNav('sched');loadSchedules();}
 function loadSchedules(){fetch('/x/schedules').then(function(r){return r.json();}).then(function(j){renderSchedules((j&&j.schedules)||[]);}).catch(function(){document.getElementById('sched-list').innerHTML='<div class="aud-empty">Could not load schedules.</div>';});}
 function schedEvery(w){w=w||{};return w.type==='once'?('once, in '+(w.mins||0)+'m'):w.type==='interval'?('every '+(w.mins||0)+'m'):('daily at '+(w.hhmm||'')+' UTC');}
 function nextIn(secs){if(secs==null)return '';var now=Math.floor(Date.now()/1000);var d=secs-now;if(d<=0)return 'due';return d<60?(d+'s'):d<3600?(Math.round(d/60)+'m'):d<86400?(Math.round(d/3600)+'h'):(Math.round(d/86400)+'d');}
 function renderSchedules(arr){var el=document.getElementById('sched-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No scheduled actions. Open a device → pick an action → tick “Schedule”.</div>';return;}el.innerHTML=arr.map(function(s){return '<div class="sched-row"><div class="sched-main"><div class="sched-nm">'+esc2(s.label||s.kind)+(s.arg?(' <span class="dim2">'+esc2(s.arg)+'</span>'):'')+'</div><div class="sched-meta">'+esc2(s.device||'?')+' · '+esc2(schedEvery(s.when))+' · next in '+nextIn(s.next_run)+'</div></div><button class="b danger" onclick="delSchedule(\''+attrEsc(s.id)+'\')">Cancel</button></div>';}).join('');}
 function delSchedule(id){fetch('/x/schedule-delete?id='+encodeURIComponent(id)).then(function(r){return r.json();}).then(function(){loadSchedules();}).catch(function(){});}
 var RECS_ON=false,REC_TIMERS=[];
-function showRecordings(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;MAP_ON=false;RECS_ON=true;SEL=null;highlight();hideViews();document.getElementById('recordings-view').style.display='block';stopPlay();loadRecordings();}
+function showRecordings(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;RECS_ON=true;SEL=null;highlight();hideViews();document.getElementById('recordings-view').style.display='block';setNav('recs');stopPlay();loadRecordings();}
 function loadRecordings(){fetch('/x/recordings').then(function(r){return r.json();}).then(function(j){renderRecordings((j&&j.recordings)||[]);}).catch(function(){document.getElementById('rec-list').innerHTML='<div class="aud-empty">Could not load recordings.</div>';});}
 function recWhen(ts){if(!ts)return '';var d=Math.floor(Date.now()/1000)-ts;return d<60?(d+'s ago'):d<3600?(Math.round(d/60)+'m ago'):d<86400?(Math.round(d/3600)+'h ago'):(Math.round(d/86400)+'d ago');}
 function recSize(n){return n<1024?(n+' B'):n<1048576?((n/1024).toFixed(0)+' KB'):((n/1048576).toFixed(1)+' MB');}
@@ -2151,17 +2417,29 @@ function renderRecordings(arr){var el=document.getElementById('rec-list');if(!ar
 function stopPlay(){if(REC_TIMERS){REC_TIMERS.forEach(clearTimeout);REC_TIMERS=[];}var p=document.getElementById('rec-player');if(p)p.style.display='none';var t=document.getElementById('rec-term');if(t)t.innerHTML='';}
 function playRecording(file,dev){stopPlay();document.getElementById('rec-player').style.display='block';document.getElementById('rec-title').textContent='▶ '+dev+' — replaying…';fetch('/x/recording?file='+encodeURIComponent(file)).then(function(r){return r.text();}).then(function(txt){var lines=txt.split('\n');var term=new Terminal({convertEol:false,fontSize:12,cols:120,rows:30,theme:{background:'#0d0f14',foreground:'#e6e9f2'}});term.open(document.getElementById('rec-term'));REC_TIMERS=[];var last=0;for(var i=1;i<lines.length;i++){if(!lines[i])continue;try{var e=JSON.parse(lines[i]);if(e[1]!=='o')continue;(function(data,at){REC_TIMERS.push(setTimeout(function(){term.write(data);},at*1000));})(e[2],e[0]);if(e[0]>last)last=e[0];}catch(x){}}REC_TIMERS.push(setTimeout(function(){document.getElementById('rec-title').textContent='▶ '+dev+' — done';},last*1000+300));}).catch(function(){document.getElementById('rec-title').textContent='playback failed';});}
 function delRecording(file){if(!confirm('Delete this recording?'))return;fetch('/x/recording-delete?file='+encodeURIComponent(file)).then(function(r){return r.json();}).then(function(){loadRecordings();}).catch(function(){});}
-var MAP_ON=false;
-function showMap(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=true;SEL=null;highlight();hideViews();document.getElementById('map-view').style.display='block';document.getElementById('map-svg').innerHTML='<div class="dim2" style="font-size:12px">Locating devices…</div>';loadMap();}
+var MAP_ON=false,LMAP=null;
+function ensureLeaflet(cb){if(window.L||window.__lfTried){cb();return;}window.__lfTried=true;var css=document.createElement('link');css.rel='stylesheet';css.href='/bin/leaflet.css';document.head.appendChild(css);var s=document.createElement('script');s.src='/bin/leaflet.js';s.onload=cb;s.onerror=cb;document.head.appendChild(s);}
+function showMap(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;CVE_ON=false;SET_ON=false;MAP_ON=true;SEL=null;highlight();hideViews();document.getElementById('map-view').style.display='block';setNav('map');document.getElementById('map-svg').innerHTML='<div class="dim2" style="font-size:12px">Locating devices…</div>';ensureLeaflet(loadMap);}
 function loadMap(){fetch('/x/geo').then(function(r){return r.json();}).then(function(j){renderMap((j&&j.devices)||[]);}).catch(function(){document.getElementById('map-svg').innerHTML='<div class="aud-empty">Could not load map.</div>';});}
-function renderMap(devs){var loc=devs.filter(function(d){return d.lat!=null&&d.lon!=null;});var un=devs.filter(function(d){return d.lat==null||d.lon==null;});var grid='',i;for(i=0;i<=360;i+=30)grid+='<line x1="'+i+'" y1="0" x2="'+i+'" y2="180"/>';for(i=0;i<=180;i+=30)grid+='<line x1="0" y1="'+i+'" x2="360" y2="'+i+'"/>';var pins=loc.map(function(d){var x=(+d.lon)+180,y=90-(+d.lat);return '<g class="pin" onclick="select(\''+attrEsc(d.base)+'\')"><circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+'" r="2.6"/><title>'+esc2(d.name+' — '+((d.city?d.city+', ':'')+(d.country||'')))+'</title></g>';}).join('');document.getElementById('map-svg').innerHTML='<svg viewBox="0 0 360 180" class="worldsvg"><rect x="0" y="0" width="360" height="180" class="mapbg"/><g class="grat">'+grid+'</g>'+pins+'</svg>';document.getElementById('map-count').textContent=loc.length+' located · '+un.length+' unlocated';document.getElementById('map-un').innerHTML=un.length?('<div class="map-unh">Unlocated (LAN / private IP):</div>'+un.map(function(d){return '<span class="chip map-unc" onclick="select(\''+attrEsc(d.base)+'\')">'+esc2(d.name)+'</span>';}).join('')):'';}
+function renderMap(devs){var loc=devs.filter(function(d){return d.lat!=null&&d.lon!=null;});var un=devs.filter(function(d){return d.lat==null||d.lon==null;});document.getElementById('map-count').textContent=loc.length+' located · '+un.length+' unlocated'+(window.L?'':' · offline map');document.getElementById('map-un').innerHTML=un.length?('<div class="map-unh">Unlocated (LAN / private IP):</div>'+un.map(function(d){return '<span class="chip map-unc" onclick="select(\''+attrEsc(d.base)+'\')">'+esc2(d.name)+'</span>';}).join('')):'';if(window.L){renderLeaflet(loc);}else{renderGraticule(loc);}}
+function renderLeaflet(loc){var el=document.getElementById('map-svg');el.innerHTML='<div id="lmap" style="height:440px;border-radius:10px;overflow:hidden;border:1px solid var(--line2)"></div>';if(LMAP){LMAP.remove();LMAP=null;}LMAP=L.map('lmap').setView([20,0],2);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'© OpenStreetMap'}).addTo(LMAP);var pts=[];loc.forEach(function(d){var mk=L.circleMarker([+d.lat,+d.lon],{radius:7,weight:1,color:'#fff',fillColor:'#5b9dff',fillOpacity:.9}).addTo(LMAP);mk.bindPopup('<b>'+esc2(d.name)+'</b><br>'+esc2((d.city?d.city+', ':'')+(d.country||''))+'<br><span class="cve-id" style="cursor:pointer" onclick="select(\''+attrEsc(d.base)+'\')">Open device →</span>');pts.push([+d.lat,+d.lon]);});if(pts.length)LMAP.fitBounds(pts,{padding:[40,40],maxZoom:6});setTimeout(function(){if(LMAP)LMAP.invalidateSize();},120);}
+function renderGraticule(loc){var grid='',i;for(i=0;i<=360;i+=30)grid+='<line x1="'+i+'" y1="0" x2="'+i+'" y2="180"/>';for(i=0;i<=180;i+=30)grid+='<line x1="0" y1="'+i+'" x2="360" y2="'+i+'"/>';var pins=loc.map(function(d){var x=(+d.lon)+180,y=90-(+d.lat);return '<g class="pin" onclick="select(\''+attrEsc(d.base)+'\')"><circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+'" r="2.6"/><title>'+esc2(d.name+' — '+((d.city?d.city+', ':'')+(d.country||'')))+'</title></g>';}).join('');document.getElementById('map-svg').innerHTML='<svg viewBox="0 0 360 180" class="worldsvg"><rect x="0" y="0" width="360" height="180" class="mapbg"/><g class="grat">'+grid+'</g>'+pins+'</svg>';}
+var CVE_ON=false;
+function showCVE(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;SET_ON=false;CVE_ON=true;SEL=null;highlight();hideViews();document.getElementById('cve-view').style.display='block';setNav('cve');document.getElementById('cve-q').focus();}
+function sevCls(s){s=(s||'').toUpperCase();return s==='CRITICAL'?'sev-crit':s==='HIGH'?'sev-high':s==='MEDIUM'?'sev-med':s==='LOW'?'sev-low':'sev-none';}
+function searchCVE(){var q=document.getElementById('cve-q').value.trim();if(!q)return;var el=document.getElementById('cve-list');el.innerHTML='<div class="dim2" style="font-size:12px">Querying NVD…</div>';document.getElementById('cve-count').textContent='';fetch('/x/cve?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(j){renderCVE((j&&j.cves)||[]);}).catch(function(){el.innerHTML='<div class="aud-empty">NVD query failed (rate-limited? try again).</div>';});}
+function renderCVE(arr){document.getElementById('cve-count').textContent=arr.length+' CVEs';var el=document.getElementById('cve-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No CVEs found for that term.</div>';return;}el.innerHTML=arr.map(function(c){var sc=(c.score!=null)?c.score:'—';return '<div class="cve-row"><div class="cve-head"><a class="cve-id" href="https://nvd.nist.gov/vuln/detail/'+encodeURIComponent(c.id)+'" target="_blank" rel="noopener">'+esc2(c.id)+'</a><span class="cve-sev '+sevCls(c.severity)+'">'+esc2(c.severity||'—')+' '+sc+'</span><span class="dim2">'+esc2(c.published||'')+'</span></div><div class="cve-sum">'+esc2(c.summary||'')+'</div></div>';}).join('');}
+var SET_ON=false;
+function showSettings(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=true;SEL=null;highlight();hideViews();document.getElementById('settings-view').style.display='block';setNav('settings');loadSettings();}
+function loadSettings(){fetch('/x/settings').then(function(r){return r.json();}).then(function(j){document.getElementById('set-au').value=j.agent_update||'manual';document.getElementById('set-ver').textContent='serving v'+(j.server_version||'');}).catch(function(){});}
+function saveAgentUpdate(){var m=document.getElementById('set-au').value;fetch('/x/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_update:m})}).then(function(r){return r.json();}).then(function(){}).catch(function(){});}
 var CMP_CHECKS=[['disk encryption','encryption'],['firewall','firewall'],['antivirus','av'],['OS updates','updates']];
 var CMP_FW=['CIS','NIST 800-53','PCI-DSS','HIPAA','ISO 27001','Essential Eight'];
-function showCompliance(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;COMPLIANCE_ON=true;SEL=null;highlight();hideViews();document.getElementById('compliance-view').style.display='block';var s=document.getElementById('cmp-fw');if(!s.options.length){s.innerHTML=CMP_FW.map(function(f){return '<option>'+esc2(f)+'</option>';}).join('');}renderCompliance();}
+function showCompliance(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;COMPLIANCE_ON=true;SEL=null;highlight();hideViews();document.getElementById('compliance-view').style.display='block';setNav('compliance');var s=document.getElementById('cmp-fw');if(!s.options.length){s.innerHTML=CMP_FW.map(function(f){return '<option>'+esc2(f)+'</option>';}).join('');}renderCompliance();}
 function runCompliance(){var b=document.getElementById('cmp-body');b.innerHTML='<tr><td colspan="6" class="ov-empty">Running posture on every device…</td></tr>';fetch('/x/compliance-fleet').then(function(r){return r.json();}).then(function(j){CMP_DATA=j;renderCompliance();}).catch(function(){b.innerHTML='<tr><td colspan="6" class="ov-empty">Failed to run.</td></tr>';});}
 function renderCompliance(){var fw=document.getElementById('cmp-fw').value||CMP_FW[0];var leg=(CMP_DATA&&CMP_DATA.legend)||{};document.getElementById('cmp-head').innerHTML='<tr><th>Device</th><th class="ov-num">Grade</th>'+CMP_CHECKS.map(function(c){var ctl=(leg[c[1]]&&leg[c[1]][fw])?('<div class="cmp-ctl">'+esc2(leg[c[1]][fw])+'</div>'):'';return '<th>'+esc2(c[0])+ctl+'</th>';}).join('')+'</tr>';var body=document.getElementById('cmp-body');if(!CMP_DATA){body.innerHTML='<tr><td colspan="6" class="ov-empty">Click “Run across fleet ▶”.</td></tr>';return;}var res=CMP_DATA.results||[];if(!res.length){body.innerHTML='<tr><td colspan="6" class="ov-empty">No devices.</td></tr>';return;}body.innerHTML=res.map(function(d){var by={};(d.checks||[]).forEach(function(c){by[c.kind]=c.pass;});var cells=CMP_CHECKS.map(function(c){var p=by[c[1]];return '<td class="ov-num '+(p?'cmp-pass':'cmp-fail')+'">'+(p?'✓':'✗')+'</td>';}).join('');return '<tr><td class="ov-nm">'+esc2(d.device||'?')+'</td><td class="ov-num cmp-g cmp-'+esc2(d.grade||'F')+'">'+esc2(d.grade||'?')+' <span class="dim2">'+(d.score!=null?d.score:'')+'</span></td>'+cells+'</tr>';}).join('');}
-function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;SEL=null;highlight();hideViews();document.getElementById('overview-view').style.display='block';renderOverview(LAST);}
-function showScripts(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=true;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;SEL=null;highlight();hideViews();document.getElementById('scripts-view').style.display='block';fillScrTargets();searchScripts();document.getElementById('scr-q').focus();}
+function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('overview-view').style.display='block';setNav('overview');renderOverview(LAST);}
+function showScripts(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=true;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('scripts-view').style.display='block';setNav('scripts');fillScrTargets();searchScripts();document.getElementById('scr-q').focus();}
 function fillScrTargets(){var s=document.getElementById('scr-target');var cur=s.value;var h='<option value="__FLEET__">All devices (fleet)</option>';(LAST||[]).forEach(function(d){h+='<option value="'+attrEsc(baseOf(d))+'">'+esc2(d.name||d.hostname||d.ip)+'</option>';});s.innerHTML=h;if(cur)s.value=cur;}
 function searchScripts(){var q=document.getElementById('scr-q').value.trim();fetch('/scripts?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(j){renderScripts((j&&j.scripts)||[],j&&j.total);}).catch(function(){document.getElementById('scr-list').innerHTML='<div class="aud-empty">Could not load the script library.</div>';});}
 function renderScripts(arr,total){document.getElementById('scr-count').textContent=arr.length+(total?(' of '+total):'')+' scripts';var el=document.getElementById('scr-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No matching scripts.</div>';return;}el.innerHTML=arr.map(function(s){var pl=(s.platforms||[]).map(function(p){return '<span class="chip">'+esc2(p)+'</span>';}).join('');var cust=s.custom?'<span class="chip cust">custom</span>':'';var cat=s.category?('<span class="scr-cat">'+esc2(s.category)+'</span>'):'';var del=s.custom?('<button class="b subtle scr-del" title="delete this custom script" onclick="deleteScript(event,\''+attrEsc(s.filename)+'\')">✕</button>'):'';return '<div class="scr-row"><div class="scr-main"><div class="scr-nm">'+cust+esc2(s.name||s.filename)+'</div><div class="scr-desc">'+esc2(s.description||'')+'</div><div class="scr-meta">'+pl+cat+'</div></div>'+del+'<button class="b" onclick="runScript(this,\''+attrEsc(s.filename)+'\')">Run ▶</button></div>';}).join('');}
@@ -2169,49 +2447,40 @@ function toggleScrForm(){var f=document.getElementById('scr-form');f.style.displ
 function submitScript(){var name=document.getElementById('sf-name').value.trim();var bodyv=document.getElementById('sf-body').value;var msg=document.getElementById('sf-msg');if(!name||!bodyv.trim()){msg.textContent='name and script body are required';return;}msg.textContent='saving…';fetch('/x/script-add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,description:document.getElementById('sf-desc').value,shell:document.getElementById('sf-shell').value,platforms:document.getElementById('sf-plat').value.split(','),body:bodyv})}).then(function(r){return r.json();}).then(function(j){if(j.ok){document.getElementById('sf-name').value='';document.getElementById('sf-desc').value='';document.getElementById('sf-body').value='';toggleScrForm();searchScripts();}else{msg.textContent=j.error||'failed';}}).catch(function(){msg.textContent='request failed';});}
 function deleteScript(ev,file){ev.stopPropagation();if(!confirm('Delete this custom script?'))return;fetch('/x/script-delete?file='+encodeURIComponent(file)).then(function(r){return r.json();}).then(function(){searchScripts();}).catch(function(){});}
 function runScript(btn,file){var s=document.getElementById('scr-target');var tgt=s.value;var label=s.options[s.selectedIndex].text;var o=document.getElementById('scr-out');o.style.display='block';o.innerHTML='<div class="scr-run">Running <b>'+esc2(file)+'</b> on <b>'+esc2(label)+'</b>…</div>';btn.disabled=true;var url=(tgt==='__FLEET__')?('/x/script-fleet?file='+encodeURIComponent(file)):('/x/script?target='+encodeURIComponent(tgt)+'&file='+encodeURIComponent(file));fetch(url).then(function(r){return r.json();}).then(function(j){btn.disabled=false;if(j.results){o.innerHTML='<div class="scr-run">'+esc2(file)+' on '+j.count+' device'+(j.count===1?'':'s')+':</div>'+j.results.map(function(x){return '<div class="scr-dev">'+esc2(x.device)+'</div><pre class="scr-pre">'+esc2(x.output||'')+'</pre>';}).join('');}else if(j.ok){o.innerHTML='<div class="scr-run">'+esc2(file)+' on '+esc2(j.device||label)+':</div><pre class="scr-pre">'+esc2(j.output||'(no output)')+'</pre>';}else{o.innerHTML='<div class="scr-run err">'+esc2(file)+': '+esc2(j.error||'failed')+'</div>';}}).catch(function(){btn.disabled=false;o.innerHTML='<div class="scr-run err">request failed</div>';});}
-function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="12" class="ov-empty">No devices.</td></tr>';return;}body.innerHTML=arr.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+'</td><td>'+esc2(d.user||'—')+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td></tr>';}).join('');}
-function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch('/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
-function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){var ev=j.audit||[];var el=document.getElementById('audit-rows');if(!ev.length){el.innerHTML='<div class="aud-empty">No device actions recorded yet.</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}).catch(function(){});}
+var OV_SORT={key:'name',dir:1};
+function ovSort(k){if(OV_SORT.key===k){OV_SORT.dir*=-1;}else{OV_SORT.key=k;OV_SORT.dir=1;}renderOverview(LAST);}
+function ovVal(d,k){switch(k){case 'name':return (d.name||d.hostname||d.ip||'').toLowerCase();case 'os':return (d.os||'').toLowerCase();case 'user':return (d.user||'').toLowerCase();case 'cpu':return (d.cpu_pct==null?-1:d.cpu_pct);case 'ram':return (d.free_gb==null?-1:d.free_gb);case 'seen':return (d.last_seen_secs==null?1e9:d.last_seen_secs);case 'status':return ({on:0,idle:1,off:2}[statusOf(d)]);default:return 0;}}
+function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="12" class="ov-empty">No devices.</td></tr>';return;}var sorted=arr.slice();sorted.sort(function(a,b){var va=ovVal(a,OV_SORT.key),vb=ovVal(b,OV_SORT.key);return (va<vb?-1:va>vb?1:0)*OV_SORT.dir;});body.innerHTML=sorted.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+'</td><td>'+esc2(d.user||'—')+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td></tr>';}).join('');}
+function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var n=(LAST||[]).length;if(!confirm('Run this command on ALL '+n+' device'+(n===1?'':'s')+'?\n\n'+c))return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch('/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
+var AUD_ALL=[];
+function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){AUD_ALL=j.audit||[];renderAudit();}).catch(function(){});}
+function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;hideViews();document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);actChanged();resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
 function specHtml(d){function sp(l,v){return (v!=null&&v!=='')?('<span class="spec"><span class="sl">'+l+'</span><span class="sv">'+esc2(v)+'</span></span>'):'';}var ifs='';(d.interfaces||[]).forEach(function(i){if(!i.addr||i.addr.indexOf('fe80')===0||i.addr==='::1'||i.addr.indexOf('127.')===0)return;ifs+='<span class="chip"><b>'+esc2(i.name)+'</b> '+esc2(i.addr)+'</span>';});var mics='';(d.microphones||[]).forEach(function(m){mics+='<span class="chip mic">🎙 '+esc2(m)+'</span>';});var chips=(ifs||mics)?('<div class="chiprow">'+ifs+mics+'</div>'):'';var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var agln=av?('v'+av+(sv?(av===sv?' (current)':(' — update to '+sv)):'')):(sv?(sv+' available from hub'):'');return sp('Hostname',d.hostname)+sp('OS',(d.os||'')+(d.arch?(' ('+d.arch+')'):''))+sp('User',d.user)+sp('CPU',d.cpu)+sp('Cores',d.cores)+sp('Memory',d.mem_gb?(d.mem_gb+' GB total'):'')+sp('Agent',agln)+metersHtml(d)+chips;}
 function camSelect(d){var o='';d.cameras.forEach(function(c,i){o+='<option value="'+i+'">'+esc2(c)+'</option>';});return '<select class="campick" id="campick" title="select camera">'+o+'</select>';}
-var ACTIONS=[
-{g:'Reports',id:'hardware',n:'Hardware inventory',d:'CPU, memory and disks on the device.'},
-{g:'Reports',id:'packages',n:'Installed software',d:'List installed packages / applications.'},
-{g:'Reports',id:'services',n:'Running services',d:'Services currently running.'},
-{g:'Reports',id:'processes',n:'Top processes',d:'Processes sorted by CPU usage.'},
-{g:'Reports',id:'network',n:'Network neighbors',d:'ARP table — devices seen on the LAN.'},
-{g:'Reports',id:'updates',n:'Check for updates',d:'Available OS / app updates (does not install).'},
-{g:'Reports',id:'power_report',n:'Power report',d:'Power scheme / battery report.'},
-{g:'Security',id:'posture',n:'Compliance check',d:'Score encryption, firewall, antivirus and updates (A–F grade).'},
-{g:'Security',id:'encryption',n:'Encryption status',d:'Disk-encryption state (BitLocker / FileVault / LUKS).'},
-{g:'Security',id:'firewall',n:'Firewall status',d:'Current firewall state.'},
-{g:'Security',id:'firewall_on',n:'Firewall — turn ON',d:'Enable the firewall.',danger:1},
-{g:'Security',id:'firewall_off',n:'Firewall — turn OFF',d:'Disable the firewall.',danger:1},
-{g:'Security',id:'av',n:'Antivirus status',d:'Antivirus / Defender status.'},
-{g:'Security',id:'usb_lock',n:'Lock USB storage',d:'Block USB mass storage (Windows).',danger:1},
-{g:'Security',id:'usb_unlock',n:'Unlock USB storage',d:'Allow USB mass storage (Windows).'},
-{g:'Software',id:'install',n:'Install a package',d:'winget / brew / apt install.',arg:'package id'},
-{g:'Software',id:'uninstall',n:'Uninstall a package',d:'winget / brew / apt remove.',arg:'package id'},
-{g:'Software',id:'update_all',n:'Install all updates',d:'Apply every available update.',danger:1},
-{g:'Power',id:'reboot',n:'Restart',d:'Reboot the device.',danger:1},
-{g:'Power',id:'shutdown',n:'Shut down',d:'Power the device off.',danger:1},
-{g:'Power',id:'sleep',n:'Sleep',d:'Put the device to sleep.'},
-{g:'Power',id:'logoff',n:'Log off',d:'Sign the current user out.',danger:1},
-{g:'Notify',id:'message',n:'Message the user',d:'Pop up a message to the logged-in user.',arg:'message text'},
-{g:'Run',id:'exec',n:'Run a command',d:'Run an arbitrary shell command and return its output.',arg:'command'},
-{g:'Run',id:'launch',n:'Launch an app (no wait)',d:'Start a program and return immediately — for GUI apps that would otherwise block the channel.',arg:'command, e.g. cmd /C start "" notepad.exe'}
+var ROWS=[
+{nm:'System report',d:'Pull a system report from the device.',sched:1,opts:[['Hardware','hardware'],['Installed software','packages'],['Running services','services'],['Top processes','processes'],['Network neighbors','network'],['Available updates','updates'],['Power / battery','power_report']]},
+{nm:'Compliance check',d:'Score encryption, firewall, antivirus and updates (A–F grade).',kind:'posture',sched:1},
+{nm:'Security status',d:'Check a security control on the device.',sched:1,opts:[['Encryption','encryption'],['Firewall','firewall'],['Antivirus','av']]},
+{nm:'Firewall control',d:'Enable or disable the firewall.',sched:1,danger:1,opts:[['Turn ON','firewall_on'],['Turn OFF','firewall_off']]},
+{nm:'USB storage',d:'Lock or unlock USB mass storage (Windows).',sched:1,danger:1,opts:[['Lock','usb_lock'],['Unlock','usb_unlock']]},
+{nm:'Install / uninstall',d:'Install or remove a package (winget / brew / apt).',sched:1,arg:'package id',opts:[['Install','install'],['Uninstall','uninstall']]},
+{nm:'Install all updates',d:'Apply every available OS / app update.',kind:'update_all',sched:1,danger:1},
+{nm:'Power',d:'Restart, shut down, sleep, or log the user off.',sched:1,danger:1,opts:[['Restart','reboot'],['Shut down','shutdown'],['Sleep','sleep'],['Log off','logoff']]},
+{nm:'Message the user',d:'Pop up a message to the logged-in user.',kind:'message',arg:'message text',sched:1},
+{nm:'Run a command',d:'Run a shell command and return its output.',kind:'exec',arg:'command',sched:1},
+{nm:'Launch an app (no wait)',d:'Start a program and return immediately — for GUI apps that would otherwise block.',kind:'launch',arg:'command, e.g. cmd /C start "" notepad.exe'}
 ];
 var PLUGINS=[];
-function allActs(){return ACTIONS.concat(PLUGINS.map(function(p){return {g:p.group||'Plugins',id:p.id,n:p.name,d:p.description,arg:p.arg||''};}));}
-function actOptions(){var g='',cur='';allActs().forEach(function(a,i){if(a.g!==cur){if(cur)g+='</optgroup>';g+='<optgroup label="'+esc2(a.g)+'">';cur=a.g;}g+='<option value="'+i+'">'+esc2(a.n)+'</option>';});return g+'</optgroup>';}
-function loadPlugins(){fetch('/plugins').then(function(r){return r.json();}).then(function(j){PLUGINS=(j&&j.plugins)||[];var s=document.getElementById('act-sel');if(s){s.innerHTML=actOptions();actChanged();}}).catch(function(){});}
+function allRows(){return ROWS.concat(PLUGINS.map(function(p){return {nm:p.name,d:p.description,kind:p.id,arg:p.arg||'',sched:1,plugin:1};}));}
+function loadPlugins(){fetch('/plugins').then(function(r){return r.json();}).then(function(j){PLUGINS=(j&&j.plugins)||[];var dc=document.getElementById('d-controls');if(dc&&SEL&&DEV[SEL]&&dc.querySelector('.alist'))dc.innerHTML=buildControls(DEV[SEL]);}).catch(function(){});}
+function actionListHtml(){return '<div class="blabel" style="margin:2px 0 6px">Actions</div><div class="alist">'+allRows().map(function(r,i){var ctl='';if(r.opts){ctl+='<select class="scr-sel arow-opt">'+r.opts.map(function(o){return '<option value="'+attrEsc(o[1])+'">'+esc2(o[0])+'</option>';}).join('')+'</select>';}if(r.arg){ctl+='<input class="devsearch arow-arg" placeholder="'+attrEsc(r.arg)+'" autocomplete="off">';}ctl+='<button class="b'+(r.danger?' danger':'')+'" onclick="execRow('+i+')">Execute</button>';if(r.sched){ctl+='<button class="b subtle arow-sbtn" title="schedule this action" onclick="schedRow('+i+')">⏰</button>';}var sbar=r.sched?'<div class="arow-sched" style="display:none"><select class="scr-sel sch-type" onchange="schTypeChg('+i+')"><option value="once">Once, in</option><option value="interval">Every</option><option value="daily">Daily at</option></select><input class="devsearch sch-in sch-mins" type="number" min="1" value="60"><span class="sch-unit dim2">min</span><input class="devsearch sch-in sch-hhmm" type="time" value="09:00" style="display:none"><span class="dim2">UTC</span><button class="b" onclick="doSchedRow('+i+')">Schedule</button></div>':'';return '<div class="arow" data-i="'+i+'"><div class="arow-main"><div class="arow-nm">'+esc2(r.nm)+(r.plugin?' <span class="chip cust">plugin</span>':'')+'</div><div class="arow-desc">'+esc2(r.d)+'</div></div><div class="arow-ctl">'+ctl+'</div>'+sbar+'</div>';}).join('')+'</div>';}
 function buildControls(d){var cam=d.cameras&&d.cameras.length;
 var scr='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button><button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';
 if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{scr+='<span class="chip off">no camera</span>';}
@@ -2221,12 +2490,15 @@ var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&
 var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button><button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
-var runner='<div class="runner"><span class="blabel">Action</span><div class="runner-row"><select id="act-sel" class="scr-sel act-selw" onchange="actChanged()">'+actOptions()+'</select><input id="act-arg" class="devsearch act-arg" autocomplete="off" style="display:none"><button class="b" id="act-run" onclick="runAction()">Execute</button><label class="sched-lbl"><input type="checkbox" id="act-sched" onchange="actChanged()"> Schedule</label></div><div id="act-desc" class="act-desc"></div><div id="act-schedbox" class="sched-box" style="display:none"><select id="sch-type" class="scr-sel" onchange="actChanged()"><option value="once">Once, in</option><option value="interval">Every</option><option value="daily">Daily at</option></select><input id="sch-mins" class="devsearch sch-in" type="number" min="1" value="60"><span id="sch-unit" class="dim2">minutes</span><input id="sch-hhmm" class="devsearch sch-in" type="time" value="09:00" style="display:none"><span class="dim2">UTC</span></div></div>';
-return groups+runner;}
-function curAction(){return allActs()[+document.getElementById('act-sel').value]||ACTIONS[0];}
-function actChanged(){var a=curAction();document.getElementById('act-desc').textContent=a.d;var ai=document.getElementById('act-arg');if(a.arg){ai.style.display='';ai.placeholder=a.arg;}else{ai.style.display='none';ai.value='';}var on=document.getElementById('act-sched').checked;document.getElementById('act-schedbox').style.display=on?'flex':'none';document.getElementById('act-run').textContent=on?'Schedule':'Execute';var t=document.getElementById('sch-type').value;document.getElementById('sch-mins').style.display=(t==='daily')?'none':'';document.getElementById('sch-unit').style.display=(t==='daily')?'none':'';document.getElementById('sch-hhmm').style.display=(t==='daily')?'':'none';document.getElementById('sch-unit').textContent=(t==='interval')?'minutes':'minutes';}
-function runAction(){var a=curAction();var arg=a.arg?document.getElementById('act-arg').value.trim():'';if(a.arg&&!arg){out('[enter a '+a.arg+']');return;}if(document.getElementById('act-sched').checked){scheduleAction(a,arg);return;}if(a.danger&&!confirm(a.n+' — run on this device now?'))return;if(a.id==='exec'||a.id==='launch'){if(!arg)return;var dt=a.id==='launch';out((dt?'launch ':'$ ')+arg+'\n…');fetch('/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:arg,detach:dt})}).then(function(r){return r.json();}).then(function(j){out((dt?'launch ':'$ ')+arg+'\n'+(j.detached?('launched (pid '+j.pid+')'):(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed')))));}).catch(function(e){out('error: '+e);});}else if(a.id==='posture'){doPosture();}else{sysCall(a.id,arg);}}
-function scheduleAction(a,arg){var t=document.getElementById('sch-type').value;var when={type:t};if(t==='daily'){when.hhmm=document.getElementById('sch-hhmm').value;}else{when.mins=parseInt(document.getElementById('sch-mins').value,10)||1;}var kind=a.id;out('scheduling '+a.n+'…');fetch('/x/schedule-add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,kind:kind,arg:arg,label:a.n,when:when})}).then(function(r){return r.json();}).then(function(j){out(j.ok?('Scheduled: '+a.n+' ('+schedWhen(when)+'). See ⏰ Scheduled.'):('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
+return groups+actionListHtml();}
+function rowOf(i){return document.querySelector('.arow[data-i="'+i+'"]');}
+function rowKind(r,row){return r.opts?row.querySelector('.arow-opt').value:r.kind;}
+function rowArg(r,row){var a=row.querySelector('.arow-arg');return a?a.value.trim():'';}
+function runKind(kind,arg){if(kind==='exec'||kind==='launch'){var dt=kind==='launch';out((dt?'launch ':'$ ')+arg+'\n…');fetch('/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:arg,detach:dt})}).then(function(r){return r.json();}).then(function(j){out((dt?'launch ':'$ ')+arg+'\n'+(j.detached?('launched (pid '+j.pid+')'):(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed')))));}).catch(function(e){out('error: '+e);});}else if(kind==='posture'){doPosture();}else{sysCall(kind,arg);}}
+function execRow(i){var r=allRows()[i],row=rowOf(i);var kind=rowKind(r,row),arg=rowArg(r,row);if(r.arg&&!arg){out('[enter '+r.arg+']');return;}if(r.danger&&!confirm(r.nm+' — run on this device now?'))return;runKind(kind,arg);}
+function schedRow(i){var b=rowOf(i).querySelector('.arow-sched');b.style.display=(b.style.display==='none')?'flex':'none';}
+function schTypeChg(i){var row=rowOf(i),t=row.querySelector('.sch-type').value;row.querySelector('.sch-mins').style.display=(t==='daily')?'none':'';row.querySelector('.sch-unit').style.display=(t==='daily')?'none':'';row.querySelector('.sch-hhmm').style.display=(t==='daily')?'':'none';}
+function doSchedRow(i){var r=allRows()[i],row=rowOf(i);var kind=rowKind(r,row),arg=rowArg(r,row);if(r.arg&&!arg){out('[enter '+r.arg+']');return;}var t=row.querySelector('.sch-type').value,when={type:t};if(t==='daily'){when.hhmm=row.querySelector('.sch-hhmm').value;}else{when.mins=parseInt(row.querySelector('.sch-mins').value,10)||1;}out('scheduling '+r.nm+'…');fetch('/x/schedule-add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,kind:kind,arg:arg,label:r.nm,when:when})}).then(function(rr){return rr.json();}).then(function(j){out(j.ok?('Scheduled: '+r.nm+' ('+schedWhen(when)+'). See ⏰ Scheduled.'):('[error] '+(j.error||'failed')));row.querySelector('.arow-sched').style.display='none';}).catch(function(e){out('error: '+e);});}
 function schedWhen(w){return w.type==='once'?('once, in '+w.mins+'m'):w.type==='interval'?('every '+w.mins+'m'):('daily '+w.hhmm+' UTC');}
 function camI(){var s=document.getElementById('campick');return (s&&s.value)?s.value:'0';}
 function setView(url){var v=document.getElementById('view');v.src=url;v.style.display='block';document.getElementById('vp-hint').style.display='none';document.getElementById('vp-tools').style.display='flex';}
@@ -2260,7 +2532,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
 document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}loadPlugins();fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}var cveq=document.getElementById('cve-q');if(cveq){cveq.onkeydown=function(e){if(e.key==='Enter')searchCVE();};}loadPlugins();fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {
