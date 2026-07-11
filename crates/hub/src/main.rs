@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.3";
+const VERSION: &str = "2.11.4";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -804,11 +804,20 @@ const COMPLIANCE_FRAMEWORKS: [&str; 6] = ["CIS", "NIST 800-53", "PCI-DSS", "HIPA
 /// each check carrying its pass/fail, output snippet, and control mapping.
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
     let checks = [("disk encryption", "encryption"), ("firewall", "firewall"), ("antivirus", "av"), ("OS updates", "updates")];
+    // Batch all checks into ONE agent round-trip: join the per-check commands with
+    // a marker echo, run once, split the combined output back into sections. Saves
+    // 4 relay round-trips → 1 (the big compliance-latency win). The marker echo runs
+    // regardless of the previous command's exit code (& on cmd, newline on sh).
+    let cmds: Vec<String> = checks.iter().map(|(_, k)| os_command(platform, k, "").unwrap_or_else(|| "echo n/a".into())).collect();
+    let joiner = if platform == "windows" { " & echo ::HAIVE:: & " } else { "\necho ::HAIVE::\n" };
+    let combined = cmds.join(joiner);
+    let full = exec_output(target, &combined);
+    let sections: Vec<&str> = full.split("::HAIVE::").collect();
     let mut items = Vec::new();
     let mut pass_n = 0;
-    for (label, k) in checks {
-        let out = os_command(platform, k, "").map(|c| exec_output(target, &c)).unwrap_or_else(|| "n/a".into());
-        let pass = posture_pass(k, &out);
+    for (i, (label, k)) in checks.iter().enumerate() {
+        let out = sections.get(i).map(|s| s.trim()).unwrap_or("");
+        let pass = posture_pass(k, out);
         if pass {
             pass_n += 1;
         }
