@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.4.0";
+const VERSION: &str = "2.5.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -112,7 +112,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
             return;
         }
-        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys") {
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys" | "/m/script" | "/m/script-fleet") {
             if let Some(t) = query_param(&url, "target") {
                 if !may_control(mowner.as_deref(), agents, &t) {
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
@@ -198,6 +198,12 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
         (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
+        (Method::Get, "/scripts") => scripts_list(&url),
+        (Method::Get, "/m/scripts") => scripts_list(&url),
+        (Method::Get, "/x/script") => proxy_script(&url, agents, user.as_deref(), false),
+        (Method::Get, "/m/script") => proxy_script(&url, agents, mowner.as_deref(), true),
+        (Method::Get, "/x/script-fleet") => proxy_script_fleet(&url, agents, user.as_deref(), false),
+        (Method::Get, "/m/script-fleet") => proxy_script_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/m/download") => proxy_download(&url),
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
@@ -813,6 +819,193 @@ fn proxy_fleet(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) ->
     json_resp(&serde_json::json!({"ok": true, "count": results.len(), "results": results}))
 }
 
+// ── TacticalRMM community-scripts browser ────────────────────────────────────
+// Search the amidaware/community-scripts library and run a chosen script on one
+// device or the whole fleet. The script body is fetched from GitHub and
+// base64-wrapped into a single `/exec` call (no temp files on the device).
+// Mind the agent's ~65s `/exec` cap: long-running scripts get truncated —
+// fire-and-forget + log-poll is a future enhancement.
+const SCRIPTS_MANIFEST_URL: &str = "https://raw.githubusercontent.com/amidaware/community-scripts/main/community_scripts.json";
+const SCRIPTS_RAW_BASE: &str = "https://raw.githubusercontent.com/amidaware/community-scripts/main/scripts/";
+
+fn scripts_cache() -> &'static Mutex<Option<Vec<serde_json::Value>>> {
+    static C: std::sync::OnceLock<Mutex<Option<Vec<serde_json::Value>>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+/// Fetch + cache the community-scripts manifest (once per process, unless forced).
+fn scripts_manifest(force: bool) -> Vec<serde_json::Value> {
+    if !force {
+        if let Some(v) = scripts_cache().lock().unwrap().as_ref() {
+            return v.clone();
+        }
+    }
+    let list: Vec<serde_json::Value> = http()
+        .get(SCRIPTS_MANIFEST_URL)
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    if !list.is_empty() {
+        *scripts_cache().lock().unwrap() = Some(list.clone());
+    }
+    list
+}
+
+/// The OSes a script applies to — explicit `supported_platforms`, else inferred.
+fn script_platforms(s: &serde_json::Value) -> Vec<String> {
+    if let Some(a) = s.get("supported_platforms").and_then(|x| x.as_array()) {
+        let v: Vec<String> = a.iter().filter_map(|x| x.as_str()).map(|x| x.to_lowercase()).collect();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let shell = s.get("shell").and_then(|x| x.as_str()).unwrap_or("");
+    let fname = s.get("filename").and_then(|x| x.as_str()).unwrap_or("");
+    match shell {
+        "powershell" | "cmd" => vec!["windows".into()],
+        _ if fname.starts_with("Mac") => vec!["macos".into()],
+        _ if fname.starts_with("Linux") => vec!["linux".into()],
+        _ => vec!["linux".into(), "macos".into()],
+    }
+}
+
+/// GET /scripts?q=&platform=&refresh=1 — the searchable manifest (trimmed rows).
+fn scripts_list(url: &str) -> Resp {
+    let q = query_param(url, "q").unwrap_or_default().to_lowercase();
+    let plat = query_param(url, "platform").unwrap_or_default().to_lowercase();
+    let force = query_param(url, "refresh").as_deref() == Some("1");
+    let all = scripts_manifest(force);
+    let rows: Vec<serde_json::Value> = all
+        .iter()
+        .filter(|s| {
+            let name = s.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let desc = s.get("description").and_then(|x| x.as_str()).unwrap_or("");
+            let cat = s.get("category").and_then(|x| x.as_str()).unwrap_or("");
+            let hay = format!("{name} {desc} {cat}").to_lowercase();
+            (q.is_empty() || hay.contains(&q))
+                && (plat.is_empty() || script_platforms(s).iter().any(|p| p.contains(&plat) || plat.contains(p.as_str())))
+        })
+        .map(|s| {
+            serde_json::json!({
+                "filename": s.get("filename").and_then(|x| x.as_str()).unwrap_or(""),
+                "name": s.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                "description": s.get("description").and_then(|x| x.as_str()).unwrap_or(""),
+                "shell": s.get("shell").and_then(|x| x.as_str()).unwrap_or(""),
+                "category": s.get("category").and_then(|x| x.as_str()).unwrap_or(""),
+                "platforms": script_platforms(s),
+            })
+        })
+        .collect();
+    json_resp(&serde_json::json!({"ok": true, "count": rows.len(), "total": all.len(), "scripts": rows}))
+}
+
+fn find_script(all: &[serde_json::Value], id: &str) -> Option<serde_json::Value> {
+    all.iter()
+        .find(|s| s.get("filename").and_then(|x| x.as_str()) == Some(id) || s.get("guid").and_then(|x| x.as_str()) == Some(id))
+        .cloned()
+}
+
+/// Wrap a script body into a single shell command for the agent's `/exec`.
+fn wrap_script(shell: &str, body: &str) -> Option<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(body.as_bytes());
+    match shell {
+        "powershell" => {
+            // PowerShell -EncodedCommand wants UTF-16LE base64.
+            let utf16: Vec<u8> = body.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let enc = base64::engine::general_purpose::STANDARD.encode(&utf16);
+            Some(format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"))
+        }
+        "cmd" | "batch" => {
+            // No clean stdin path for a .bat — have PowerShell materialize + run a
+            // temp file. The whole PS is EncodedCommand'd, so nothing needs escaping.
+            let ps = format!(
+                "$p=Join-Path $env:TEMP ('hs_'+$PID+'.bat');[IO.File]::WriteAllBytes($p,[Convert]::FromBase64String('{b64}'));& cmd /c $p;Remove-Item $p -Force -ErrorAction SilentlyContinue"
+            );
+            let utf16: Vec<u8> = ps.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let enc = base64::engine::general_purpose::STANDARD.encode(&utf16);
+            Some(format!("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {enc}"))
+        }
+        "python" => Some(format!(
+            "python3 -c \"import base64;exec(base64.b64decode('{b64}').decode())\" || python -c \"import base64;exec(base64.b64decode('{b64}').decode())\""
+        )),
+        "shell" | "bash" | "" => Some(format!("echo {b64} | base64 -d | sh")),
+        _ => None,
+    }
+}
+
+/// Fetch a named script and run it on one target; returns a JSON result object.
+fn run_named_script(target: &str, platform: &str, all: &[serde_json::Value], id: &str) -> serde_json::Value {
+    let meta = match find_script(all, id) {
+        Some(m) => m,
+        None => return serde_json::json!({"ok": false, "error": "script not found"}),
+    };
+    let plats = script_platforms(&meta);
+    if !plats.iter().any(|p| p.contains(platform) || platform.contains(p.as_str())) {
+        return serde_json::json!({"ok": false, "error": format!("script targets {plats:?}, device is {platform}")});
+    }
+    let shell = meta.get("shell").and_then(|x| x.as_str()).unwrap_or("shell");
+    let fname = meta.get("filename").and_then(|x| x.as_str()).unwrap_or("");
+    let body = match http().get(format!("{SCRIPTS_RAW_BASE}{fname}")).send().ok().and_then(|r| r.text().ok()) {
+        Some(b) if !b.is_empty() => b,
+        _ => return serde_json::json!({"ok": false, "error": "could not fetch script body from GitHub"}),
+    };
+    let cmd = match wrap_script(shell, &body) {
+        Some(c) => c,
+        None => return serde_json::json!({"ok": false, "error": format!("shell '{shell}' not supported yet")}),
+    };
+    serde_json::json!({"ok": true, "output": exec_output(target, &cmd)})
+}
+
+/// GET /x|m/script?target=&file= — run one community script on one device.
+fn proxy_script(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    let id = query_param(url, "file").or_else(|| query_param(url, "guid")).unwrap_or_default();
+    if !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    let platform = device_platform(agents, &target);
+    let dev = device_name(agents, &target);
+    record_mcp_access(&target, "run script", user.unwrap_or(""), &id);
+    audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, "run script", &dev, &id);
+    let mut r = run_named_script(&target, &platform, &scripts_manifest(false), &id);
+    if let Some(o) = r.as_object_mut() {
+        o.insert("device".into(), serde_json::json!(dev));
+        o.insert("script".into(), serde_json::json!(id));
+    }
+    json_resp(&r)
+}
+
+/// GET /x|m/script-fleet?file= — run one community script on every owned device.
+fn proxy_script_fleet(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
+    let id = query_param(url, "file").or_else(|| query_param(url, "guid")).unwrap_or_default();
+    let targets = owned_targets(agents, user);
+    audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, "run script (fleet)", &format!("all ({})", targets.len()), &id);
+    let all = std::sync::Arc::new(scripts_manifest(false));
+    let out = std::sync::Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let mut handles = Vec::new();
+    for (name, target, platform) in targets {
+        let (out, all, id) = (out.clone(), all.clone(), id.clone());
+        handles.push(std::thread::spawn(move || {
+            let r = run_named_script(&target, &platform, all.as_ref(), &id);
+            let text = if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                r.get("output").and_then(|x| x.as_str()).unwrap_or("").to_string()
+            } else {
+                format!("({})", r.get("error").and_then(|x| x.as_str()).unwrap_or("failed"))
+            };
+            out.lock().unwrap().push(serde_json::json!({"device": name, "output": text}));
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    let mut results = std::sync::Arc::try_unwrap(out).unwrap().into_inner().unwrap();
+    results.sort_by(|a, b| a["device"].as_str().unwrap_or("").cmp(b["device"].as_str().unwrap_or("")));
+    json_resp(&serde_json::json!({"ok": true, "count": results.len(), "results": results}))
+}
+
 fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
@@ -1100,6 +1293,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <ul id=\"devlist\" class=\"devlist\"></ul>\
 <button class=\"addbtn\" onclick=\"showOverview()\">📊 Fleet status</button>\
 <button class=\"addbtn\" onclick=\"showFleet()\">⚡ Fleet run</button>\
+<button class=\"addbtn\" onclick=\"showScripts()\">🧰 Script library</button>\
 <button class=\"addbtn\" onclick=\"showAudit()\">📋 Audit log</button>\
 <button class=\"addbtn\" onclick=\"toggleReg()\">+ Register a device</button>\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><p class=\"reg-hint\">Download the agent, then run it:</p>{win}{mac}{lin}</div>\
@@ -1108,6 +1302,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"stage-empty\" id=\"stage-empty\">Select a device from the left to control it.</div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account</span></div><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
 <div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th></th><th>Device</th><th>OS</th><th>User</th><th class=\"ov-num\">CPU</th><th class=\"ov-num\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th>Last seen</th><th>MCP</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
+<div id=\"scripts-view\" style=\"display:none\"><div class=\"aud-head\">Script library <span class=\"dim2\">— TacticalRMM community scripts (amidaware) · runs base64-wrapped, ~65s cap</span></div><div class=\"fleet-bar\"><input id=\"scr-q\" class=\"devsearch\" placeholder=\"Search scripts… (bitlocker, cleanup, defender, choco…)\" autocomplete=\"off\"><select id=\"scr-target\" class=\"scr-sel\" title=\"where to run\"></select></div><div id=\"scr-out\" class=\"scr-out\" style=\"display:none\"></div><div id=\"scr-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"scr-list\" class=\"scr-list\"></div></div>\
 <div id=\"fleet-view\" style=\"display:none\"><div class=\"aud-head\">Fleet run <span class=\"dim2\">— run on all your devices, in parallel</span></div><div class=\"fleet-bar\"><input id=\"fleet-cmd\" class=\"devsearch\" placeholder=\"shell command to run on every device…\" autocomplete=\"off\"><button class=\"b\" onclick=\"runFleet()\">Run on all</button></div><div id=\"fleet-results\"></div></div>\
 <div id=\"detail\" style=\"display:none\">\
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
@@ -1198,6 +1393,20 @@ pre{margin:0}
 .ov-num{text-align:right;font-variant-numeric:tabular-nums}
 .ov-tbl .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
 .ov-empty{text-align:center;color:var(--muted2);padding:24px}
+.scr-sel{background:var(--surface2);color:var(--text);border:1px solid var(--line2);border-radius:8px;padding:0 10px;font-size:13px;max-width:220px}
+.scr-list{display:flex;flex-direction:column;gap:8px}
+.scr-row{display:flex;align-items:flex-start;gap:12px;border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.scr-main{flex:1;min-width:0}
+.scr-nm{font-weight:600;font-size:13px;color:var(--text)}
+.scr-desc{color:var(--muted);font-size:12px;margin:2px 0 6px;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.scr-meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.scr-cat{color:var(--muted2);font-size:10px}
+.scr-row .b{flex:none}
+.scr-out{border:1px solid var(--line2);border-radius:10px;padding:10px 12px;margin-bottom:12px;background:var(--surface)}
+.scr-run{font-size:12px;color:var(--muted);margin-bottom:6px}
+.scr-run.err{color:var(--danger)}
+.scr-dev{font-size:11px;font-weight:600;color:var(--accent);margin-top:8px}
+.scr-pre{white-space:pre-wrap;word-break:break-word;font-size:11px;background:var(--bg);border-radius:6px;padding:8px;margin:4px 0 0;max-height:280px;overflow:auto}
 .fleet-card{border:1px solid var(--line);border-radius:10px;margin-bottom:10px;overflow:hidden}
 .fleet-dev{background:var(--surface2);padding:7px 12px;font-weight:600;font-size:12px;color:#d7dbe6}
 .fleet-out{margin:0;padding:10px 12px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.5;color:#c3c9d8;white-space:pre-wrap;max-height:200px;overflow:auto}
@@ -1248,7 +1457,11 @@ pre{margin:0}
 .chip.off{font-family:inherit;font-style:italic;color:var(--muted2)}
 .dim{color:var(--muted2)}
 .fbrow.dim{opacity:.55}
-.controls{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:13px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.controls{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:flex-start;padding:13px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.bgroup{display:flex;flex-direction:column;gap:6px;padding-right:14px;border-right:1px solid var(--line)}
+.bgroup:last-child{padding-right:0;border-right:0}
+.blabel{font-size:9px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted2);font-weight:600}
+.brow{display:flex;flex-wrap:wrap;gap:7px;align-items:center}
 .b{background:var(--surface2);border:1px solid var(--line2);color:#d7dbe6;border-radius:7px;padding:6px 11px;cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
 .b:hover{background:#252b3a;border-color:#3a4258;color:#fff}
 .b:active{background:#2c3346}
@@ -1288,37 +1501,51 @@ var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
 function statusOf(d){var s=(d.last_seen_secs==null)?99999:d.last_seen_secs;return s<15?'on':(s<40?'idle':'off');}
 function seenTxt(s){if(s==null)return '';return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(OVERVIEW_ON)renderOverview(arr);var special=AUDIT_ON||OVERVIEW_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!SEL&&arr.length&&!special){select(baseOf(arr[0]));}}).catch(function(){});}
+function fetchAgents(){fetch('/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);if(OVERVIEW_ON)renderOverview(arr);var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!SEL&&arr.length&&!special){select(baseOf(arr[0]));}}).catch(function(){});}
 function renderSide(arr){var el=document.getElementById('devlist');document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'recent MCP activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+rows+'</div>';}
 function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyText(t,btn){var ok=function(){if(!btn)return;var o=btn.textContent;btn.textContent='✓';setTimeout(function(){btn.textContent=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
-function showEmpty(){document.getElementById('detail').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('stage-empty').style.display='block';}
+function showEmpty(){hideViews();document.getElementById('stage-empty').style.display='block';}
 var AUDIT_ON=false;
 function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
-function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('audit-view').style.display='block';loadAudit();}
+function hideViews(){var v=['detail','stage-empty','fleet-view','overview-view','audit-view','scripts-view'];for(var i=0;i<v.length;i++){var el=document.getElementById(v[i]);if(el)el.style.display='none';}}
+function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SCRIPTS_ON=false;SEL=null;highlight();hideViews();document.getElementById('audit-view').style.display='block';loadAudit();}
 function sysCall(kind,arg){var u='/x/sys?target='+enc(SEL)+'&kind='+enc(kind);if(arg)u+='&arg='+enc(arg);out(kind+' …');fetch(u).then(function(r){return r.json();}).then(function(j){out(j.output||('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
 function doSys(){var k=prompt('Report — hardware / av / encryption / firewall / processes / services / network / packages / updates / power_report','hardware');if(k)sysCall(k.trim(),'');}
 function doPower(){var a=prompt('Action — reboot / shutdown / sleep / logoff / update_all / firewall_on / firewall_off / usb_lock / usb_unlock','sleep');if(!a)return;a=a.trim();if(!confirm(a+' — run on this device?'))return;sysCall(a,'');}
 function doMsg(){var t=prompt('Message to show the logged-in user:');if(t)sysCall('message',t);}
 function doInstall(){var p=prompt('Package to install (winget id / brew formula / apt package):');if(p)sysCall('install',p.trim());}
 function doPosture(){out('checking compliance…');fetch('/x/sys?target='+enc(SEL)+'&kind=posture').then(function(r){return r.json();}).then(function(j){if(!j.ok){out('[error] '+(j.error||'failed'));return;}var s='Compliance: '+j.grade+' ('+j.score+'/100)\n';(j.checks||[]).forEach(function(c){s+='  ['+(c.pass?'PASS':'FAIL')+'] '+c.check+'\n';});out(s);}).catch(function(e){out('error: '+e);});}
-function showFleet(){AUDIT_ON=false;OVERVIEW_ON=false;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
-var OVERVIEW_ON=false;
-function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SEL=null;highlight();document.getElementById('detail').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='block';renderOverview(LAST);}
+function showFleet(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;SEL=null;highlight();hideViews();document.getElementById('fleet-view').style.display='block';document.getElementById('fleet-cmd').focus();}
+var OVERVIEW_ON=false,SCRIPTS_ON=false,SCR_T=null;
+function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SCRIPTS_ON=false;SEL=null;highlight();hideViews();document.getElementById('overview-view').style.display='block';renderOverview(LAST);}
+function showScripts(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=true;SEL=null;highlight();hideViews();document.getElementById('scripts-view').style.display='block';fillScrTargets();searchScripts();document.getElementById('scr-q').focus();}
+function fillScrTargets(){var s=document.getElementById('scr-target');var cur=s.value;var h='<option value="__FLEET__">All devices (fleet)</option>';(LAST||[]).forEach(function(d){h+='<option value="'+attrEsc(baseOf(d))+'">'+esc2(d.name||d.hostname||d.ip)+'</option>';});s.innerHTML=h;if(cur)s.value=cur;}
+function searchScripts(){var q=document.getElementById('scr-q').value.trim();fetch('/scripts?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(j){renderScripts((j&&j.scripts)||[],j&&j.total);}).catch(function(){document.getElementById('scr-list').innerHTML='<div class="aud-empty">Could not load the script library.</div>';});}
+function renderScripts(arr,total){document.getElementById('scr-count').textContent=arr.length+(total?(' of '+total):'')+' scripts';var el=document.getElementById('scr-list');if(!arr.length){el.innerHTML='<div class="aud-empty">No matching scripts.</div>';return;}el.innerHTML=arr.map(function(s){var pl=(s.platforms||[]).map(function(p){return '<span class="chip">'+esc2(p)+'</span>';}).join('');var cat=s.category?('<span class="scr-cat">'+esc2(s.category)+'</span>'):'';return '<div class="scr-row"><div class="scr-main"><div class="scr-nm">'+esc2(s.name||s.filename)+'</div><div class="scr-desc">'+esc2(s.description||'')+'</div><div class="scr-meta">'+pl+cat+'</div></div><button class="b" onclick="runScript(this,\''+attrEsc(s.filename)+'\')">Run ▶</button></div>';}).join('');}
+function runScript(btn,file){var s=document.getElementById('scr-target');var tgt=s.value;var label=s.options[s.selectedIndex].text;var o=document.getElementById('scr-out');o.style.display='block';o.innerHTML='<div class="scr-run">Running <b>'+esc2(file)+'</b> on <b>'+esc2(label)+'</b>…</div>';btn.disabled=true;var url=(tgt==='__FLEET__')?('/x/script-fleet?file='+encodeURIComponent(file)):('/x/script?target='+encodeURIComponent(tgt)+'&file='+encodeURIComponent(file));fetch(url).then(function(r){return r.json();}).then(function(j){btn.disabled=false;if(j.results){o.innerHTML='<div class="scr-run">'+esc2(file)+' on '+j.count+' device'+(j.count===1?'':'s')+':</div>'+j.results.map(function(x){return '<div class="scr-dev">'+esc2(x.device)+'</div><pre class="scr-pre">'+esc2(x.output||'')+'</pre>';}).join('');}else if(j.ok){o.innerHTML='<div class="scr-run">'+esc2(file)+' on '+esc2(j.device||label)+':</div><pre class="scr-pre">'+esc2(j.output||'(no output)')+'</pre>';}else{o.innerHTML='<div class="scr-run err">'+esc2(file)+': '+esc2(j.error||'failed')+'</div>';}}).catch(function(){btn.disabled=false;o.innerHTML='<div class="scr-run err">request failed</div>';});}
 function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="12" class="ov-empty">No devices.</td></tr>';return;}body.innerHTML=arr.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+'</td><td>'+esc2(d.user||'—')+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td></tr>';}).join('');}
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch('/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(function(j){var ev=j.audit||[];var el=document.getElementById('audit-rows');if(!ev.length){el.innerHTML='<div class="aud-empty">No device actions recorded yet.</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}).catch(function(){});}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){AUDIT_ON=false;OVERVIEW_ON=false;document.getElementById('audit-view').style.display='none';document.getElementById('fleet-view').style.display='none';document.getElementById('overview-view').style.display='none';document.getElementById('stage-empty').style.display='none';document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;hideViews();document.getElementById('detail').style.display='block';refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
 function specHtml(d){function sp(l,v){return (v!=null&&v!=='')?('<span class="spec"><span class="sl">'+l+'</span><span class="sv">'+esc2(v)+'</span></span>'):'';}var ifs='';(d.interfaces||[]).forEach(function(i){if(!i.addr||i.addr.indexOf('fe80')===0||i.addr==='::1'||i.addr.indexOf('127.')===0)return;ifs+='<span class="chip"><b>'+esc2(i.name)+'</b> '+esc2(i.addr)+'</span>';});var mics='';(d.microphones||[]).forEach(function(m){mics+='<span class="chip mic">🎙 '+esc2(m)+'</span>';});var chips=(ifs||mics)?('<div class="chiprow">'+ifs+mics+'</div>'):'';return sp('OS',(d.os||'')+(d.arch?(' ('+d.arch+')'):''))+sp('User',d.user)+sp('CPU',d.cpu)+sp('Cores',d.cores)+sp('Memory',d.mem_gb?(d.mem_gb+' GB total'):'')+metersHtml(d)+chips;}
 function camSelect(d){var o='';d.cameras.forEach(function(c,i){o+='<option value="'+i+'">'+esc2(c)+'</option>';});return '<select class="campick" id="campick" title="select camera">'+o+'</select>';}
-function buildControls(d){var cam=d.cameras&&d.cameras.length;var h='';h+='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button>';h+='<button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';if(cam){h+=camSelect(d);h+='<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button>';h+='<button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{h+='<span class="chip off">no camera</span>';}h+='<button class="b" onclick="doRun()" title="run one command">Run…</button>';h+='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';h+='<button class="b" onclick="doSys()" title="system report">System…</button>';h+='<button class="b" onclick="doPower()" title="power action">Power…</button>';h+='<button class="b" onclick="doMsg()" title="message the logged-in user">Message…</button>';h+='<button class="b" onclick="doInstall()" title="install a package">Install…</button>';h+='<button class="b" onclick="doPosture()" title="security compliance check">Compliance</button>';h+='<button class="b" onclick="doGet()" title="download a file">Get file</button>';h+='<button class="b" onclick="doPut()" title="upload a file">Put file</button>';h+='<button class="b subtle" onclick="doUpd()" title="update agent">Update</button>';h+='<button class="b danger" onclick="doDis()" title="dissolve agent">Dissolve</button>';return h;}
+function buildControls(d){var cam=d.cameras&&d.cameras.length;
+var scr='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button><button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';
+if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{scr+='<span class="chip off">no camera</span>';}
+var run='<button class="b" onclick="doRun()" title="run one command">Run…</button><button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
+var manage='<button class="b" onclick="doSys()" title="system report">System…</button><button class="b" onclick="doPower()" title="power action">Power…</button><button class="b" onclick="doMsg()" title="message the logged-in user">Message…</button><button class="b" onclick="doInstall()" title="install a package">Install…</button><button class="b" onclick="doPosture()" title="security compliance check">Compliance</button>';
+var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
+var agent='<button class="b subtle" onclick="doUpd()" title="update agent to the latest build">Update</button><button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
+function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
+return g('Screen &amp; camera',scr)+g('Run',run)+g('Manage',manage)+g('Files',files)+g('Agent',agent);}
 function camI(){var s=document.getElementById('campick');return (s&&s.value)?s.value:'0';}
 function setView(url){var v=document.getElementById('view');v.src=url;v.style.display='block';document.getElementById('vp-hint').style.display='none';document.getElementById('vp-tools').style.display='flex';}
 function stopView(){var v=document.getElementById('view');v.removeAttribute('src');v.style.display='none';document.getElementById('vp-hint').style.display='block';document.getElementById('vp-tools').style.display='none';}
@@ -1351,7 +1578,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
 document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {

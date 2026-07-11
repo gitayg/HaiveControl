@@ -125,6 +125,22 @@ struct FleetReportArgs {
     /// one of: hardware, av, encryption, firewall, processes, services, network, packages
     kind: String,
 }
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SearchScriptsArgs {
+    /// search text matched against script name, description and category (e.g. "bitlocker", "cleanup temp", "defender")
+    query: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RunScriptArgs {
+    device: String,
+    /// the script filename returned by search_scripts (e.g. "Win_Bitlocker_Status.ps1")
+    script: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RunScriptFleetArgs {
+    /// the script filename returned by search_scripts, to run on every device you own
+    script: String,
+}
 
 #[derive(Clone)]
 struct Srv {
@@ -445,6 +461,43 @@ impl Srv {
     #[tool(description = "Run a system report (hardware, av, encryption, firewall, processes, services, network, packages) on EVERY device you own, in parallel.")]
     async fn fleet_report(&self, Parameters(a): Parameters<FleetReportArgs>) -> Result<CallToolResult, ErrorData> {
         let out = self.fleet(&format!("kind={}", urlencode(&a.kind))).await?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Search the TacticalRMM community-scripts library (amidaware) for a maintenance/diagnostic script. Returns matching scripts with their filename, shell, platforms and name — pass a filename to run_script or run_script_fleet to execute it.")]
+    async fn search_scripts(&self, Parameters(a): Parameters<SearchScriptsArgs>) -> Result<CallToolResult, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("scripts", &format!("q={}", urlencode(&a.query)))).send().await.map_err(err)?.json().await.map_err(err)?;
+        let list = v["scripts"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .take(40)
+                    .map(|s| {
+                        let plats = s["platforms"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                        format!("- {} ({}) — {}", s["filename"].as_str().unwrap_or(""), plats, s["name"].as_str().unwrap_or(""))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} of {} scripts match:\n{}", v["count"].as_i64().unwrap_or(0), v["total"].as_i64().unwrap_or(0), list))]))
+    }
+
+    #[tool(description = "Run a community script (from search_scripts) on the named device. Pass the script filename. It is fetched from GitHub and run on the device; its output is returned. Subject to a ~65s execution cap.")]
+    async fn run_script(&self, Parameters(a): Parameters<RunScriptArgs>) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve(&a.device).await.map_err(err)?;
+        let v: serde_json::Value = self.client.get(self.m("script", &format!("target={}&file={}", urlencode(&target), urlencode(&a.script)))).send().await.map_err(err)?.json().await.map_err(err)?;
+        let out = v["output"].as_str().or_else(|| v["error"].as_str()).unwrap_or("failed").to_string();
+        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+    }
+
+    #[tool(description = "Run a community script (from search_scripts) on EVERY device you own, in parallel. Pass the script filename.")]
+    async fn run_script_fleet(&self, Parameters(a): Parameters<RunScriptFleetArgs>) -> Result<CallToolResult, ErrorData> {
+        let v: serde_json::Value = self.client.get(self.m("script-fleet", &format!("file={}", urlencode(&a.script)))).send().await.map_err(err)?.json().await.map_err(err)?;
+        let out = v["results"]
+            .as_array()
+            .map(|arr| arr.iter().map(|r| format!("### {}\n{}", r["device"].as_str().unwrap_or("?"), r["output"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n"))
+            .unwrap_or_else(|| "no devices".to_string());
         Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
     }
 }
