@@ -72,18 +72,35 @@ fn relaunch_detached() -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    let spawned;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — no console, survives window close.
-        c.creation_flags(0x0000_0008 | 0x0000_0200);
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB.
+        // Breakaway is the fix for the child dying the instant the launching shell
+        // exits: Windows OpenSSH sessions (and some terminals) run the shell inside a
+        // kill-on-close job object, and a merely "detached" child is still a member of
+        // that job — so it gets terminated with the shell. Breaking away escapes it.
+        // If the job forbids breakaway, fall back to a plain detached spawn.
+        const BASE: u32 = 0x0000_0008 | 0x0000_0200;
+        c.creation_flags(BASE | 0x0100_0000);
+        spawned = match c.spawn() {
+            Ok(ch) => Some(ch),
+            Err(_) => {
+                c.creation_flags(BASE);
+                c.spawn().ok()
+            }
+        };
     }
-    match c.spawn() {
-        Ok(_) => {
-            println!("HaiveControl is now running in the background — you can close this window.");
-            true
-        }
-        Err(_) => false,
+    #[cfg(not(windows))]
+    {
+        spawned = c.spawn().ok();
+    }
+    if spawned.is_some() {
+        println!("HaiveControl is now running in the background — you can close this window.");
+        true
+    } else {
+        false
     }
 }
 
