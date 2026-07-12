@@ -113,6 +113,16 @@ fn relaunch_detached() -> bool {
 /// restart keeps the SAME relay id — the hub reuses the device's entry (and its
 /// retained analysis) instead of piling up a new ghost per launch. DefaultHasher
 /// uses fixed keys, so this is stable across runs.
+fn agent_direct_token(relay_token: &str, relay_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(relay_token.as_bytes());
+    h.update(b":");
+    h.update(relay_id.as_bytes());
+    h.update(b":haive-direct");
+    format!("{:x}", h.finalize())
+}
+
 fn stable_suffix() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -386,10 +396,12 @@ fn main() {
         let fid = args.id.clone();
         std::thread::spawn(move || discovery::auto_update_loop(mid, fid, asset));
     }
+    let mut direct_token = String::new();
     if let Some(relay_addr) = args.relay.clone() {
         let rid = relay_id(&name);
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
+        direct_token = agent_direct_token(&token, &rid);
         // LAN-direct: get a hub-signed leaf cert (SANs = our LAN IPs + a stable
         // name) so a same-LAN controller can validate a direct connection to us
         // against the hub CA. Falls back to the self-signed cert on failure.
@@ -444,6 +456,7 @@ fn main() {
         share,
         grabber,
         cert,
+        direct_token,
     });
     schedule::run_scheduler();
     http::serve(cfg, tx);

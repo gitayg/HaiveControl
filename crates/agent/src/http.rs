@@ -29,6 +29,7 @@ pub struct Config {
     pub share: String,
     pub grabber: Grabber,
     pub cert: Option<(Vec<u8>, Vec<u8>)>,
+    pub direct_token: String,
 }
 
 pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
@@ -94,6 +95,15 @@ fn header_value(req: &Request, name: &'static str) -> Option<String> {
 }
 
 fn authorized(req: &Request, cfg: &Config) -> bool {
+    // LAN-direct: a request carrying the hub-issued per-device token is authorized
+    // (lets an MCP the hub trusts drive us directly, even behind a password).
+    if !cfg.direct_token.is_empty() {
+        if let Some(q) = req.url().split('?').nth(1) {
+            if q.split('&').any(|kv| kv.strip_prefix("dtok=").map(|v| v == cfg.direct_token).unwrap_or(false)) {
+                return true;
+            }
+        }
+    }
     if cfg.password.is_empty() {
         return true;
     }

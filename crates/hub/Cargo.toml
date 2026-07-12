@@ -18,3 +18,4 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v5"] }
 flate2 = "1"
 rcgen = { version = "0.13", features = ["x509-parser"] }
+sha2 = "0.10"

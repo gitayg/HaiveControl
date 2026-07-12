@@ -167,6 +167,7 @@ struct Srv {
     mtok: String,
     owner: String,
     client: reqwest::Client,
+    direct_client: std::sync::Arc<tokio::sync::OnceCell<reqwest::Client>>,
 }
 
 fn err(e: impl ToString) -> ErrorData {
@@ -196,6 +197,7 @@ impl Srv {
             mtok: std::env::var("HIVE_MCP_TOKEN").unwrap_or_default(),
             owner: std::env::var("HIVE_OWNER").unwrap_or_default(),
             client: b.build().expect("build http client"),
+            direct_client: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -255,6 +257,51 @@ impl Srv {
             .map_err(err)?;
         Ok(())
     }
+    /// A reqwest client that trusts the hub CA (fetched once from /m/ca) — used
+    /// for direct LAN connections to an agent's hub-signed cert. Fast connect
+    /// timeout so an unreachable LAN IP falls back to the relay quickly.
+    async fn direct_client(&self) -> Option<&reqwest::Client> {
+        self.direct_client
+            .get_or_try_init(|| async {
+                let pem = self.client.get(self.m("ca", "")).send().await.map_err(|_| ())?.bytes().await.map_err(|_| ())?;
+                let ca = reqwest::Certificate::from_pem(&pem).map_err(|_| ())?;
+                reqwest::Client::builder()
+                    .add_root_certificate(ca)
+                    .connect_timeout(std::time::Duration::from_secs(2))
+                    .build()
+                    .map_err(|_| ())
+            })
+            .await
+            .ok()
+    }
+
+    /// Ask the hub for a device's LAN IPs + its per-device direct token.
+    async fn direct_info(&self, target: &str) -> Option<(Vec<String>, String)> {
+        let v: serde_json::Value = self.client.get(self.m("direct", &format!("target={}", urlencode(target)))).send().await.ok()?.json().await.ok()?;
+        let ips = v.get("ips")?.as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect::<Vec<_>>();
+        let token = v.get("token")?.as_str()?.to_string();
+        Some((ips, token))
+    }
+
+    /// Try to run the command directly over the LAN (validated against the hub
+    /// CA, authorized by the per-device token). Returns None to fall back to relay.
+    async fn try_direct_exec(&self, target: &str, cmd: &str, detach: bool) -> Option<serde_json::Value> {
+        let (ips, token) = self.direct_info(target).await?;
+        if ips.is_empty() {
+            return None;
+        }
+        let client = self.direct_client().await?;
+        for ip in ips {
+            let url = format!("https://{ip}:8765/exec?dtok={}", urlencode(&token));
+            if let Ok(r) = client.post(&url).timeout(std::time::Duration::from_secs(65)).json(&serde_json::json!({"cmd": cmd, "detach": detach})).send().await {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
 }
 
 #[tool_router]
@@ -282,16 +329,19 @@ impl Srv {
     #[tool(description = "Run a shell command on the named device and return its output.")]
     async fn run_command(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let out: serde_json::Value = self
-            .client
-            .post(self.m("exec", ""))
-            .json(&serde_json::json!({"target": target, "cmd": a.command, "detach": a.detach}))
-            .send()
-            .await
-            .map_err(err)?
-            .json()
-            .await
-            .map_err(err)?;
+        let out: serde_json::Value = match self.try_direct_exec(&target, &a.command, a.detach).await {
+            Some(v) => v,
+            None => self
+                .client
+                .post(self.m("exec", ""))
+                .json(&serde_json::json!({"target": target, "cmd": a.command, "detach": a.detach}))
+                .send()
+                .await
+                .map_err(err)?
+                .json()
+                .await
+                .map_err(err)?,
+        };
         let text = if out["detached"].as_bool().unwrap_or(false) {
             format!("launched (pid {})", out["pid"].as_i64().unwrap_or(0))
         } else if out["ok"].as_bool().unwrap_or(false) {

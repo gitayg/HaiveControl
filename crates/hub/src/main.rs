@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.17.0";
+const VERSION: &str = "2.18.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -235,6 +235,19 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
+        (Method::Get, "/m/ca") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
+        (Method::Get, "/m/direct") => {
+            let t = query_param(&url, "target").unwrap_or_default();
+            let rid = t.strip_prefix("relay://").unwrap_or(&t).trim_end_matches('/').to_string();
+            let key = device_key(&t);
+            let ips: Vec<String> = agents.lock().unwrap().get(&key)
+                .and_then(|a| a.data.get("interfaces").and_then(|x| x.as_array()).cloned())
+                .map(|arr| arr.iter().filter_map(|i| i.get("addr").and_then(|s| s.as_str()))
+                    .filter(|a| a.parse::<std::net::Ipv4Addr>().map(|ip| !ip.is_loopback() && !ip.is_link_local()).unwrap_or(false))
+                    .map(String::from).collect())
+                .unwrap_or_default();
+            json_resp(&serde_json::json!({"ok": true, "name": device_name(agents, &t), "ips": ips, "port": 8765, "token": direct_token(&rid)}))
+        }
         (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
         (Method::Get, "/x/analysis") => proxy_analysis(&url, agents, user.as_deref()),
@@ -427,6 +440,20 @@ fn may_control(user: Option<&str>, agents: &Agents, target: &str) -> bool {
         None => true,
         Some(u) => { let o = device_owner(agents, target).unwrap_or_default(); o.is_empty() || o == u }
     }
+}
+
+/// A per-device token for the LAN-direct path: sha256(RELAY_TOKEN : relay_id).
+/// The agent computes the same value locally (it has both), and the hub hands it
+/// to an authorized MCP via /m/direct — so a random LAN host can't drive the agent.
+fn direct_token(relay_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let secret = std::env::var("RELAY_TOKEN").unwrap_or_default();
+    let mut h = Sha256::new();
+    h.update(secret.as_bytes());
+    h.update(b":");
+    h.update(relay_id.as_bytes());
+    h.update(b":haive-direct");
+    format!("{:x}", h.finalize())
 }
 
 /// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset.
