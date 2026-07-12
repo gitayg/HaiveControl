@@ -127,6 +127,27 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
     }
 }
 
+/// Same as `auto_update_loop`, but for relay agents (no LAN mac-id to resolve):
+/// pull the binary straight from the relay URL's `/bin/`. `apply_update` self-
+/// replaces AND re-execs, so this self-restarts without needing a supervisor.
+pub fn auto_update_relay(base: String, asset: String) {
+    let self_bytes = match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
+        Some(b) => b,
+        None => return,
+    };
+    let b = base.trim_end_matches('/').to_string();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(120));
+        let url = format!("{b}/bin/{asset}");
+        if let Some(newb) = download_agent(&url) {
+            if !newb.is_empty() && newb != self_bytes && crate::http::apply_update(&newb) {
+                std::thread::sleep(Duration::from_millis(500));
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 fn download_agent(url: &str) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut r = ureq::get(url).call().ok()?.into_reader();
