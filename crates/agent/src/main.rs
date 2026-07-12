@@ -349,7 +349,7 @@ fn main() {
         "one-time (until closed)".to_string()
     };
 
-    let cert = if tls {
+    let mut cert = if tls {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_default();
@@ -390,6 +390,27 @@ fn main() {
         let rid = relay_id(&name);
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
+        // LAN-direct: get a hub-signed leaf cert (SANs = our LAN IPs + a stable
+        // name) so a same-LAN controller can validate a direct connection to us
+        // against the hub CA. Falls back to the self-signed cert on failure.
+        if tls {
+            let mut sans: Vec<String> = sysinfo
+                .get("interfaces")
+                .and_then(|x| x.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.get("addr").and_then(|s| s.as_str()))
+                        .filter(|a| a.parse::<std::net::Ipv4Addr>().map(|ip| !ip.is_loopback() && !ip.is_link_local()).unwrap_or(false))
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            sans.push(format!("{rid}.haive.lan"));
+            if let Some(c) = config::fetch_hub_cert(&relay_addr, &rid, &token, sans) {
+                println!("   lan-direct: using hub-signed cert");
+                cert = Some(c);
+            }
+        }
         println!("   relay: dialing {relay_addr} as {rid}");
         config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
         analysis::start(relay_addr.clone(), rid.clone(), token.clone());

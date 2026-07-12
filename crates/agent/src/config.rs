@@ -27,3 +27,20 @@ pub fn start_poll(hub: String, token: Option<String>) {
         std::thread::sleep(std::time::Duration::from_secs(60));
     });
 }
+
+/// Ask the hub to sign a leaf cert for this agent (SANs = our LAN IPs + a stable
+/// name), so a same-LAN controller can validate a direct connection against the
+/// hub CA. Returns (cert_pem, key_pem) bytes, or None to fall back to self-signed.
+pub fn fetch_hub_cert(hub: &str, relay_id: &str, token: &str, sans: Vec<String>) -> Option<(Vec<u8>, Vec<u8>)> {
+    let base = hub.trim_end_matches('/');
+    let mut url = format!("{base}/relay/cert");
+    if !token.is_empty() {
+        url.push_str(&format!("?tok={token}"));
+    }
+    let body = serde_json::json!({ "relay_id": relay_id, "sans": sans });
+    let r = ureq::post(&url).timeout(std::time::Duration::from_secs(10)).send_json(body).ok()?;
+    let v: serde_json::Value = r.into_json().ok()?;
+    let cert = v.get("cert")?.as_str()?.as_bytes().to_vec();
+    let key = v.get("key")?.as_str()?.as_bytes().to_vec();
+    Some((cert, key))
+}
