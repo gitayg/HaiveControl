@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.11.9";
+const VERSION: &str = "2.12.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -164,6 +164,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             relay::hello(agents, data);
             Response::from_string("").with_status_code(204)
         }
+        (Method::Post, "/relay/analysis") => recv_analysis(&mut req),
         (Method::Get, "/relay/poll") => {
             let id = query_param(&url, "id").unwrap_or_default();
             match relay::poll(&id, std::time::Duration::from_secs(25)) {
@@ -210,8 +211,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref(), true),
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
+        (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
+        (Method::Get, "/x/analysis") => proxy_analysis(&url, agents, user.as_deref()),
         (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
         (Method::Get, "/scripts") => scripts_list(&url),
         (Method::Get, "/m/scripts") => scripts_list(&url),
@@ -683,12 +686,21 @@ fn shell_arg(s: &str) -> String {
 
 /// The OS-appropriate shell command for a canned management action, or None if
 /// unsupported on that platform. `arg` = message text / package id where used.
+/// Wrap a PowerShell one-liner as `-EncodedCommand` (base64 UTF-16LE) so its
+/// quotes and pipes survive the shell layers intact. A bare `-Command "…|…"`
+/// gets mangled through cmd → agent and echoed back instead of executed.
+fn ps(script: &str) -> String {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    format!("powershell -NoProfile -EncodedCommand {}", base64::engine::general_purpose::STANDARD.encode(utf16))
+}
+
 fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
     let cmd: String = match (kind, platform) {
         ("hardware", "windows") => "systeminfo".into(),
         ("hardware", "macos") => "system_profiler SPHardwareDataType".into(),
         ("hardware", "linux") => "lscpu; echo; free -h; echo; lsblk".into(),
-        ("av", "windows") => "powershell -NoProfile -Command \"Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMRunningMode | Format-List\"".into(),
+        ("av", "windows") => ps("Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMRunningMode | Format-List"),
         ("av", "macos") => "echo 'Gatekeeper:'; spctl --status; echo 'XProtect present:'; ls /Library/Apple/System/Library/CoreServices/XProtect.bundle >/dev/null 2>&1 && echo yes || echo no".into(),
         ("av", "linux") => "clamscan --version 2>/dev/null || echo 'no clamav installed'".into(),
         ("encryption", "windows") => "manage-bde -status C:".into(),
@@ -705,7 +717,7 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("firewall_off", "linux") => "sudo ufw disable".into(),
         ("processes", "windows") => "tasklist".into(),
         ("processes", _) => "ps aux 2>/dev/null | sort -rk3 | head -25".into(),
-        ("services", "windows") => "powershell -NoProfile -Command \"Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 40 Name,DisplayName | Format-Table -Auto\"".into(),
+        ("services", "windows") => ps("Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 40 Name,DisplayName | Format-Table -Auto"),
         ("services", "macos") => "launchctl list | head -40".into(),
         ("services", "linux") => "systemctl list-units --type=service --state=running --no-pager | head -40".into(),
         ("network", _) => "arp -a".into(),
@@ -777,12 +789,16 @@ fn exec_output(target: &str, cmd: &str) -> String {
 
 /// Heuristic pass/fail from a check's command output (best-effort across OSes).
 fn posture_pass(kind: &str, out: &str) -> bool {
-    let o = out.to_lowercase();
+    // Collapse runs of whitespace to single spaces so column-aligned tool output
+    // (netsh, PowerShell Format-List) matches single-space patterns. Without this,
+    // `netsh` prints `State⎵⎵…⎵ON` and a `"state on"` substring never matched.
+    let n: String = out.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
     match kind {
-        "encryption" => o.contains("filevault is on") || o.contains("protection on") || o.contains("percentage encrypted: 100") || o.contains("crypt"),
-        "firewall" => o.contains("state = 1") || o.contains("state on") || o.contains("firewall is enabled") || o.contains("status: active"),
-        "av" => o.contains("antivirusenabled  : true") || o.contains("realtimeprotectionenabled : true") || o.contains("assessments enabled"),
-        "updates" => o.contains("no new software") || o.contains("no applicable") || o.contains("no installed package") || out.lines().count() <= 2,
+        "encryption" => n.contains("filevault is on") || n.contains("protection on") || n.contains("percentage encrypted: 100") || n.contains("crypt"),
+        // Windows lists a State per profile — pass only if one is ON and none OFF.
+        "firewall" => (n.contains("state on") && !n.contains("state off")) || n.contains("state = 1") || n.contains("firewall is enabled") || n.contains("status: active"),
+        "av" => n.contains("antivirusenabled : true") || n.contains("realtimeprotectionenabled : true") || n.contains("assessments enabled"),
+        "updates" => n.contains("no new software") || n.contains("no applicable") || n.contains("no installed package") || out.lines().count() <= 2,
         _ => false,
     }
 }
@@ -815,6 +831,84 @@ const COMPLIANCE_FRAMEWORKS: [&str; 6] = ["CIS", "NIST 800-53", "PCI-DSS", "HIPA
 
 /// Run the security-posture checks on one device → {score, grade, checks[]},
 /// each check carrying its pass/fail, output snippet, and control mapping.
+// ---- Auto analysis: agent-pushed periodic device analysis (delta) -----------
+type AnalysisStore = Mutex<HashMap<String, (std::collections::BTreeMap<String, (String, Instant)>, Instant)>>;
+fn analysis_store() -> &'static AnalysisStore {
+    static A: std::sync::OnceLock<AnalysisStore> = std::sync::OnceLock::new();
+    A.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// POST /relay/analysis — merge the agent's pushed sections into the store.
+/// Replies `want_full=true` when we had no record (e.g. the hub restarted), so
+/// the agent re-sends a full snapshot instead of only deltas.
+fn recv_analysis(req: &mut Request) -> Resp {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let rid = v.get("relay_id").and_then(|x| x.as_str()).unwrap_or_default();
+    if rid.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false}));
+    }
+    let full = v.get("full").and_then(|x| x.as_bool()).unwrap_or(false);
+    let key = format!("relay:{rid}");
+    let mut store = analysis_store().lock().unwrap();
+    let existed = store.contains_key(&key);
+    let entry = store.entry(key).or_insert_with(|| (std::collections::BTreeMap::new(), Instant::now()));
+    if let Some(sections) = v.get("sections").and_then(|x| x.as_object()) {
+        for (k, val) in sections {
+            if let Some(s) = val.as_str() {
+                entry.0.insert(k.clone(), (s.to_string(), Instant::now()));
+            }
+        }
+    }
+    entry.1 = Instant::now();
+    json_resp(&serde_json::json!({"ok": true, "want_full": !existed && !full}))
+}
+
+/// Compliance grade computed from the stored security sections (no relay call).
+fn analysis_compliance(sections: &std::collections::BTreeMap<String, (String, Instant)>) -> serde_json::Value {
+    let checks = [("disk encryption", "encryption"), ("firewall", "firewall"), ("antivirus", "av"), ("OS updates", "updates")];
+    let mut items = Vec::new();
+    let mut pass_n = 0;
+    for (label, k) in checks.iter() {
+        let have = sections.contains_key(*k);
+        let out = sections.get(*k).map(|(s, _)| s.as_str()).unwrap_or("");
+        let pass = have && posture_pass(k, out);
+        if pass {
+            pass_n += 1;
+        }
+        items.push(serde_json::json!({"check": label, "kind": k, "pass": pass, "have": have}));
+    }
+    let score = (pass_n as f64 / checks.len() as f64 * 100.0).round() as i64;
+    serde_json::json!({"score": score, "grade": grade(score), "checks": items})
+}
+
+/// GET /x|/m/analysis?target=… — the latest auto-collected analysis for a device.
+fn proxy_analysis(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    let key = device_key(&target);
+    let now = Instant::now();
+    let store = analysis_store().lock().unwrap();
+    match store.get(&key) {
+        None => json_resp(&serde_json::json!({"ok": true, "sections": [], "updated_secs": null})),
+        Some((sections, updated)) => {
+            let secs: Vec<serde_json::Value> = sections
+                .iter()
+                .map(|(k, (out, at))| serde_json::json!({"kind": k, "output": out, "secs_ago": now.duration_since(*at).as_secs()}))
+                .collect();
+            json_resp(&serde_json::json!({
+                "ok": true,
+                "sections": secs,
+                "compliance": analysis_compliance(sections),
+                "updated_secs": now.duration_since(*updated).as_secs()
+            }))
+        }
+    }
+}
+
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
     let checks = [("disk encryption", "encryption"), ("firewall", "firewall"), ("antivirus", "av"), ("OS updates", "updates")];
     // Batch all checks into ONE agent round-trip: join the per-check commands with
@@ -2222,6 +2316,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <a class=\"dh-open\" id=\"d-open\" target=\"_blank\">Open agent&nbsp;↗</a></div>\
 <div class=\"specs\" id=\"d-specs\"></div>\
 <div id=\"d-activity\"></div>\
+<div id=\"d-analysis\" class=\"an-panel\"></div>\
 <div id=\"d-controls\"></div>\
 <div class=\"viewport\" id=\"viewport\"><div class=\"vp-hint\" id=\"vp-hint\">Press <b>Live screen</b>, <b>Screenshot</b>, or a <b>Camera</b> action — it renders here.</div><img id=\"view\" alt=\"\" style=\"display:none\"><div class=\"vp-tools\" id=\"vp-tools\" style=\"display:none\"><button class=\"b\" onclick=\"stopView()\">Stop</button><button class=\"b\" onclick=\"openTab()\">Open in tab&nbsp;↗</button></div></div>\
 <div class=\"term\" id=\"terminal\" style=\"display:none\"><div class=\"term-head\"><span>interactive shell</span><button class=\"b\" onclick=\"closeShell()\">Close shell</button></div><div id=\"xterm\" class=\"xterm-host\"></div></div>\
@@ -2313,6 +2408,26 @@ pre{margin:0}
 .scope-hint code{background:rgba(255,255,255,.06);padding:1px 5px;border-radius:4px;font-size:10px}
 .output.flash{animation:outflash .7s ease-out}
 @keyframes outflash{0%{box-shadow:0 0 0 2px var(--accent,#5b9dff) inset}100%{box-shadow:0 0 0 0 transparent inset}}
+.an-panel{margin:12px 0}
+.an-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.an-title{font-size:13px;font-weight:600}
+.an-grade{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px}
+.gA{background:#1f7a3d;color:#fff}.gB{background:#3d8b40;color:#fff}.gC{background:#b8860b;color:#fff}.gD{background:#c0562b;color:#fff}.gF{background:#a12d2d;color:#fff}
+.an-upd{font-size:11px;color:var(--dim2,#8a91a3)}
+.an-rf{margin-left:auto;padding:3px 9px;font-size:12px}
+.an-empty{font-size:12px;color:var(--dim2,#8a91a3);padding:8px 0}
+.an-secs{display:flex;flex-direction:column;gap:4px}
+.an-sec{border:1px solid var(--line2,#232838);border-radius:8px;overflow:hidden}
+.an-sec-h{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;font-size:12px;user-select:none}
+.an-sec-h:hover{background:rgba(255,255,255,.03)}
+.an-caret{transition:transform .15s;font-size:10px;color:var(--dim2,#8a91a3)}
+.an-sec.open .an-caret{transform:rotate(90deg)}
+.an-lbl{font-weight:500}
+.an-ok{font-size:10px;font-weight:700;color:#4fb06a}
+.an-bad{font-size:10px;font-weight:700;color:#d9694f}
+.an-age{margin-left:auto;font-size:10px;color:var(--dim2,#8a91a3)}
+.an-out{display:none;margin:0;padding:8px 10px;border-top:1px solid var(--line2,#232838);font-size:11px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+.an-sec.open .an-out{display:block}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
 .ov-nm{font-weight:600;color:var(--text)}
 .ov-num{text-align:right;font-variant-numeric:tabular-nums}
@@ -2622,8 +2737,12 @@ function loadAudit(){fetch('/audit').then(function(r){return r.json();}).then(fu
 function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
+var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
+var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];
+function loadAnalysis(target){fetch('/x/analysis?target='+enc(target)).then(function(r){return r.json();}).then(function(j){renderAnalysis(j,target);}).catch(function(){});}
+function renderAnalysis(j,target){var el=document.getElementById('d-analysis');if(!el||SEL!==target)return;var secs=(j&&j.sections)||[];var byKind={};secs.forEach(function(s){byKind[s.kind]=s;});var cmp=j&&j.compliance;var head='<div class="an-head"><span class="an-title">Live analysis <span class="dim2">— auto, every 5 min</span></span>'+(cmp?('<span class="an-grade g'+cmp.grade+'">'+cmp.grade+' · '+cmp.score+'/100</span>'):'')+'<span class="an-upd">'+(j.updated_secs==null?'awaiting first report…':('updated '+seenTxt(j.updated_secs)))+'</span><button class="b subtle an-rf" title="refresh" onclick="loadAnalysis(\''+attrEsc(target)+'\')">↻</button></div>';if(j.updated_secs==null){el.innerHTML=head+'<div class="an-empty">The agent runs a full analysis every 5 minutes and pushes only what changed. First report is on its way…</div>';return;}var rows='';ANALYSIS_ORDER.forEach(function(k){var s=byKind[k];if(!s)return;var lbl=ANALYSIS_LABELS[k]||k;var badge='';if(cmp){var chk=(cmp.checks||[]).filter(function(c){return c.kind===k;})[0];if(chk){badge=chk.pass?'<span class="an-ok">PASS</span>':'<span class="an-bad">FAIL</span>';}}rows+='<div class="an-sec"><div class="an-sec-h" onclick="this.parentElement.classList.toggle(\'open\')"><span class="an-caret">▸</span><span class="an-lbl">'+esc2(lbl)+'</span>'+badge+'<span class="an-age">'+seenTxt(s.secs_ago)+'</span></div><pre class="an-out">'+esc2(s.output||'')+'</pre></div>';});el.innerHTML=head+'<div class="an-secs">'+rows+'</div>';}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
@@ -2699,7 +2818,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 document.getElementById('devlist').addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});
 window.addEventListener('resize',function(){fitShell();});
 document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}var cveq=document.getElementById('cve-q');if(cveq){cveq.onkeydown=function(e){if(e.key==='Enter')searchCVE();};}loadPlugins();fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}var cveq=document.getElementById('cve-q');if(cveq){cveq.onkeydown=function(e){if(e.key==='Enter')searchCVE();};}loadPlugins();fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);setInterval(function(){if(SEL&&document.getElementById('detail').style.display==='block')loadAnalysis(SEL);},30000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {

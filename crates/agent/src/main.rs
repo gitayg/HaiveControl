@@ -1,6 +1,7 @@
 // HaiveControl — LAN remote control & screen sharing with an AI/MCP interface.
 // Copyright (C) 2026 The HaiveControl Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
+mod analysis;
 mod capture;
 mod config;
 mod discovery;
@@ -354,6 +355,7 @@ fn main() {
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
         println!("   relay: dialing {relay_addr} as {rid}");
         config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
+        analysis::start(relay_addr.clone(), rid.clone(), token.clone());
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
