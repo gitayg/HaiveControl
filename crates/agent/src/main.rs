@@ -105,12 +105,25 @@ fn relaunch_detached() -> bool {
     }
 }
 
+/// A stable per-machine suffix (deterministic hash of hostname + user + OS), so a
+/// restart keeps the SAME relay id — the hub reuses the device's entry (and its
+/// retained analysis) instead of piling up a new ghost per launch. DefaultHasher
+/// uses fixed keys, so this is stable across runs.
+fn stable_suffix() -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hostname().hash(&mut h);
+    env_or("USER", &env_or("USERNAME", "")).hash(&mut h);
+    std::env::consts::OS.hash(&mut h);
+    format!("{:08x}", h.finish() as u32)
+}
+
 fn relay_id(name: &str) -> String {
     let base: String = name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
-    format!("{base}-{}", std::process::id())
+    format!("{base}-{}", stable_suffix())
 }
 
 fn env_or(key: &str, default: &str) -> String {

@@ -15,9 +15,13 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.12.0";
+const VERSION: &str = "2.13.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
+/// How long a device (and its last-known analysis) is retained after it goes
+/// offline, so the dashboard keeps showing it — marked offline — instead of
+/// dropping it the moment it stops heartbeating.
+const OFFLINE_RETAIN: Duration = Duration::from_secs(14 * 24 * 3600);
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 type Agents = Mutex<HashMap<String, Agent>>;
@@ -2179,7 +2183,7 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
     let alog = access_log().lock().unwrap();
     guard
         .iter()
-        .filter(|(_, a)| now.duration_since(a.last) < STALE)
+        .filter(|(_, a)| now.duration_since(a.last) < OFFLINE_RETAIN)
         .filter(|(_, a)| match user {
             None => true,
             Some(u) => a.data.get("owner").and_then(|o| o.as_str()) == Some(u),
@@ -2188,6 +2192,7 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
             let mut d = a.data.clone();
             if let Some(o) = d.as_object_mut() {
                 o.insert("last_seen_secs".to_string(), serde_json::json!(now.duration_since(a.last).as_secs()));
+                o.insert("online".to_string(), serde_json::json!(now.duration_since(a.last) < STALE));
                 if let Some(events) = alog.get(key) {
                     // Only surface accesses within the last 5 minutes.
                     let recent: Vec<serde_json::Value> = events
@@ -2428,6 +2433,8 @@ pre{margin:0}
 .an-age{margin-left:auto;font-size:10px;color:var(--dim2,#8a91a3)}
 .an-out{display:none;margin:0;padding:8px 10px;border-top:1px solid var(--line2,#232838);font-size:11px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .an-sec.open .an-out{display:block}
+.off-pill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;background:#5a2530;color:#ff9aa2;vertical-align:middle;margin-left:6px}
+.an-off{font-size:12px;color:#f0b37a;background:rgba(240,150,80,.08);border:1px solid rgba(240,150,80,.25);border-radius:8px;padding:7px 10px;margin-bottom:8px}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
 .ov-nm{font-weight:600;color:var(--text)}
 .ov-num{text-align:right;font-variant-numeric:tabular-nums}
@@ -2738,11 +2745,11 @@ function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
-function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').textContent=(relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs);var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
+function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':'');var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
 var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];
 function loadAnalysis(target){fetch('/x/analysis?target='+enc(target)).then(function(r){return r.json();}).then(function(j){renderAnalysis(j,target);}).catch(function(){});}
-function renderAnalysis(j,target){var el=document.getElementById('d-analysis');if(!el||SEL!==target)return;var secs=(j&&j.sections)||[];var byKind={};secs.forEach(function(s){byKind[s.kind]=s;});var cmp=j&&j.compliance;var head='<div class="an-head"><span class="an-title">Live analysis <span class="dim2">— auto, every 5 min</span></span>'+(cmp?('<span class="an-grade g'+cmp.grade+'">'+cmp.grade+' · '+cmp.score+'/100</span>'):'')+'<span class="an-upd">'+(j.updated_secs==null?'awaiting first report…':('updated '+seenTxt(j.updated_secs)))+'</span><button class="b subtle an-rf" title="refresh" onclick="loadAnalysis(\''+attrEsc(target)+'\')">↻</button></div>';if(j.updated_secs==null){el.innerHTML=head+'<div class="an-empty">The agent runs a full analysis every 5 minutes and pushes only what changed. First report is on its way…</div>';return;}var rows='';ANALYSIS_ORDER.forEach(function(k){var s=byKind[k];if(!s)return;var lbl=ANALYSIS_LABELS[k]||k;var badge='';if(cmp){var chk=(cmp.checks||[]).filter(function(c){return c.kind===k;})[0];if(chk){badge=chk.pass?'<span class="an-ok">PASS</span>':'<span class="an-bad">FAIL</span>';}}rows+='<div class="an-sec"><div class="an-sec-h" onclick="this.parentElement.classList.toggle(\'open\')"><span class="an-caret">▸</span><span class="an-lbl">'+esc2(lbl)+'</span>'+badge+'<span class="an-age">'+seenTxt(s.secs_ago)+'</span></div><pre class="an-out">'+esc2(s.output||'')+'</pre></div>';});el.innerHTML=head+'<div class="an-secs">'+rows+'</div>';}
+function renderAnalysis(j,target){var el=document.getElementById('d-analysis');if(!el||SEL!==target)return;var secs=(j&&j.sections)||[];var byKind={};secs.forEach(function(s){byKind[s.kind]=s;});var cmp=j&&j.compliance;var head='<div class="an-head"><span class="an-title">Live analysis <span class="dim2">— auto, every 5 min</span></span>'+(cmp?('<span class="an-grade g'+cmp.grade+'">'+cmp.grade+' · '+cmp.score+'/100</span>'):'')+'<span class="an-upd">'+(j.updated_secs==null?'awaiting first report…':('updated '+seenTxt(j.updated_secs)))+'</span><button class="b subtle an-rf" title="refresh" onclick="loadAnalysis(\''+attrEsc(target)+'\')">↻</button></div>';var dev=DEV[target]||{};var offNote=(dev.online===false)?'<div class="an-off">⚠ Device is offline — showing the last analysis received'+(j.updated_secs!=null?(' ('+seenTxt(j.updated_secs)+')'):'')+'.</div>':'';if(j.updated_secs==null){el.innerHTML=head+offNote+'<div class="an-empty">The agent runs a full analysis every 5 minutes and pushes only what changed. First report is on its way…</div>';return;}var rows='';ANALYSIS_ORDER.forEach(function(k){var s=byKind[k];if(!s)return;var lbl=ANALYSIS_LABELS[k]||k;var badge='';if(cmp){var chk=(cmp.checks||[]).filter(function(c){return c.kind===k;})[0];if(chk){badge=chk.pass?'<span class="an-ok">PASS</span>':'<span class="an-bad">FAIL</span>';}}rows+='<div class="an-sec"><div class="an-sec-h" onclick="this.parentElement.classList.toggle(\'open\')"><span class="an-caret">▸</span><span class="an-lbl">'+esc2(lbl)+'</span>'+badge+'<span class="an-age">'+seenTxt(s.secs_ago)+'</span></div><pre class="an-out">'+esc2(s.output||'')+'</pre></div>';});el.innerHTML=head+offNote+'<div class="an-secs">'+rows+'</div>';}
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
