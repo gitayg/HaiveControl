@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.14.2";
+const VERSION: &str = "2.15.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 /// How long a device (and its last-known analysis) is retained after it goes
@@ -2277,8 +2277,10 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         VERSION
     );
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\
+<button id=\"navtoggle\" class=\"navtoggle\" onclick=\"toggleNav()\" aria-label=\"menu\">☰</button>\
+<div id=\"navback\" class=\"navback\" onclick=\"toggleNav()\"></div>\
 <nav class=\"rail\">\
 <div class=\"rail-top\"><div class=\"rail-brand\">📡 <span class=\"rail-name\">Haive</span><span class=\"pill\" id=\"count\">…</span></div><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div>\
 <button class=\"railadd\" onclick=\"toggleReg()\" title=\"register a new device\">+ Add device</button>\
@@ -2329,8 +2331,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}{hb}<script src=\"/assets/xterm.js\"></script><script src=\"/assets/addon-fit.js\"></script>{script}</body></html>",
-        cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML
+</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}</body></html>",
+        cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
     maybe_gzip(html.into_bytes(), "text/html; charset=utf-8", accepts_gzip)
 }
@@ -2434,6 +2436,23 @@ pre{margin:0}
 .an-age{margin-left:auto;font-size:10px;color:var(--dim2,#8a91a3)}
 .an-out{display:none;margin:0;padding:8px 10px;border-top:1px solid var(--line2,#232838);font-size:11px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word}
 .an-sec.open .an-out{display:block}
+.navtoggle{display:none;align-items:center;justify-content:center;width:40px;height:40px;border-radius:10px;border:1px solid var(--line);background:var(--surface);color:#e6e9f2;font-size:19px;cursor:pointer;line-height:1}
+.navback{display:none}
+@media (max-width:700px){
+.app{border:none;border-radius:0;overflow:visible;min-height:100vh}
+.side{display:none}
+.navtoggle{display:inline-flex;position:fixed;top:10px;left:10px;z-index:60}
+.rail{position:fixed;top:0;left:0;bottom:0;width:236px;z-index:56;transform:translateX(-100%);transition:transform .22s ease}
+body.navopen .rail{transform:none;box-shadow:0 18px 60px rgba(0,0,0,.6)}
+.navback{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:55}
+body.navopen .navback{display:block}
+.stage{padding:58px 12px 18px}
+.viewport{min-height:240px}
+.aud-head{flex-wrap:wrap;gap:6px}
+.ov-refresh{float:none;margin-left:auto}
+.ov-scroll{-webkit-overflow-scrolling:touch}
+.arow-arg,.sf-body{width:100%}
+}
 .off-pill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;background:#5a2530;color:#ff9aa2;vertical-align:middle;margin-left:6px}
 .an-off{font-size:12px;color:#f0b37a;background:rgba(240,150,80,.08);border:1px solid rgba(240,150,80,.25);border-radius:8px;padding:7px 10px;margin-bottom:8px}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
@@ -2673,7 +2692,8 @@ function showEmpty(){hideViews();document.getElementById('stage-empty').style.di
 var AUDIT_ON=false;
 function agoTxt(s){return s<60?(s+'s ago'):(s<3600?(Math.floor(s/60)+'m ago'):(Math.floor(s/3600)+'h ago'));}
 function hideViews(){stopPlay();if(LMAP){try{LMAP.remove();}catch(e){}LMAP=null;}var v=['detail','stage-empty','fleet-view','overview-view','audit-view','scripts-view','compliance-view','schedules-view','recordings-view','map-view','cve-view','settings-view','inv-toggle','dashboard-view','reg'];for(var i=0;i<v.length;i++){var el=document.getElementById(v[i]);if(el)el.style.display='none';}}
-function setNav(n){var b=document.querySelectorAll('.navb');for(var i=0;i<b.length;i++){b[i].classList.toggle('active',b[i].getAttribute('data-nav')===n);}}
+function toggleNav(){document.body.classList.toggle('navopen');}
+function setNav(n){var b=document.querySelectorAll('.navb');for(var i=0;i<b.length;i++){b[i].classList.toggle('active',b[i].getAttribute('data-nav')===n);}if(window.innerWidth<=700)document.body.classList.remove('navopen');}
 function showAudit(){AUDIT_ON=true;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('audit-view').style.display='block';setNav('audit');loadAudit();}
 function sysCall(kind,arg){var u='/x/sys?target='+enc(SEL)+'&kind='+enc(kind);if(arg)u+='&arg='+enc(arg);out(kind+' …');fetch(u).then(function(r){return r.json();}).then(function(j){out(j.output||('[error] '+(j.error||'failed')));}).catch(function(e){out('error: '+e);});}
 function doSys(){var k=prompt('Report — hardware / av / encryption / firewall / processes / services / network / packages / updates / power_report','hardware');if(k)sysCall(k.trim(),'');}
