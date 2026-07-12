@@ -34,9 +34,13 @@ struct Args {
     /// hub Mac ID for mDNS fallback when the target is a direct IP
     #[arg(long)]
     id: Option<String>,
-    /// install autostart so it survives reboot
+    /// install autostart so it survives reboot (per-user: Run key / LaunchAgent)
     #[arg(long, conflicts_with = "ttl")]
     persist: bool,
+    /// install as a boot/logon service (Scheduled Task / LaunchDaemon / systemd);
+    /// more robust than --persist and restarts the agent if it dies. Run elevated.
+    #[arg(long, conflicts_with = "ttl")]
+    install: bool,
     /// run for MIN minutes, then auto-exit (dissolve)
     #[arg(long, value_name = "MIN")]
     ttl: Option<f64>,
@@ -124,6 +128,16 @@ fn relay_id(name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect();
     format!("{base}-{}", stable_suffix())
+}
+
+/// The args to persist for autostart: the current invocation minus the one-shot
+/// persistence/detach flags, so the installed command re-runs in the same mode
+/// (relay or LAN) without re-triggering install or backgrounding.
+fn persist_args() -> Vec<String> {
+    std::env::args()
+        .skip(1)
+        .filter(|a| !matches!(a.as_str(), "--install" | "--persist" | "--background" | "--uninstall"))
+        .collect()
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -311,9 +325,12 @@ fn main() {
     let grabber = capture::Grabber { index: monitor };
     let geo = grabber.geometry();
 
-    let lifetime = if args.persist {
-        persistence::install(&persistence::boot_args(&mac_id_disp, &args.password, &args.name));
-        "persistent (starts on boot)".to_string()
+    let lifetime = if args.install {
+        persistence::install_service(&persist_args());
+        "installed (service — starts at logon/boot, self-restarting)".to_string()
+    } else if args.persist {
+        persistence::install(&persist_args());
+        "persistent (autostart at login)".to_string()
     } else if let Some(mins) = args.ttl {
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs_f64(mins * 60.0));
@@ -369,6 +386,13 @@ fn main() {
         println!("   relay: dialing {relay_addr} as {rid}");
         config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
         analysis::start(relay_addr.clone(), rid.clone(), token.clone());
+        let asset = match std::env::consts::OS {
+            "windows" => "HaiveControl-windows.exe",
+            "macos" => "HaiveControl-macos",
+            _ => "HaiveControl-linux",
+        }
+        .to_string();
+        discovery::auto_update_relay(relay_addr.clone(), asset);
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
