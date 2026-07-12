@@ -4,6 +4,7 @@
 //
 // HaiveHub — runs on the Mac. Advertises a Mac ID over Bonjour, collects agent
 // registrations, and serves a dashboard + JSON list of registered devices.
+mod ca;
 use std::collections::HashMap;
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.16.1";
+const VERSION: &str = "2.17.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -173,6 +174,18 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             Response::from_string("").with_status_code(204)
         }
         (Method::Post, "/relay/analysis") => recv_analysis(&mut req),
+        (Method::Post, "/relay/cert") => {
+            let mut body = String::new();
+            let _ = req.as_reader().read_to_string(&mut body);
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            let sans: Vec<String> = v.get("sans").and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            match ca::sign_leaf(sans) {
+                Some((cert, key)) => json_resp(&serde_json::json!({"ok": true, "cert": cert, "key": key})),
+                None => json_resp(&serde_json::json!({"ok": false, "error": "sign failed"})),
+            }
+        }
         (Method::Get, "/relay/poll") => {
             let id = query_param(&url, "id").unwrap_or_default();
             match relay::poll(&id, std::time::Duration::from_secs(25)) {
@@ -190,6 +203,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         }
         (Method::Get, "/install.ps1") => text_resp(install_ps1(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
         (Method::Get, "/install.sh") => text_resp(install_sh(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
+        (Method::Get, "/ca.crt") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, p) if p.starts_with("/bin/") => serve_bin(&p[5..]),
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
