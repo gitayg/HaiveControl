@@ -145,7 +145,13 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 fn hostname() -> String {
-    if let Ok(o) = std::process::Command::new("hostname").output() {
+    let mut hc = std::process::Command::new("hostname");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        hc.creation_flags(0x0800_0000);
+    }
+    if let Ok(o) = hc.output() {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if !s.is_empty() {
             return s;
@@ -253,7 +259,8 @@ fn media_devices() -> (Vec<String>, Vec<String>) {
 }
 #[cfg(target_os = "windows")]
 fn ps_lines(cmd: &str) -> Vec<String> {
-    match std::process::Command::new("powershell").args(["-NoProfile", "-Command", cmd]).output() {
+    use std::os::windows::process::CommandExt;
+    match std::process::Command::new("powershell").args(["-NoProfile", "-Command", cmd]).creation_flags(0x0800_0000).output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
         Err(_) => Vec::new(),
     }
