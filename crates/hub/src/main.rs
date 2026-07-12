@@ -15,13 +15,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.15.0";
+const VERSION: &str = "2.16.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
-/// How long a device (and its last-known analysis) is retained after it goes
-/// offline, so the dashboard keeps showing it — marked offline — instead of
-/// dropping it the moment it stops heartbeating.
-const OFFLINE_RETAIN: Duration = Duration::from_secs(14 * 24 * 3600);
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 type Agents = Mutex<HashMap<String, Agent>>;
@@ -54,6 +50,14 @@ fn main() {
     println!("   On a device run:  HaiveControl {mid}");
 
     let agents: Arc<Agents> = Arc::new(Mutex::new(HashMap::new()));
+    load_state(&agents);
+    {
+        let a = agents.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(20));
+            save_state(&a);
+        });
+    }
     start_scheduler(agents.clone(), ip.clone(), port);
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
@@ -191,6 +195,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
         (Method::Get, "/x/recordings") => recordings_list(),
@@ -249,6 +254,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
     };
@@ -911,6 +917,67 @@ fn proxy_analysis(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
             }))
         }
     }
+}
+
+fn devices_path() -> std::path::PathBuf { data_dir().join("devices.json") }
+fn analysis_file() -> std::path::PathBuf { data_dir().join("analysis.json") }
+fn to_unix(t: std::time::SystemTime) -> u64 { t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() }
+fn from_unix(secs: u64) -> std::time::SystemTime { std::time::UNIX_EPOCH + Duration::from_secs(secs) }
+
+/// Persist the device registry + latest analysis to HUB_DATA (the persistent
+/// volume) so a redeploy/restart doesn't drop enrolled devices. They reload as
+/// offline and flip back online on their next heartbeat.
+fn save_state(agents: &Agents) {
+    let _ = std::fs::create_dir_all(data_dir());
+    let devs: Vec<serde_json::Value> = agents.lock().unwrap().iter()
+        .map(|(k, a)| serde_json::json!({"key": k, "data": a.data, "last": to_unix(a.last)}))
+        .collect();
+    let _ = std::fs::write(devices_path(), serde_json::to_string(&devs).unwrap_or_default());
+    let an: Vec<serde_json::Value> = analysis_store().lock().unwrap().iter().map(|(k, (secs, updated))| {
+        let sections: serde_json::Map<String, serde_json::Value> = secs.iter()
+            .map(|(kind, (out, at))| (kind.clone(), serde_json::json!({"o": out, "t": to_unix(*at)})))
+            .collect();
+        serde_json::json!({"key": k, "sections": sections, "updated": to_unix(*updated)})
+    }).collect();
+    let _ = std::fs::write(analysis_file(), serde_json::to_string(&an).unwrap_or_default());
+}
+
+fn load_state(agents: &Agents) {
+    if let Ok(txt) = std::fs::read_to_string(devices_path()) {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
+            let mut g = agents.lock().unwrap();
+            for e in arr {
+                if let (Some(k), Some(data), Some(last)) = (e.get("key").and_then(|x| x.as_str()), e.get("data"), e.get("last").and_then(|x| x.as_u64())) {
+                    g.insert(k.to_string(), Agent { data: data.clone(), last: from_unix(last) });
+                }
+            }
+        }
+    }
+    if let Ok(txt) = std::fs::read_to_string(analysis_file()) {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
+            let mut st = analysis_store().lock().unwrap();
+            for e in arr {
+                let key = match e.get("key").and_then(|x| x.as_str()) { Some(k) => k.to_string(), None => continue };
+                let updated = from_unix(e.get("updated").and_then(|x| x.as_u64()).unwrap_or(0));
+                let mut sm = std::collections::BTreeMap::new();
+                if let Some(secs) = e.get("sections").and_then(|x| x.as_object()) {
+                    for (kind, v) in secs {
+                        sm.insert(kind.clone(), (v.get("o").and_then(|x| x.as_str()).unwrap_or("").to_string(), from_unix(v.get("t").and_then(|x| x.as_u64()).unwrap_or(0))));
+                    }
+                }
+                st.insert(key, (sm, updated));
+            }
+        }
+    }
+}
+
+/// Remove a device (and its analysis) from the inventory + disk — the manual
+/// cleanup for the "keep forever" retention model.
+fn forget_device(agents: &Agents, target: &str) {
+    let key = device_key(target);
+    agents.lock().unwrap().remove(&key);
+    analysis_store().lock().unwrap().remove(&key);
+    save_state(agents);
 }
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
@@ -2184,7 +2251,6 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
     let alog = access_log().lock().unwrap();
     guard
         .iter()
-        .filter(|(_, a)| now.duration_since(a.last).unwrap_or_default() < OFFLINE_RETAIN)
         .filter(|(_, a)| match user {
             None => true,
             Some(u) => { let o = a.data.get("owner").and_then(|o| o.as_str()).unwrap_or(""); o.is_empty() || o == u },
@@ -2802,7 +2868,7 @@ if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera
 var term='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
 var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button><button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
+var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button><button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button><button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
 return groups+actionListHtml();}
@@ -2835,6 +2901,7 @@ function closeShell(){if(SHSID)fetch(API+'/x/shell/close?target='+enc(SEL)+'&sid
 function doGet(){openFb(SEL,'get');}
 function doPut(){openFb(SEL,'put');}
 function doUpd(){if(!confirm('Update the agent on this device to the latest build?'))return;out('updating…');fetch(API+'/x/update?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
+function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It will stop and remove its autostart.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
 /* ---- file browser ---- */
 var fbBase=null,fbMode=null,fbPath='',fbParent='';
