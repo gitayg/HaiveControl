@@ -15,7 +15,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.14.0";
+const VERSION: &str = "2.14.1";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 /// How long a device (and its last-known analysis) is retained after it goes
@@ -405,7 +405,7 @@ fn auditable(path: &str) -> bool {
 fn may_control(user: Option<&str>, agents: &Agents, target: &str) -> bool {
     match user {
         None => true,
-        Some(u) => device_owner(agents, target).as_deref() == Some(u),
+        Some(u) => { let o = device_owner(agents, target).unwrap_or_default(); o.is_empty() || o == u }
     }
 }
 
@@ -2186,7 +2186,7 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
         .filter(|(_, a)| now.duration_since(a.last) < OFFLINE_RETAIN)
         .filter(|(_, a)| match user {
             None => true,
-            Some(u) => a.data.get("owner").and_then(|o| o.as_str()) == Some(u),
+            Some(u) => { let o = a.data.get("owner").and_then(|o| o.as_str()).unwrap_or(""); o.is_empty() || o == u },
         })
         .map(|(key, a)| {
             let mut d = a.data.clone();
