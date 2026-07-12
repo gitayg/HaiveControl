@@ -56,7 +56,7 @@ fn upsert_agent(agents: &Agents, key: &str, agent_id: &str, data: &serde_json::V
             o.insert("owner".into(), serde_json::json!(own));
         }
     }
-    agents.lock().unwrap().insert(key.to_string(), Agent { data: d, last: Instant::now() });
+    agents.lock().unwrap().insert(key.to_string(), Agent { data: d, last: std::time::SystemTime::now() });
 }
 
 /// POST /relay/hello — register (or heartbeat) a relay agent.
