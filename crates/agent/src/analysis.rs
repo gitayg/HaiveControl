@@ -65,12 +65,17 @@ fn commands() -> Vec<(&'static str, String)> {
 /// command can't stall the whole analysis cycle.
 fn run(cmd: &str) -> String {
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-    let child = std::process::Command::new(prog)
-        .arg(flag)
+    let mut c = std::process::Command::new(prog);
+    c.arg(flag)
         .arg(cmd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — no flashing console per command
+    }
+    let child = c.spawn();
     let child = match child {
         Ok(c) => c,
         Err(e) => return format!("[error] {e}"),

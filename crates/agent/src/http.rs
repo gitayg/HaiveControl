@@ -466,12 +466,17 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     }
 
     // Run-and-capture, but bounded: wait on a worker thread and time out + kill.
-    let child = std::process::Command::new(prog)
-        .arg(flag)
+    let mut capc = std::process::Command::new(prog);
+    capc.arg(flag)
         .arg(&cmd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        capc.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let child = capc.spawn();
     let child = match child {
         Ok(c) => c,
         Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
