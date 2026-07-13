@@ -142,9 +142,35 @@ pub fn reply_stream(agent_id: &str, req_id: u32, status: u16, ctype: String, rea
     }
 }
 
+/// True once the agent has an active tunnel (dialed in via /relay/hello).
+pub fn is_connected(agent_id: &str) -> bool {
+    registry().lock().unwrap().contains_key(agent_id)
+}
+
+/// Wait up to `budget` for the agent's tunnel to (re)appear, returning it if so.
+/// Covers the brief dark window after a dropped long-poll or a hub redeploy —
+/// the device reloads as "online" from disk but its in-memory tunnel is gone
+/// until it re-sends /relay/hello (within a heartbeat). Beats failing instantly.
+fn wait_for_tunnel(agent_id: &str, budget: Duration) -> Option<Arc<Tunnel>> {
+    let step = Duration::from_millis(150);
+    let mut waited = Duration::ZERO;
+    loop {
+        if let Some(t) = registry().lock().unwrap().get(agent_id).cloned() {
+            return Some(t);
+        }
+        if waited >= budget {
+            return None;
+        }
+        std::thread::sleep(step);
+        waited += step;
+    }
+}
+
 /// Dispatch a request to a relay agent and return a streaming response handle.
 pub fn request(agent_id: &str, method: &str, path: &str, body: Option<(String, Vec<u8>)>) -> Option<RelayResponse> {
-    let tunnel = registry().lock().unwrap().get(agent_id)?.clone();
+    // Tolerate a reconnecting agent (redeploy / dropped poll) instead of an
+    // instant "unreachable" — it re-hellos within a heartbeat.
+    let tunnel = wait_for_tunnel(agent_id, Duration::from_secs(4))?;
     let id = tunnel.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     tunnel.pending.lock().unwrap().insert(id, tx);

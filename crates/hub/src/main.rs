@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.21.0";
+const VERSION: &str = "2.22.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -2445,6 +2445,11 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
                 o.insert("last_seen_secs".to_string(), serde_json::json!(now.duration_since(a.last).unwrap_or_default().as_secs()));
                 o.insert("online".to_string(), serde_json::json!(now.duration_since(a.last).unwrap_or_default() < STALE));
                 o.insert("dissolve_pending".to_string(), serde_json::json!(is_dissolve_pending(key)));
+                // A relay device can be "online" by heartbeat yet have no live
+                // tunnel for a moment (reconnecting after a dropped poll/redeploy).
+                if let Some(id) = key.strip_prefix("relay:") {
+                    o.insert("connected".to_string(), serde_json::json!(relay::is_connected(id)));
+                }
                 if let Some(events) = alog.get(key) {
                     // Only surface accesses within the last 5 minutes.
                     let recent: Vec<serde_json::Value> = events
@@ -2706,6 +2711,7 @@ body.navopen .navback{display:block}
 .arow-arg,.sf-body{width:100%}
 }
 .off-pill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;background:#5a2530;color:#ff9aa2;vertical-align:middle;margin-left:6px}
+.recon-pill{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:5px;background:#5a4a25;color:#ffd59a;vertical-align:middle;margin-left:6px}
 .an-off{font-size:12px;color:#f0b37a;background:rgba(240,150,80,.08);border:1px solid rgba(240,150,80,.25);border-radius:8px;padding:7px 10px;margin-bottom:8px}
 .ov-row:hover td{background:var(--hover,rgba(127,127,127,.08))}
 .ov-nm{font-weight:600;color:var(--text)}
@@ -3020,7 +3026,7 @@ function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
-function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':'');var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
+function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':((relay&&d.connected===false)?' <span class="recon-pill">RECONNECTING</span>':''));var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
 var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];
 function loadAnalysis(target){fetch(API+'/x/analysis?target='+enc(target)).then(function(r){return r.json();}).then(function(j){renderAnalysis(j,target);}).catch(function(){});}
