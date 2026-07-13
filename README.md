@@ -245,11 +245,16 @@ scripts get truncated — fire-and-forget is a future enhancement.) Also availab
 `search_scripts`, `run_script`, and `run_script_fleet`.
 
 **Fleet status.** The sidebar's **📊 Fleet status** opens a whole-fleet overview — one row
-per device, every parameter at a glance: status dot, OS/arch, logged-in user, live CPU load,
-free/total RAM, cores, camera/mic counts, address (LAN or relay), last-seen, and a **🤖⇄**
-marker when an AI agent is on it. A summary strip up top counts online / idle / stale devices,
-shows average CPU load, and how many are being accessed via MCP right now. It's owner-scoped and
-refreshes live; click any row to jump straight into that device's control view.
+per device, every parameter at a glance: status dot, **OS/arch** with an **install-mode** chip
+(`service` / `autostart` / `ephemeral` — how the agent comes back after a reboot), a **presence
+cell** (the logged-in session user with a green/amber/grey dot for active / idle / no-login,
+idle time on hover), live CPU load, free/total RAM, cores, camera/mic counts, address (LAN or
+relay), last-seen, and a **🤖⇄** marker when an AI agent is on it. A summary strip up top counts
+online / idle / stale devices, shows average CPU load, and how many are being accessed via MCP
+right now. It's owner-scoped and refreshes live; click any row to jump straight into that
+device's control view — the detail panel repeats **Install mode** and **Logged in** (user +
+active/idle) in the spec list. Presence is derived per-OS: loginctl + GNOME Mutter IdleMonitor
+(Linux), `query user` (Windows), console user + `ioreg` HIDIdleTime (macOS).
 
 **Audit log.** The sidebar's **📋 Audit log** opens a running record of every device action —
 each row is *when · via (browser/MCP) · action · device · who · detail* (e.g. the exact
