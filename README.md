@@ -128,6 +128,17 @@ entry) removes it. "Dissolve" stops the process and clears autostart — it does
 delete the binary (self-deleting executables are a malware pattern, intentionally
 avoided).
 
+**Windows service mode & Session 0.** `--install` registers a boot/logon **service**
+(Scheduled Task, SYSTEM) — robust, survives logout, starts before login. But Windows
+isolates services in **Session 0**, which has no access to the interactive desktop, so a
+SYSTEM service can't screen-capture or inject input. The agent handles this transparently:
+when it starts as SYSTEM it becomes a **supervisor** and runs the actual agent inside the
+active user's session (a per-user scheduled task with an interactive token), so capture and
+input work; when nobody is logged in it runs in Session 0 so the box stays manageable
+(exec / reports / presence). Exactly one agent runs at a time, under one relay id, so the
+device appears once. `--persist` (per-user autostart) always runs in-session and needs no
+supervisor.
+
 ## Step 3 — connect from the Mac
 
 Open the hub dashboard (`http://localhost:8770/`). The Windows machine appears in the
