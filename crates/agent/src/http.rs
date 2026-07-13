@@ -154,9 +154,9 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
     }
     let resp = match (&method, path.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
-        (Method::Get, "/frame") => match cfg.grabber.grab_jpeg(cfg.quality, cfg.max_width) {
-            Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
-            None => Response::from_string("capture failed").with_status_code(500),
+        (Method::Get, "/frame") => match cfg.grabber.grab(cfg.quality, cfg.max_width) {
+            Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+            Err(reason) => Response::from_string(reason).with_status_code(500),
         },
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {

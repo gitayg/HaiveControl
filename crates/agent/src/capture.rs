@@ -18,17 +18,29 @@ impl Grabber {
     }
 
     pub fn grab_jpeg(&self, quality: u8, max_width: u32) -> Option<Vec<u8>> {
-        let img = self.monitor()?.capture_image().ok()?; // RgbaImage
-        let mut rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-        if max_width > 0 && rgb.width() > max_width {
-            let h = rgb.height() * max_width / rgb.width();
-            rgb = image::imageops::resize(&rgb, max_width, h, image::imageops::FilterType::Triangle);
+        self.grab(quality, max_width).ok()
+    }
+
+    /// Capture → JPEG, or a human-readable reason it couldn't. Tries xcap first
+    /// (X11 + wlroots-Wayland); on a Wayland session where that fails (GNOME/KDE
+    /// have no wlr-screencopy), falls back to the xdg-desktop-portal ScreenCast
+    /// path, whose reason (e.g. "consent pending") is surfaced to the caller.
+    pub fn grab(&self, quality: u8, max_width: u32) -> Result<Vec<u8>, String> {
+        if let Some(img) = self.monitor().and_then(|m| m.capture_image().ok()) {
+            return Ok(encode_rgb(image::DynamicImage::ImageRgba8(img).to_rgb8(), quality, max_width));
         }
-        let (w, h) = (rgb.width(), rgb.height());
-        let mut out = Vec::new();
-        let mut enc = JpegEncoder::new_with_quality(&mut out, quality);
-        enc.encode(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8).ok()?;
-        Some(out)
+        #[cfg(target_os = "linux")]
+        if crate::wayland::is_wayland() {
+            return match crate::wayland::capture_rgb() {
+                Ok((w, h, rgb)) => {
+                    let buf = image::RgbImage::from_raw(w, h, rgb)
+                        .ok_or_else(|| "malformed Wayland frame".to_string())?;
+                    Ok(encode_rgb(buf, quality, max_width))
+                }
+                Err(e) => Err(e.message()),
+            };
+        }
+        Err("capture failed".to_string())
     }
 
     /// (origin_x, origin_y, width, height) — origin assumed 0,0.
@@ -69,6 +81,19 @@ pub fn frame_to_jpeg(cam: &mut nokhwa::Camera, quality: u8) -> Option<Vec<u8>> {
     let mut enc = JpegEncoder::new_with_quality(&mut out, quality);
     enc.encode(img.as_raw(), img.width(), img.height(), image::ExtendedColorType::Rgb8).ok()?;
     Some(out)
+}
+
+/// Resize (if wider than max_width) and JPEG-encode an RGB image.
+fn encode_rgb(mut rgb: image::RgbImage, quality: u8, max_width: u32) -> Vec<u8> {
+    if max_width > 0 && rgb.width() > max_width {
+        let h = rgb.height() * max_width / rgb.width();
+        rgb = image::imageops::resize(&rgb, max_width, h, image::imageops::FilterType::Triangle);
+    }
+    let (w, h) = (rgb.width(), rgb.height());
+    let mut out = Vec::new();
+    let mut enc = JpegEncoder::new_with_quality(&mut out, quality);
+    let _ = enc.encode(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8);
+    out
 }
 
 pub fn camera_snapshot(index: u32, quality: u8) -> Option<Vec<u8>> {

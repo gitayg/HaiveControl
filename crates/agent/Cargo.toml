@@ -32,3 +32,12 @@ portable-pty = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
+# Wayland screen capture on GNOME/KDE (no wlr-screencopy): the xdg-desktop-portal
+# ScreenCast API (D-Bus, via zbus blocking) hands us a PipeWire fd + node, which
+# the pipewire crate streams one frame from. zbus + pipewire are already in the
+# tree (transitive), so this adds no new system libs beyond libpipewire — which
+# every Wayland desktop already ships.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+pipewire = "0.9"

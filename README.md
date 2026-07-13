@@ -58,9 +58,15 @@ Nothing to install to *run* them — they're static native binaries.
 - **macOS** — the agent needs **Screen Recording** and **Accessibility** permission
   (System Settings → Privacy & Security). Unsigned binary: right-click → Open the
   first time to clear Gatekeeper.
-- **Linux** — runs headless (registers with the hub) with no extra libs; input
-  control needs an **X11** session (Wayland unsupported by the capture/input
-  crates). Build deps: `libxcb1-dev libx11-dev libxtst-dev`.
+- **Linux** — runs headless (registers with the hub) with no extra libs. Screen
+  capture works on **X11** and on **wlroots** Wayland (Sway/Hyprland) out of the
+  box. On **GNOME/KDE Wayland** (no wlr-screencopy) it uses the **xdg-desktop-portal
+  ScreenCast** API: the first capture raises a one-time "Share your screen" consent
+  dialog on the device's display — approve it once (with "remember") and every later
+  capture is silent (a `restore_token` is stashed in `~/.haive/screencast.token`).
+  Until consent is given, capture reports "consent pending" rather than a blank error.
+  Input control still needs X11. Build deps: `libxcb1-dev libx11-dev libxtst-dev
+  libpipewire-0.3-dev libdbus-1-dev` (already in CI).
 
 ## Step 1 — start the hub on the Mac
 
