@@ -169,6 +169,8 @@ renders results **in the stage viewport**:
 - **Get file / Put file** — a remote **file browser** to download or upload.
 - **Update** — hot-update this agent to the hub's latest build.
 - **Dissolve** — stop the agent and remove its autostart (does not delete the binary).
+  If the device is **offline**, the dissolve is **queued** and runs automatically on
+  its next connect (the dashboard shows a "⏳ dissolve queued" chip with a Cancel button).
 
 Uploads land in `SCREEN_SHARE` (or the user's home dir if unset); with `SCREEN_SHARE`
 set, browsing/downloads are confined to that folder (`..` is blocked).
