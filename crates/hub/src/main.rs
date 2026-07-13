@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.18.0";
+const VERSION: &str = "2.18.1";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -759,7 +759,7 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("encryption", "linux") => "lsblk -o NAME,FSTYPE,MOUNTPOINT | grep -i crypt || echo 'no LUKS volumes detected'".into(),
         ("firewall", "windows") => "netsh advfirewall show allprofiles state".into(),
         ("firewall", "macos") => "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate".into(),
-        ("firewall", "linux") => "ufw status 2>/dev/null || echo 'ufw not present'".into(),
+        ("firewall", "linux") => "ufw status 2>/dev/null || echo \"ufw is $(systemctl is-active ufw 2>/dev/null || echo not-installed)\"".into(),
         ("firewall_on", "windows") => "netsh advfirewall set allprofiles state on".into(),
         ("firewall_on", "macos") => "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on".into(),
         ("firewall_on", "linux") => "sudo ufw enable".into(),
@@ -771,6 +771,7 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("services", "windows") => ps("Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 40 Name,DisplayName | Format-Table -Auto"),
         ("services", "macos") => "launchctl list | head -40".into(),
         ("services", "linux") => "systemctl list-units --type=service --state=running --no-pager | head -40".into(),
+        ("network", "linux") => "ip neigh".into(),
         ("network", _) => "arp -a".into(),
         ("packages", "windows") => "winget list".into(),
         ("packages", "macos") => "brew list --versions 2>/dev/null || ls /Applications".into(),
@@ -847,7 +848,7 @@ fn posture_pass(kind: &str, out: &str) -> bool {
     match kind {
         "encryption" => n.contains("filevault is on") || n.contains("protection on") || n.contains("percentage encrypted: 100") || n.contains("crypt"),
         // Windows lists a State per profile — pass only if one is ON and none OFF.
-        "firewall" => (n.contains("state on") && !n.contains("state off")) || n.contains("state = 1") || n.contains("firewall is enabled") || n.contains("status: active"),
+        "firewall" => (n.contains("state on") && !n.contains("state off")) || n.contains("state = 1") || n.contains("firewall is enabled") || n.contains("status: active") || n.contains("ufw is active"),
         "av" => n.contains("antivirusenabled : true") || n.contains("realtimeprotectionenabled : true") || n.contains("assessments enabled"),
         "updates" => n.contains("no new software") || n.contains("no applicable") || n.contains("no installed package") || out.lines().count() <= 2,
         _ => false,
