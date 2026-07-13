@@ -413,6 +413,18 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
 the agent sends it (`--relay-token` or `HIVE_RELAY_TOKEN`); wrong/absent → `401`. Unset =
 open (trusted LAN / dev). Query-string tokens on bypass paths aren't logged by the proxy.
 
+**Relay reliability.** The tunnel is HTTP long-poll, so it can be torn down between
+commands (proxy/NAT idle timeout, or a hub redeploy that clears the in-memory tunnel
+registry). To keep that from surfacing as spurious "unreachable":
+- The agent heartbeats every **10s** (app-level keepalive under proxy/NAT idle windows)
+  and, the instant a poll fails, re-registers at a steady ~½s cadence until the hub
+  answers — so its tunnel is back within ~½s of the hub returning, not on the next
+  heartbeat.
+- The hub **waits up to ~4s** for a reconnecting agent's tunnel before declaring it
+  unreachable, absorbing redeploy/blip gaps (one central retry for every relay call).
+- The dashboard shows a **RECONNECTING** pill (device is heartbeat-online but has no live
+  tunnel this moment) distinct from **OFFLINE**, via a `connected` flag on `/agents`.
+
 **Per-user devices (multi-user hub).** When AppCrane forwards the authenticated user
 (`X-AppCrane-User-Email`), the hub scopes everything to that user: the device list
 (`/agents` + dashboard) shows only devices they own, and device actions (`/x/*`) are

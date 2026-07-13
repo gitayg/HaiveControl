@@ -69,11 +69,13 @@ pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_js
     }
     println!("relay: connected to {base} as {relay_id}");
 
-    // Heartbeat: re-send HELLO (fresh CPU/RAM) so the hub keeps us live.
+    // Heartbeat: re-send HELLO (fresh CPU/RAM) so the hub keeps us live. 10s keeps
+    // us well inside the hub's staleness window (tolerates a few missed beats) and
+    // acts as an app-level keepalive so NAT/proxy idle timeouts don't drop us.
     {
         let (b, rid, nm, si, tk) = (base.clone(), relay_id.clone(), name.clone(), sysinfo.clone(), token.clone());
         std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(15));
+            std::thread::sleep(Duration::from_secs(10));
             let _ = post_hello(&b, &rid, &nm, &si, &tk);
         });
     }
@@ -91,7 +93,21 @@ pub fn relay_loop(hub: String, relay_id: String, name: String, sysinfo: serde_js
                     std::thread::spawn(move || handle_req(&b, &rid, &tk, &body));
                 }
             }
-            Err(_) => std::thread::sleep(Duration::from_secs(3)),
+            Err(_) => {
+                // A failed poll means the tunnel dropped (hub redeploy, NAT/proxy
+                // reset). Re-register at a steady fast cadence until the hub
+                // answers — recreating our tunnel within ~½s of it coming back,
+                // not on the next 10s heartbeat — so the hub's wait-for-reconnect
+                // lands the command instead of reporting us unreachable. Jitter
+                // keeps a fleet from reconnecting in lockstep.
+                while !post_hello(&base, &relay_id, &name, &sysinfo, &token) {
+                    let jitter = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| (d.subsec_nanos() as u64) % 250)
+                        .unwrap_or(0);
+                    std::thread::sleep(Duration::from_millis(500 + jitter));
+                }
+            }
         }
     }
 }
