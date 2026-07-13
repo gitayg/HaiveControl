@@ -154,10 +154,7 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
     }
     let resp = match (&method, path.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
-        (Method::Get, "/frame") => match cfg.grabber.grab(cfg.quality, cfg.max_width) {
-            Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
-            Err(reason) => Response::from_string(reason).with_status_code(500),
-        },
+        (Method::Get, "/frame") => frame_ep(cfg),
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {
             input_ep(&mut req, tx);
@@ -310,6 +307,24 @@ fn shell_read_ep(url: &str) -> Resp {
     match crate::shell::read_from(&sid, from, std::time::Duration::from_secs(10)) {
         Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "text/plain; charset=utf-8")),
         None => Response::from_string("no shell session").with_status_code(404),
+    }
+}
+
+/// GET /frame → JPEG. On a Windows session-0 service (no desktop access) the grab
+/// is delegated to the active user's session; otherwise we capture directly. The
+/// service stays online either way — only the screenshot fails if delegation can't.
+fn frame_ep(cfg: &Config) -> Resp {
+    #[cfg(windows)]
+    if crate::winsession::is_session0() {
+        return match crate::winsession::capture_once() {
+            Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+            None => Response::from_string("Windows session 0: no interactive user session to capture (nobody logged in?)")
+                .with_status_code(500),
+        };
+    }
+    match cfg.grabber.grab(cfg.quality, cfg.max_width) {
+        Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+        Err(reason) => Response::from_string(reason).with_status_code(500),
     }
 }
 

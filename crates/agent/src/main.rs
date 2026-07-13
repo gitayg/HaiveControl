@@ -65,14 +65,10 @@ struct Args {
     /// re-launch detached and exit, so you can close this window
     #[arg(long)]
     background: bool,
-    /// internal: this instance is spawned + supervised by a session-0 service, so
-    /// it runs the agent directly instead of re-entering the supervisor.
-    #[arg(long, hide = true)]
-    managed: bool,
-    /// internal: force this relay id (the supervisor pins one id across the
-    /// session-0 fallback and the per-user worker, so the device shows up once).
-    #[arg(long, hide = true, value_name = "ID")]
-    relay_id: Option<String>,
+    /// internal: grab one screen frame to this file (JPEG) and exit. Used by the
+    /// Windows session-0 service to capture from the active user's session.
+    #[arg(long, hide = true, value_name = "FILE")]
+    capture_once: Option<String>,
 }
 
 /// If `--background` was given, re-spawn ourselves detached (no console, no
@@ -339,6 +335,23 @@ fn main() {
         return;
     }
 
+    // One-shot capture mode: grab a single frame to a file and exit. The Windows
+    // session-0 service invokes this inside the active user's session (which can
+    // reach the desktop) and reads back the file.
+    if let Some(file) = args.capture_once.clone() {
+        let quality: u8 = env_or("SCREEN_QUALITY", "60").parse().unwrap_or(60);
+        let max_width: u32 = env_or("SCREEN_MAXW", "1600").parse().unwrap_or(1600);
+        let monitor: usize = env_or("SCREEN_MONITOR", "0").parse().unwrap_or(0);
+        let g = capture::Grabber { index: monitor };
+        match g.grab(quality, max_width) {
+            Ok(bytes) => {
+                let _ = std::fs::write(&file, bytes);
+                std::process::exit(0);
+            }
+            Err(_) => std::process::exit(1),
+        }
+    }
+
     let mac_id = args.mac_id.clone().or_else(|| std::env::var("SCREEN_HUB").ok());
     if mac_id.is_none() && args.relay.is_none() {
         eprintln!("usage: HaiveControl <mac-id> [password] [--name N] [--persist | --ttl MIN] [--relay HOST[:PORT]]");
@@ -359,36 +372,6 @@ fn main() {
         .clone()
         .or_else(|| std::env::var("SCREEN_NAME").ok())
         .unwrap_or_else(hostname);
-
-    // Windows Session 0: a relay service runs as SYSTEM in session 0, which can't
-    // reach the interactive desktop (no screen capture / input). Become a
-    // supervisor that runs the agent inside the active user's session instead.
-    #[cfg(windows)]
-    if args.relay.is_some() && !args.managed && winsession::is_system_service() {
-        let rid = relay_id(&name);
-        let mut wargs: Vec<String> = vec!["--relay".into(), args.relay.clone().unwrap()];
-        let tok = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
-        if !tok.is_empty() {
-            wargs.push("--relay-token".into());
-            wargs.push(tok);
-        }
-        if let Some(o) = args.owner.clone().or_else(|| std::env::var("HIVE_OWNER").ok()).filter(|s| !s.is_empty()) {
-            wargs.push("--owner".into());
-            wargs.push(o);
-        }
-        wargs.push("--name".into());
-        wargs.push(name.clone());
-        wargs.push("--managed".into());
-        wargs.push("--relay-id".into());
-        wargs.push(rid);
-        winsession::supervise(wargs); // never returns
-    }
-    // A supervised worker/fallback is a singleton: if another already holds the
-    // serving port (e.g. an ONLOGON trigger racing the supervisor), bow out.
-    #[cfg(windows)]
-    if args.managed && std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-        return;
-    }
 
     let grabber = capture::Grabber { index: monitor };
     let geo = grabber.geometry();
@@ -449,7 +432,7 @@ fn main() {
     }
     let mut direct_token = String::new();
     if let Some(relay_addr) = args.relay.clone() {
-        let rid = args.relay_id.clone().unwrap_or_else(|| relay_id(&name));
+        let rid = relay_id(&name);
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
         direct_token = agent_direct_token(&token, &rid);
