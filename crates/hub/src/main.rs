@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.19.0";
+const VERSION: &str = "2.20.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -210,6 +210,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
+        (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
@@ -325,6 +326,10 @@ fn owner_id(email: &str) -> String {
 /// pre-hashed ids interoperate and all resolve to one stable key.
 pub(crate) fn canon_owner(s: &str) -> String {
     let t = s.trim();
+    // An enrollment token resolves to the owner id it was issued for.
+    if let Some(owner) = resolve_owner_token(t) {
+        return owner;
+    }
     if t.contains('@') {
         owner_id(t)
     } else {
@@ -1035,6 +1040,7 @@ fn load_state(agents: &Agents) {
         }
     }
     load_pending();
+    load_owner_tokens();
 }
 
 /// Remove a device (and its analysis) from the inventory + disk — the manual
@@ -1082,6 +1088,80 @@ pub(crate) fn clear_pending_dissolve(key: &str) -> bool {
     let removed = pending_dissolve().lock().unwrap().remove(key);
     if removed { save_pending(); }
     removed
+}
+
+// ---- Per-owner enrollment tokens ---------------------------------------------
+// An owner enrolls devices with `--owner <htok_…>` instead of their raw owner id
+// (a UUIDv5 of their email). The token maps to that same owner id, so devices
+// still scope to the account, but the credential on each device command line is
+// an opaque, rotatable token — not the derivable email/uuid. Resolved in
+// `canon_owner`, so it works at every entry (device --owner, MCP ?owner=).
+
+/// Unguessable enrollment token: 18 bytes of OS randomness, hex, `htok_`-prefixed.
+fn rand_token() -> String {
+    let mut buf = [0u8; 18];
+    use std::io::Read;
+    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).is_err() {
+        // Dev-only fallback (no /dev/urandom): time + stack-address entropy.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let seed = format!("{}-{:p}-{}", t.as_nanos(), &buf as *const _, std::process::id());
+        let d = <sha2::Sha256 as sha2::Digest>::digest(seed.as_bytes());
+        buf.copy_from_slice(&d[..18]);
+    }
+    let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+    format!("htok_{hex}")
+}
+
+fn owner_tokens() -> &'static Mutex<HashMap<String, String>> {
+    static T: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn owner_tokens_path() -> std::path::PathBuf { data_dir().join("owner_tokens.json") }
+fn save_owner_tokens() {
+    let _ = std::fs::create_dir_all(data_dir());
+    let m = owner_tokens().lock().unwrap();
+    let _ = std::fs::write(owner_tokens_path(), serde_json::to_string(&*m).unwrap_or_default());
+}
+fn load_owner_tokens() {
+    if let Ok(txt) = std::fs::read_to_string(owner_tokens_path()) {
+        if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&txt) {
+            *owner_tokens().lock().unwrap() = m;
+        }
+    }
+}
+/// The owner id an enrollment token maps to, if any.
+fn resolve_owner_token(tok: &str) -> Option<String> {
+    owner_tokens().lock().unwrap().get(tok).cloned()
+}
+/// The current enrollment token for `owner`, minting + persisting one if none.
+fn enroll_token_for(owner: &str) -> String {
+    if let Some(t) = owner_tokens().lock().unwrap().iter().find(|(_, o)| o.as_str() == owner).map(|(t, _)| t.clone()) {
+        return t;
+    }
+    let t = rand_token();
+    owner_tokens().lock().unwrap().insert(t.clone(), owner.to_string());
+    save_owner_tokens();
+    t
+}
+/// Invalidate every token for `owner` and mint a fresh one. Devices already
+/// enrolled are unaffected (they stored the resolved owner id, not the token).
+fn rotate_enroll_token(owner: &str) -> String {
+    owner_tokens().lock().unwrap().retain(|_, o| o.as_str() != owner);
+    let t = rand_token();
+    owner_tokens().lock().unwrap().insert(t.clone(), owner.to_string());
+    save_owner_tokens();
+    t
+}
+
+/// GET /x/enroll-token — the caller's enrollment token (mint if none); `?rotate=1`
+/// issues a fresh one. Owner comes from SSO, so this is per-account.
+fn enroll_token_ep(url: &str, user: Option<&str>) -> Resp {
+    let owner = match user.filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no owner context (hub is not behind SSO)"})),
+    };
+    let tok = if query_param(url, "rotate").is_some() { rotate_enroll_token(owner) } else { enroll_token_for(owner) };
+    json_resp(&serde_json::json!({"ok": true, "token": tok, "owner": owner}))
 }
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
@@ -2418,8 +2498,9 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
                 Ok(t) if !t.is_empty() => format!(" --relay-token {t}"),
                 _ => String::new(),
             };
-            // Tag the device with the logged-in user so it lists only for them.
-            let own = user.map(|u| format!(" --owner {u}")).unwrap_or_default();
+            // Tag the device with the logged-in owner's enrollment token, so it
+            // lists only for them — the token resolves to their owner id on the hub.
+            let own = user.map(|u| format!(" --owner {}", enroll_token_for(u))).unwrap_or_default();
             let ex = format!("{tok}{own}");
             (
                 cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --background")),
@@ -2474,7 +2555,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <main class=\"stage\">\
-<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{win}{mac}{lin}</div>\
+<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{win}{mac}{lin}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
 <div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
@@ -2830,6 +2911,7 @@ function esc2(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 function attrEsc(s){return esc2(s).replace(/"/g,'&quot;');}
 function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(1)+' GB';}
 function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';}}
+function rotateEnrollTok(){if(!confirm('Rotate your enrollment token? The old token stops working for new enrollments. Devices already enrolled are unaffected.'))return;fetch(API+'/x/enroll-token?rotate=1').then(function(r){return r.json();}).then(function(j){if(j&&j.ok){location.reload();}else{alert((j&&j.error)||'rotate failed');}}).catch(function(e){alert('error: '+e);});}
 /* ---- devices ---- */
 var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
