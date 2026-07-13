@@ -12,6 +12,8 @@ mod relay;
 mod schedule;
 mod shell;
 mod tls;
+#[cfg(target_os = "linux")]
+mod wayland;
 
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
