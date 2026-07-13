@@ -8,6 +8,7 @@ mod discovery;
 mod http;
 mod input;
 mod persistence;
+mod presence;
 mod relay;
 mod schedule;
 mod shell;
@@ -194,6 +195,7 @@ fn collect_sysinfo() -> serde_json::Value {
         "os": os,
         "arch": std::env::consts::ARCH,
         "platform": std::env::consts::OS,
+        "install_mode": persistence::current_mode(),
         "agent_version": VERSION,
         "hostname": host,
         "user": user,
@@ -222,7 +224,14 @@ pub(crate) fn live_metrics() -> serde_json::Value {
     };
     sys.refresh_memory();
     let free_gb = (sys.available_memory() as f64 / 1_073_741_824.0 * 10.0).round() / 10.0;
-    serde_json::json!({ "cpu_pct": cpu_pct, "free_gb": free_gb })
+    let mut m = serde_json::json!({ "cpu_pct": cpu_pct, "free_gb": free_gb });
+    // Merge in who's-at-the-machine (logged_in / session_user / idle_secs / active).
+    if let (Some(obj), Some(p)) = (m.as_object_mut(), presence::snapshot().as_object()) {
+        for (k, v) in p {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    m
 }
 
 #[cfg(target_os = "macos")]

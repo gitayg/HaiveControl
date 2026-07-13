@@ -29,6 +29,61 @@ pub fn install_service(args: &[String]) {
     let _ = (&exe, args);
 }
 
+/// How this agent will come back after a reboot, by checking which autostart
+/// artifact exists: "service" (boot/logon daemon), "autostart" (per-user), or
+/// "ephemeral" (nothing — dies with the session). Surfaced in the inventory.
+pub fn current_mode() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        if daemon_path().exists() {
+            return "service";
+        }
+        if plist_path().exists() {
+            return "autostart";
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if unit_path().exists() {
+            return "service";
+        }
+        if desktop_path().exists() {
+            return "autostart";
+        }
+    }
+    #[cfg(windows)]
+    {
+        if win_task_exists() {
+            return "service";
+        }
+        if win_run_exists() {
+            return "autostart";
+        }
+    }
+    "ephemeral"
+}
+
+#[cfg(windows)]
+fn win_task_exists() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "HaiveControl"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn win_run_exists() -> bool {
+    use winreg::enums::*;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .and_then(|k| k.get_value::<String, _>("HaiveControl"))
+        .is_ok()
+}
+
 pub fn uninstall() {
     #[cfg(windows)]
     {
