@@ -80,6 +80,22 @@ pub fn hello(agents: &Agents, data: serde_json::Value) {
     if fresh {
         println!("relay: {agent_id} connected");
     }
+    // Dissolve-on-next-connect: if this device was queued to dissolve while
+    // offline, deliver it now. Claim it atomically (clear returns true only for
+    // the first heartbeat) and dispatch on a separate thread — the dissolve reply
+    // can take up to 65s and must not block this heartbeat handler. Re-queue if
+    // the dispatch fails so a later heartbeat retries.
+    let key = format!("relay:{agent_id}");
+    if crate::clear_pending_dissolve(&key) {
+        let id = agent_id.clone();
+        std::thread::spawn(move || {
+            if request(&id, "POST", "/dissolve", None).is_some() {
+                println!("relay: {id} dissolved (queued while offline)");
+            } else {
+                crate::queue_dissolve(&format!("relay:{id}"));
+            }
+        });
+    }
 }
 
 /// GET /relay/poll — block up to `timeout` for the next request; JSON or None.

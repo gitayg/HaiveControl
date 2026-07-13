@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.18.2";
+const VERSION: &str = "2.19.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -209,6 +209,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
@@ -281,6 +282,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
@@ -706,9 +708,30 @@ fn proxy_update(url: &str, agents: &Agents, hub_ip: &str, hub_port: u16) -> Resp
 fn proxy_dissolve(url: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     match dev_unary(&target, "POST", "/dissolve", None) {
-        Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "text/plain")),
-        None => Response::from_string("dissolve failed").with_status_code(502),
+        Some((_st, _ct, b)) => {
+            // Reached it now — drop any stale queued dissolve for this device.
+            clear_pending_dissolve(&device_key(&target));
+            Response::from_data(b).with_header(hdr("Content-Type", "text/plain"))
+        }
+        // Offline / unreachable: queue it so it fires when the agent next connects,
+        // instead of failing outright (the old 502 "dissolve failed").
+        None => {
+            queue_dissolve(&device_key(&target));
+            Response::from_string("device offline — dissolve queued; it will run on the device's next connect")
+                .with_header(hdr("Content-Type", "text/plain"))
+        }
     }
+}
+
+/// Cancel a dissolve that was queued for an offline device.
+fn cancel_dissolve(url: &str) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    let msg = if clear_pending_dissolve(&device_key(&target)) {
+        "queued dissolve cancelled"
+    } else {
+        "no dissolve was queued for this device"
+    };
+    Response::from_string(msg).with_header(hdr("Content-Type", "text/plain"))
 }
 
 fn proxy_camera(url: &str) -> Resp {
@@ -1011,6 +1034,7 @@ fn load_state(agents: &Agents) {
             }
         }
     }
+    load_pending();
 }
 
 /// Remove a device (and its analysis) from the inventory + disk — the manual
@@ -1019,7 +1043,45 @@ fn forget_device(agents: &Agents, target: &str) {
     let key = device_key(target);
     agents.lock().unwrap().remove(&key);
     analysis_store().lock().unwrap().remove(&key);
+    clear_pending_dissolve(&key);
     save_state(agents);
+}
+
+/// Devices queued to dissolve on their next connect — Dissolve was clicked while
+/// they were offline. Keyed by the agents-map key (`relay:id` or LAN ip) and
+/// persisted to HUB_DATA so the queue survives a hub redeploy/restart.
+fn pending_dissolve() -> &'static Mutex<std::collections::HashSet<String>> {
+    static P: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    P.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+fn pending_dissolve_path() -> std::path::PathBuf { data_dir().join("pending_dissolve.json") }
+fn save_pending() {
+    let _ = std::fs::create_dir_all(data_dir());
+    let v: Vec<String> = pending_dissolve().lock().unwrap().iter().cloned().collect();
+    let _ = std::fs::write(pending_dissolve_path(), serde_json::to_string(&v).unwrap_or_default());
+}
+fn load_pending() {
+    if let Ok(txt) = std::fs::read_to_string(pending_dissolve_path()) {
+        if let Ok(arr) = serde_json::from_str::<Vec<String>>(&txt) {
+            *pending_dissolve().lock().unwrap() = arr.into_iter().collect();
+        }
+    }
+}
+/// Queue a dissolve for `key` (device offline now); fires on its next connect.
+pub(crate) fn queue_dissolve(key: &str) {
+    pending_dissolve().lock().unwrap().insert(key.to_string());
+    save_pending();
+}
+pub(crate) fn is_dissolve_pending(key: &str) -> bool {
+    pending_dissolve().lock().unwrap().contains(key)
+}
+/// Remove `key` from the queue, returning whether it was present. Used both to
+/// cancel a queued dissolve and to atomically claim it for delivery (so a burst
+/// of heartbeats only dispatches the dissolve once).
+pub(crate) fn clear_pending_dissolve(key: &str) -> bool {
+    let removed = pending_dissolve().lock().unwrap().remove(key);
+    if removed { save_pending(); }
+    removed
 }
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
@@ -2302,6 +2364,7 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
             if let Some(o) = d.as_object_mut() {
                 o.insert("last_seen_secs".to_string(), serde_json::json!(now.duration_since(a.last).unwrap_or_default().as_secs()));
                 o.insert("online".to_string(), serde_json::json!(now.duration_since(a.last).unwrap_or_default() < STALE));
+                o.insert("dissolve_pending".to_string(), serde_json::json!(is_dissolve_pending(key)));
                 if let Some(events) = alog.get(key) {
                     // Only surface accesses within the last 5 minutes.
                     let recent: Vec<serde_json::Value> = events
@@ -2910,7 +2973,8 @@ if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera
 var term='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
 var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button><button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button><button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
+var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
+var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+dbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
 return groups+actionListHtml();}
@@ -2944,7 +3008,8 @@ function doGet(){openFb(SEL,'get');}
 function doPut(){openFb(SEL,'put');}
 function doUpd(){if(!confirm('Update the agent on this device to the latest build?'))return;out('updating…');fetch(API+'/x/update?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
 function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
-function doDis(){if(!confirm('Dissolve the agent on this device? It will stop and remove its autostart.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
+function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
+function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 /* ---- file browser ---- */
 var fbBase=null,fbMode=null,fbPath='',fbParent='';
 function openFb(b,mode){fbBase=b;fbMode=mode;document.getElementById('fb').style.display='flex';fbLoad('');}
