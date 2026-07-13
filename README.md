@@ -131,13 +131,13 @@ avoided).
 **Windows service mode & Session 0.** `--install` registers a boot/logon **service**
 (Scheduled Task, SYSTEM) — robust, survives logout, starts before login. But Windows
 isolates services in **Session 0**, which has no access to the interactive desktop, so a
-SYSTEM service can't screen-capture or inject input. The agent handles this transparently:
-when it starts as SYSTEM it becomes a **supervisor** and runs the actual agent inside the
-active user's session (a per-user scheduled task with an interactive token), so capture and
-input work; when nobody is logged in it runs in Session 0 so the box stays manageable
-(exec / reports / presence). Exactly one agent runs at a time, under one relay id, so the
-device appears once. `--persist` (per-user autostart) always runs in-session and needs no
-supervisor.
+SYSTEM service can't screen-capture directly. The service keeps running normally in Session 0
+— always connected, self-updating, with exec / reports / presence fully working — and
+**delegates only screen capture** to the logged-in user's session on demand: a `/frame`
+request runs a one-shot capture (`--capture-once`) via a scheduled task with an interactive
+token, and returns that image. If nobody is logged in the screenshot fails, but the device
+stays online and manageable. `--persist` (per-user autostart) always runs in-session and
+captures directly.
 
 ## Step 3 — connect from the Mac
 
