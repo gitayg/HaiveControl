@@ -411,12 +411,23 @@ open (trusted LAN / dev). Query-string tokens on bypass paths aren't logged by t
 (`X-AppCrane-User-Email`), the hub scopes everything to that user: the device list
 (`/agents` + dashboard) shows only devices they own, and device actions (`/x/*`) are
 refused (`403`) on devices they don't. Ownership comes from the `owner` a device registered
-with — the dashboard bakes `--owner <you>` into the install command it shows, so a device a
-user enrolls is automatically theirs. No user header (LAN/dev) = full access, as before.
+with — the dashboard bakes a per-account **enrollment token** (`--owner htok_…`) into the
+install command it shows, so a device a user enrolls is automatically theirs. No user header
+(LAN/dev) = full access, as before.
 
-> The `owner` is self-asserted by the agent, so it's a **visibility/soft boundary** — a
-> holder of the shared `RELAY_TOKEN` could plant a device under another owner. Per-user
-> relay tokens (token → identity) would make it a hard boundary; a reasonable next step.
+**Enrollment tokens.** Instead of putting the raw owner id (a UUIDv5 of the email) on every
+device command line, each account gets an opaque enrollment token. The token maps to the
+owner id on the hub (resolved in `canon_owner`, persisted to `HUB_DATA/owner_tokens.json`),
+so a device enrolled with `--owner htok_…` scopes to that account. The token is minted on
+first view and shown in **+ Add device**; **Rotate token** there issues a fresh one and
+stops the old one working for *new* enrollments — devices already enrolled keep their scope
+(they stored the resolved owner id, not the token). `GET /x/enroll-token[?rotate=1]` (behind
+SSO) is the API. An email or a raw owner id still works as `--owner`, for backward compat.
+
+> The `owner` is still self-asserted at the transport level (any holder of the shared
+> `RELAY_TOKEN` could send an `owner`), so it's a **visibility/soft boundary**. The
+> enrollment token narrows this: the value on the device is now an opaque, rotatable
+> credential rather than the derivable email/uuid.
 
 ## Config (environment variables)
 
