@@ -12,7 +12,11 @@ path = "src/main.rs"
 tiny_http = { version = "0.12", features = ["ssl-rustls"] }
 xcap = "0.9"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
-enigo = "0.2"
+# Pure-Rust X11 (XTEST) backend instead of the default `xdo` feature, which
+# hard-links libxdo.so.3 and makes the binary fail to load on a bare Ubuntu
+# server that lacks libxdo3. x11rb needs no shared lib at load time; input
+# still works over $DISPLAY, and Enigo::new() degrades gracefully when headless.
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
 rcgen = "0.13"
 sha2 = "0.10"
 mdns-sd = "0.11"

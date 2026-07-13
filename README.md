@@ -58,8 +58,9 @@ Nothing to install to *run* them — they're static native binaries.
 - **macOS** — the agent needs **Screen Recording** and **Accessibility** permission
   (System Settings → Privacy & Security). Unsigned binary: right-click → Open the
   first time to clear Gatekeeper.
-- **Linux** — needs an **X11** session (Wayland unsupported by the capture/input
-  crates). Build deps: `libxdo-dev libxcb1-dev libx11-dev libxtst-dev`.
+- **Linux** — runs headless (registers with the hub) with no extra libs; input
+  control needs an **X11** session (Wayland unsupported by the capture/input
+  crates). Build deps: `libxcb1-dev libx11-dev libxtst-dev`.
 
 ## Step 1 — start the hub on the Mac
 
