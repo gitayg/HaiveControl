@@ -159,6 +159,30 @@ fn capture_rgb_inner() -> Result<(u32, u32, Vec<u8>), CaptureErr> {
         .ok_or_else(|| CaptureErr::Unavailable("no session_handle".into()))?;
     let session_path = OwnedObjectPath::try_from(session).map_err(err)?;
 
+    // Run SelectSources/Start/capture, then ALWAYS close the session — GNOME 46's
+    // portal SEGV-crashes if a new ScreenCast session is created while a prior one
+    // is still open, so a leaked session breaks every later capture.
+    let mut counter = 100u32;
+    let outcome = run_capture(&conn, &portal, &unique, &session_path, &mut counter);
+    close_session(&conn, &session_path);
+    drop(conn);
+    outcome
+}
+
+/// SelectSources → Start (raises the consent dialog first time) → OpenPipeWireRemote
+/// → one PipeWire frame. Split out so the caller can always close the session after.
+fn run_capture(
+    conn: &Connection,
+    portal: &Proxy,
+    unique: &str,
+    session_path: &OwnedObjectPath,
+    counter: &mut u32,
+) -> Result<(u32, u32, Vec<u8>), CaptureErr> {
+    let mut new_token = |prefix: &str| {
+        *counter += 1;
+        format!("haive_{prefix}_{}", *counter)
+    };
+
     // --- SelectSources (monitor, embedded cursor, persistent) ----------------
     let ht = new_token("r");
     let restore = load_restore_token();
@@ -171,13 +195,13 @@ fn capture_rgb_inner() -> Result<(u32, u32, Vec<u8>), CaptureErr> {
     if let Some(ref t) = restore {
         opts.insert("restore_token", Value::from(t.clone()));
     }
-    portal_request(&conn, &portal, &unique, &ht, "SelectSources", &(&session_path, opts))?;
+    portal_request(conn, portal, unique, &ht, "SelectSources", &(session_path, opts))?;
 
     // --- Start (this is what raises the consent dialog the first time) --------
     let ht = new_token("r");
     let mut opts: HashMap<&str, Value> = HashMap::new();
     opts.insert("handle_token", Value::from(ht.clone()));
-    let results = portal_request(&conn, &portal, &unique, &ht, "Start", &(&session_path, "", opts))?;
+    let results = portal_request(conn, portal, unique, &ht, "Start", &(session_path, "", opts))?;
 
     // Persist the restore_token so the next capture skips the dialog.
     if let Some(tok) = results.get("restore_token").and_then(|v| String::try_from(v.try_clone().ok()?).ok()) {
@@ -189,13 +213,23 @@ fn capture_rgb_inner() -> Result<(u32, u32, Vec<u8>), CaptureErr> {
 
     // --- OpenPipeWireRemote → an fd we stream the node from ------------------
     let fd: zbus::zvariant::OwnedFd = portal
-        .call("OpenPipeWireRemote", &(&session_path, HashMap::<&str, Value>::new()))
+        .call("OpenPipeWireRemote", &(session_path, HashMap::<&str, Value>::new()))
         .map_err(err)?;
 
-    // Keep `conn` (and thus the portal session) alive across the pipewire capture.
-    let frame = pw_capture_one(fd, node_id);
-    drop(conn);
-    frame
+    pw_capture_one(fd, node_id)
+}
+
+/// Best-effort close of a portal session so GNOME doesn't accumulate (and crash on)
+/// dangling ScreenCast sessions.
+fn close_session(conn: &Connection, session_path: &OwnedObjectPath) {
+    if let Ok(p) = Proxy::new(
+        conn,
+        "org.freedesktop.portal.Desktop",
+        session_path.as_ref(),
+        "org.freedesktop.portal.Session",
+    ) {
+        let _ = p.call::<_, _, ()>("Close", &());
+    }
 }
 
 /// Call a portal method that returns a Request handle, then block for its
