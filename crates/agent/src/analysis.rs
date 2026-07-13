@@ -52,10 +52,10 @@ fn commands() -> Vec<(&'static str, String)> {
             ("packages", "apt list --installed 2>/dev/null | head -60 || dpkg -l | head -60".into()),
             ("services", "systemctl list-units --type=service --state=running --no-pager | head -40".into()),
             ("processes", "ps aux 2>/dev/null | sort -rk3 | head -25".into()),
-            ("network", "arp -a".into()),
+            ("network", "ip neigh".into()),
             ("updates", "apt list --upgradable 2>/dev/null".into()),
             ("encryption", "lsblk -o NAME,FSTYPE,MOUNTPOINT | grep -i crypt || echo 'no LUKS volumes detected'".into()),
-            ("firewall", "ufw status 2>/dev/null || echo 'ufw not present'".into()),
+            ("firewall", "ufw status 2>/dev/null || echo \"ufw is $(systemctl is-active ufw 2>/dev/null || echo not-installed)\"".into()),
             ("av", "clamscan --version 2>/dev/null || echo 'no clamav installed'".into()),
         ],
     }
