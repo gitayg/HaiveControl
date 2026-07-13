@@ -226,8 +226,11 @@ fn update_ep(req: &mut Request) -> Resp {
     Response::from_string(format!("updated ({} bytes); restarting", bytes.len()))
 }
 
-/// Replace the running executable with `bytes` and spawn the new one (same args).
-/// The caller is responsible for exiting this process afterwards.
+/// Replace the running executable with `bytes` and restart it (same args). On
+/// Unix this `execv`s in place (same PID, inherited env + fds; the old listening
+/// socket closes on exec) — which avoids the spawn-then-exit race where the new
+/// process tried to bind :8765 before the old one released it and panicked with
+/// AddrInUse. On Windows it spawns a fresh process; the caller then exits.
 pub(crate) fn apply_update(bytes: &[u8]) -> bool {
     let tmp = std::env::temp_dir().join("airm-update.bin");
     if std::fs::write(&tmp, bytes).is_err() {
@@ -237,10 +240,15 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
         return false;
     }
     let _ = std::fs::remove_file(&tmp);
-    if let Ok(exe) = std::env::current_exe() {
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        let _ = std::process::Command::new(exe).args(args).spawn();
+    let Ok(exe) = std::env::current_exe() else { return true };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec() only returns on failure; on success it never comes back.
+        let _ = std::process::Command::new(&exe).args(&args).exec();
     }
+    let _ = std::process::Command::new(&exe).args(&args).spawn();
     true
 }
 
