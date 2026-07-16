@@ -3,18 +3,44 @@
 // so it lives alongside the live CPU/RAM metrics rather than the static sysinfo.
 use std::process::Command;
 
-/// { logged_in, session_user, idle_secs, active } — active = touched in the last
-/// 5 min. idle_secs / active are null when the platform can't report idle time
-/// (e.g. a headless service with no session bus).
+/// { logged_in, session_user, idle_secs, active, locked } — active = touched in
+/// the last 5 min. idle_secs / active are null when the platform can't report idle
+/// time (e.g. a headless service with no session bus); locked is null where we
+/// can't tell. Being logged in is NOT the same as being at the machine: a locked
+/// box reports logged_in with a session user, so surface `locked` separately and
+/// never call a locked machine "active".
 pub fn snapshot() -> serde_json::Value {
     let (logged_in, user, idle) = probe();
-    let active = idle.map(|s| s < 300);
+    let locked = locked();
+    let active = if locked == Some(true) { Some(false) } else { idle.map(|s| s < 300) };
     serde_json::json!({
         "logged_in": logged_in,
         "session_user": user,
         "idle_secs": idle,
         "active": active,
+        "locked": locked,
     })
+}
+
+/// Whether the screen is locked, where we can tell.
+#[cfg(windows)]
+fn locked() -> Option<bool> {
+    Some(crate::winsession::workstation_locked())
+}
+
+/// GNOME reports lock/blank state on the session bus; other desktops vary, so
+/// treat an unavailable service as "unknown" rather than "unlocked".
+#[cfg(all(unix, not(target_os = "macos")))]
+fn locked() -> Option<bool> {
+    use zbus::blocking::{Connection, Proxy};
+    let conn = Connection::session().ok()?;
+    let p = Proxy::new(&conn, "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver").ok()?;
+    p.call("GetActive", &()).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn locked() -> Option<bool> {
+    None
 }
 
 #[cfg(target_os = "macos")]
