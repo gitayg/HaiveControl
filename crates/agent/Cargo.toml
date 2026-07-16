@@ -32,6 +32,18 @@ portable-pty = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# Session 0 isolation: a SYSTEM service can't reach the interactive desktop, so
+# screen capture is delegated to a one-shot run inside the active user's session.
+# The WTS/token APIs address that session by ID — no username involved — which is
+# what makes it work on Azure AD / Microsoft-account boxes where schtasks /RU
+# can't resolve a name to a SID.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+] }
 
 # Wayland screen capture on GNOME/KDE (no wlr-screencopy): the xdg-desktop-portal
 # ScreenCast API (D-Bus, via zbus blocking) hands us a PipeWire fd + node, which
