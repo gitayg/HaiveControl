@@ -53,6 +53,22 @@ fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// Whether the workstation is locked (or sitting at the sign-in screen). LogonUI
+/// owns the secure desktop in both cases, and a locked desktop has no user
+/// content to capture — so this is why a capture in a live session can still fail.
+/// Also surfaced in presence: "logged in" is not the same as "at the machine".
+pub fn workstation_locked() -> bool {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq LogonUI.exe", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.to_lowercase().contains("logonui.exe"))
+        .unwrap_or(false)
+}
+
 fn public_dir() -> String {
     std::env::var("PUBLIC").unwrap_or_else(|_| "C:\\Users\\Public".into())
 }
@@ -82,6 +98,11 @@ fn ensure_helper(exe: &Path, dir: &str) -> Result<String, String> {
 /// reason it couldn't. The caller stays online regardless — only this screenshot
 /// fails.
 pub fn capture_once() -> Result<Vec<u8>, String> {
+    // A locked desktop has nothing to capture — say so plainly instead of
+    // spawning a helper that can only fail.
+    if workstation_locked() {
+        return Err("workstation is locked — unlock the screen to capture".into());
+    }
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = public_dir();
     let helper = ensure_helper(&exe, &dir)?;
@@ -89,7 +110,14 @@ pub fn capture_once() -> Result<Vec<u8>, String> {
     let _ = std::fs::remove_file(&shot);
 
     let cmdline = format!("\"{helper}\" --capture-once \"{shot}\"");
-    unsafe { run_in_active_session(&cmdline)? };
+    unsafe { run_in_active_session(&cmdline) }.map_err(|e| {
+        // It can lock between the check and the grab.
+        if workstation_locked() {
+            "workstation is locked — unlock the screen to capture".to_string()
+        } else {
+            e
+        }
+    })?;
 
     let bytes = std::fs::read(&shot).map_err(|e| format!("helper produced no frame ({e})"))?;
     let _ = std::fs::remove_file(&shot);
