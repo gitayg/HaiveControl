@@ -135,8 +135,10 @@ fn agent_direct_token(relay_token: &str, relay_id: &str) -> String {
 fn stable_suffix() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Machine-based, NOT user-based: the same box gets ONE device id regardless of
+    // which account/session runs the agent — so a SYSTEM service and the logged-in
+    // user no longer split into two inventory entries (the Baruch2025 duplicate).
     hostname().hash(&mut h);
-    env_or("USER", &env_or("USERNAME", "")).hash(&mut h);
     std::env::consts::OS.hash(&mut h);
     format!("{:08x}", h.finish() as u32)
 }
