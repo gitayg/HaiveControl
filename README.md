@@ -449,6 +449,14 @@ with — the dashboard bakes a per-account **enrollment token** (`--owner htok_�
 install command it shows, so a device a user enrolls is automatically theirs. No user header
 (LAN/dev) = full access, as before.
 
+**Reassigning ownership.** You can also (re)assign a device from the dashboard: **Claim** on
+a device's controls assigns it to you, and **Claim all to me** in the inventory bar
+consolidates the whole fleet under your account. This writes an **owner override** the hub
+re-applies on every check-in (persisted to `HUB_DATA/owner_overrides.json`), so it sticks
+even though the agent keeps reporting its own (or no) owner — handy for offline devices you
+can't re-enroll. `GET /x/set-owner?target=…[&owner=…]` (owner defaults to the caller, empty
+clears) and `GET /x/claim-all` are the endpoints.
+
 **Enrollment tokens.** Instead of putting the raw owner id (a UUIDv5 of the email) on every
 device command line, each account gets an opaque enrollment token. The token maps to the
 owner id on the hub (resolved in `canon_owner`, persisted to `HUB_DATA/owner_tokens.json`),

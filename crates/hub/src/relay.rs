@@ -46,7 +46,8 @@ fn registry() -> &'static Mutex<HashMap<String, Arc<Tunnel>>> {
 
 fn upsert_agent(agents: &Agents, key: &str, agent_id: &str, data: &serde_json::Value) {
     let mut d = data.clone();
-    let owner = d.get("owner").and_then(|x| x.as_str()).map(crate::canon_owner);
+    // A manual owner assignment (dashboard "Claim") wins over the agent's report.
+    let owner = crate::owner_override(key).or_else(|| d.get("owner").and_then(|x| x.as_str()).map(crate::canon_owner));
     if let Some(o) = d.as_object_mut() {
         o.insert("scheme".into(), serde_json::json!("relay"));
         o.insert("ip".into(), serde_json::json!(agent_id));
