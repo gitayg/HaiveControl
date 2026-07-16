@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.24.1";
+const VERSION: &str = "2.24.2";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -96,7 +96,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         .or_else(|| req_header(&req, "X-AppCrane-User"))
         .filter(|s| !s.is_empty())
         .map(|e| canon_owner(&e));
-    if path.starts_with("/x/") && path != "/x/exec" {
+    // /x/set-owner is an ownership op (behind SSO) — it must work on devices the
+    // caller doesn't yet own, so it's exempt from the may_control target gate.
+    if path.starts_with("/x/") && path != "/x/exec" && path != "/x/set-owner" {
         if let Some(t) = query_param(&url, "target") {
             if !may_control(user.as_deref(), agents, &t) {
                 let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
@@ -122,7 +124,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
             return;
         }
-        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys" | "/m/script" | "/m/script-fleet") {
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
             if let Some(t) = query_param(&url, "target") {
                 if !may_control(mowner.as_deref(), agents, &t) {
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
@@ -211,6 +213,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
+        (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/x/claim-all") => claim_all_ep(&url, agents, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
@@ -284,6 +288,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
+        (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
+        (Method::Get, "/m/claim-all") => claim_all_ep(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
@@ -1041,6 +1047,7 @@ fn load_state(agents: &Agents) {
     }
     load_pending();
     load_owner_tokens();
+    load_owner_overrides();
 }
 
 /// Remove a device (and its analysis) from the inventory + disk — the manual
@@ -1162,6 +1169,89 @@ fn enroll_token_ep(url: &str, user: Option<&str>) -> Resp {
     };
     let tok = if query_param(url, "rotate").is_some() { rotate_enroll_token(owner) } else { enroll_token_for(owner) };
     json_resp(&serde_json::json!({"ok": true, "token": tok, "owner": owner}))
+}
+
+// ---- Manual owner assignment (override) --------------------------------------
+// Reassign a device to an owner from the dashboard. Persisted and re-applied on
+// every check-in, so it survives the agent re-registering with its own (or no)
+// owner — unlike editing the registry directly, which the agent overwrites on its
+// next heartbeat.
+fn owner_overrides() -> &'static Mutex<HashMap<String, String>> {
+    static O: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    O.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn owner_overrides_path() -> std::path::PathBuf { data_dir().join("owner_overrides.json") }
+fn save_owner_overrides() {
+    let _ = std::fs::create_dir_all(data_dir());
+    let m = owner_overrides().lock().unwrap();
+    let _ = std::fs::write(owner_overrides_path(), serde_json::to_string(&*m).unwrap_or_default());
+}
+fn load_owner_overrides() {
+    if let Ok(txt) = std::fs::read_to_string(owner_overrides_path()) {
+        if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&txt) {
+            *owner_overrides().lock().unwrap() = m;
+        }
+    }
+}
+/// The owner a device (by agents-map key) has been manually assigned to, if any.
+/// Applied in relay::upsert_agent + register so it wins over the agent's report.
+pub(crate) fn owner_override(key: &str) -> Option<String> {
+    owner_overrides().lock().unwrap().get(key).cloned()
+}
+/// Assign `key` to `owner` (empty clears it): record the override, apply it to the
+/// live registry entry now, and persist.
+fn set_owner(agents: &Agents, key: &str, owner: &str) {
+    {
+        let mut m = owner_overrides().lock().unwrap();
+        if owner.is_empty() {
+            m.remove(key);
+        } else {
+            m.insert(key.to_string(), owner.to_string());
+        }
+    }
+    if let Some(a) = agents.lock().unwrap().get_mut(key) {
+        if let Some(o) = a.data.as_object_mut() {
+            if owner.is_empty() {
+                o.remove("owner");
+            } else {
+                o.insert("owner".into(), serde_json::json!(owner));
+            }
+        }
+    }
+    save_owner_overrides();
+    save_state(agents);
+}
+
+/// GET /x/set-owner?target=X[&owner=Y] — assign a device to an owner. Owner
+/// defaults to the caller (claim to self); `?owner=` sets it explicitly (email or
+/// id, canonicalized); `?owner=` empty clears it back to un-owned.
+fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() {
+        return Response::from_string("no target").with_status_code(400);
+    }
+    let owner = match query_param(url, "owner") {
+        Some(o) if o.is_empty() => String::new(),
+        Some(o) => canon_owner(&o),
+        None => user.unwrap_or("").to_string(),
+    };
+    set_owner(agents, &device_key(&target), &owner);
+    json_resp(&serde_json::json!({"ok": true, "owner": owner}))
+}
+
+/// GET /x/claim-all[?owner=Y] — assign every device in the inventory to the caller
+/// (or `?owner=`). One click to consolidate the fleet under one account.
+fn claim_all_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let owner = match query_param(url, "owner") {
+        Some(o) if o.is_empty() => String::new(),
+        Some(o) => canon_owner(&o),
+        None => user.unwrap_or("").to_string(),
+    };
+    let keys: Vec<String> = agents.lock().unwrap().keys().cloned().collect();
+    for k in &keys {
+        set_owner(agents, k, &owner);
+    }
+    json_resp(&serde_json::json!({"ok": true, "owner": owner, "count": keys.len()}))
 }
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
@@ -2421,6 +2511,10 @@ fn register(req: &mut Request, agents: &Agents) {
         if let Some(o) = v.get("owner").and_then(|x| x.as_str()).map(canon_owner) {
             v.as_object_mut().unwrap().insert("owner".to_string(), serde_json::json!(o));
         }
+        // A manual owner assignment (dashboard "Claim") wins over the agent's report.
+        if let Some(ov) = owner_override(&ip) {
+            v.as_object_mut().unwrap().insert("owner".to_string(), serde_json::json!(ov));
+        }
         if let Some(obj) = v.as_object_mut() {
             obj.insert("ip".to_string(), serde_json::Value::String(ip.clone()));
         }
@@ -2562,7 +2656,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <main class=\"stage\">\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{win}{mac}{lin}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
-<div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div></div>\
+<div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div><button class=\"b subtle\" style=\"margin-left:auto\" onclick=\"doClaimAll()\" title=\"assign every device to your account so the whole fleet lists under you\">Claim all to me</button></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account · last 500 events</span></div><input id=\"aud-q\" class=\"devsearch\" placeholder=\"Filter by device / action / who / via…\" autocomplete=\"off\" oninput=\"renderAudit();\"><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
 <div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span><button class=\"b subtle ov-refresh\" onclick=\"refreshInv(this)\" title=\"refresh device list now\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic-rf\"><path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/><path d=\"M21 3v5h-5\"/><path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/><path d=\"M3 21v-5h5\"/></svg>Refresh</button></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th><th>Agent</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
@@ -2935,6 +3029,7 @@ function durTxt(s){if(s==null)return '';return s<60?(s+'s'):(s<3600?(Math.floor(
 function instChip(d){var m=d.install_mode;if(!m)return '';var cls=m==='service'?'im-svc':(m==='autostart'?'im-auto':'im-eph');return ' <span class="imchip '+cls+'" title="how the agent restarts after reboot: service=boot/logon daemon, autostart=per-user, ephemeral=dies with the session">'+esc2(m)+'</span>';}
 function presInfo(d){var u=d.session_user||d.user||'';if(d.logged_in===false)return {cls:'off',u:(u||'—'),title:'no user logged in'+(u?(' (agent runs as '+u+')'):'')};if(d.active===true)return {cls:'on',u:(u||'—'),title:'active — input in the last 5 min'};if(d.active===false)return {cls:'idle',u:(u||'—'),title:'idle'+(d.idle_secs!=null?(' '+durTxt(d.idle_secs)):'')};return {cls:'',u:(u||'—'),title:u?'logged in':'no session info'};}
 function presCell(d){var p=presInfo(d);return '<span class="pres '+p.cls+'" title="'+attrEsc(p.title)+'"></span>'+esc2(p.u);}
+function ownerTxt(d){if(!d.owner)return 'unassigned (visible to all)';if(window.HB&&d.owner===HB.owner)return 'you';return 'another account ('+String(d.owner).slice(0,8)+'…)';}
 function fetchAgents(){fetch(API+'/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);updInvBadge();if(OVERVIEW_ON)renderOverview(arr);if(DASH_ON)renderDashboard();var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||DASH_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!BOOTED){BOOTED=true;showDashboard();}}).catch(function(){});}
 function renderSide(arr){document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var el=document.getElementById('devlist');if(!el)return;var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'Recent Activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+'<div class="act-rows">'+rows+'</div></div>';}
@@ -3046,7 +3141,7 @@ function renderAnalysis(j,target){var el=document.getElementById('d-analysis');i
 function loadCls(p){return p<60?'':(p<85?'warn':'hot');}
 function meter(label,val,pct,cls){pct=Math.max(0,Math.min(100,pct));return '<div class="meter"><div class="meter-top"><span>'+label+'</span><span>'+val+'</span></div><div class="meter-bar"><div class="meter-fill '+cls+'" style="width:'+pct+'%"></div></div></div>';}
 function metersHtml(d){var m='';if(d.cpu_pct!=null){m+=meter('CPU load',d.cpu_pct.toFixed(0)+'%',d.cpu_pct,loadCls(d.cpu_pct));}if(d.free_gb!=null&&d.mem_gb){var used=d.mem_gb-d.free_gb;var up=used/d.mem_gb*100;m+=meter('RAM',d.free_gb.toFixed(1)+' GB free of '+d.mem_gb,up,loadCls(up));}return m?('<div class="meters">'+m+'</div>'):'';}
-function specHtml(d){function sp(l,v){return (v!=null&&v!=='')?('<span class="spec"><span class="sl">'+l+'</span><span class="sv">'+esc2(v)+'</span></span>'):'';}var ifs='';(d.interfaces||[]).forEach(function(i){if(!i.addr||i.addr.indexOf('fe80')===0||i.addr==='::1'||i.addr.indexOf('127.')===0)return;ifs+='<span class="chip"><b>'+esc2(i.name)+'</b> '+esc2(i.addr)+'</span>';});var mics='';(d.microphones||[]).forEach(function(m){mics+='<span class="chip mic">🎙 '+esc2(m)+'</span>';});var chips=(ifs||mics)?('<div class="chiprow">'+ifs+mics+'</div>'):'';var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var agln=av?('v'+av+(sv?(av===sv?' (current)':(' — update to '+sv)):'')):(sv?(sv+' available from hub'):'');var pi=presInfo(d);var loginTxt=(d.logged_in===false)?'no user logged in':((pi.u&&pi.u!=='—')?(pi.u+' · '+(d.active===true?'active':(d.active===false?('idle'+(d.idle_secs!=null?(' '+durTxt(d.idle_secs)):'')):'logged in'))):'');return sp('Hostname',d.hostname)+sp('OS',(d.os||'')+(d.arch?(' ('+d.arch+')'):''))+sp('Install mode',d.install_mode)+sp('User',d.user)+sp('Logged in',loginTxt)+sp('CPU',d.cpu)+sp('Cores',d.cores)+sp('Memory',d.mem_gb?(d.mem_gb+' GB total'):'')+sp('Agent',agln)+metersHtml(d)+chips;}
+function specHtml(d){function sp(l,v){return (v!=null&&v!=='')?('<span class="spec"><span class="sl">'+l+'</span><span class="sv">'+esc2(v)+'</span></span>'):'';}var ifs='';(d.interfaces||[]).forEach(function(i){if(!i.addr||i.addr.indexOf('fe80')===0||i.addr==='::1'||i.addr.indexOf('127.')===0)return;ifs+='<span class="chip"><b>'+esc2(i.name)+'</b> '+esc2(i.addr)+'</span>';});var mics='';(d.microphones||[]).forEach(function(m){mics+='<span class="chip mic">🎙 '+esc2(m)+'</span>';});var chips=(ifs||mics)?('<div class="chiprow">'+ifs+mics+'</div>'):'';var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var agln=av?('v'+av+(sv?(av===sv?' (current)':(' — update to '+sv)):'')):(sv?(sv+' available from hub'):'');var pi=presInfo(d);var loginTxt=(d.logged_in===false)?'no user logged in':((pi.u&&pi.u!=='—')?(pi.u+' · '+(d.active===true?'active':(d.active===false?('idle'+(d.idle_secs!=null?(' '+durTxt(d.idle_secs)):'')):'logged in'))):'');return sp('Hostname',d.hostname)+sp('OS',(d.os||'')+(d.arch?(' ('+d.arch+')'):''))+sp('Install mode',d.install_mode)+sp('User',d.user)+sp('Logged in',loginTxt)+sp('Owner',ownerTxt(d))+sp('CPU',d.cpu)+sp('Cores',d.cores)+sp('Memory',d.mem_gb?(d.mem_gb+' GB total'):'')+sp('Agent',agln)+metersHtml(d)+chips;}
 function camSelect(d){var o='';d.cameras.forEach(function(c,i){o+='<option value="'+i+'">'+esc2(c)+'</option>';});return '<select class="campick" id="campick" title="select camera">'+o+'</select>';}
 var ROWS=[
 {nm:'System report',d:'Pull a system report from the device.',sched:1,opts:[['Hardware','hardware'],['Installed software','packages'],['Running services','services'],['Top processes','processes'],['Network neighbors','network'],['Available updates','updates'],['Power / battery','power_report']]},
@@ -3074,7 +3169,8 @@ var term='<button class="b" onclick="doShell()" title="open an interactive shell
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
 var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
 var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+dbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
+var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<button class="b subtle" onclick="doClaim()" title="assign this device to your account so it lists under you">Claim</button>';
+var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+dbtn+claimbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
 return groups+actionListHtml();}
@@ -3108,6 +3204,8 @@ function doGet(){openFb(SEL,'get');}
 function doPut(){openFb(SEL,'put');}
 function doUpd(){if(!confirm('Update the agent on this device to the latest build?'))return;out('updating…');fetch(API+'/x/update?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
 function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
+function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(function(r){return r.json();}).then(function(){out('claimed — this device is now under your account.');fetchAgents();}).catch(function(e){out('error: '+e);});}
+function doClaimAll(){var n=(LAST||[]).length;if(!confirm('Assign all '+n+' device'+(n===1?'':'s')+' to your account? They will list under you (and only you).'))return;fetch(API+'/x/claim-all').then(function(r){return r.json();}).then(function(j){alert('Claimed '+(j.count||0)+' device'+((j.count===1)?'':'s')+' to your account.');fetchAgents();}).catch(function(e){alert('error: '+e);});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 /* ---- file browser ---- */
