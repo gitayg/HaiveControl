@@ -317,9 +317,8 @@ fn frame_ep(cfg: &Config) -> Resp {
     #[cfg(windows)]
     if crate::winsession::is_session0() {
         return match crate::winsession::capture_once() {
-            Some(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
-            None => Response::from_string("Windows session 0: no interactive user session to capture (nobody logged in?)")
-                .with_status_code(500),
+            Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+            Err(reason) => Response::from_string(format!("Windows session 0 capture: {reason}")).with_status_code(500),
         };
     }
     match cfg.grabber.grab(cfg.quality, cfg.max_width) {
