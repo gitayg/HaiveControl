@@ -3,19 +3,26 @@
 // running normally (always connected, self-updating, exec/reports/presence all
 // work) and delegate ONLY screen capture to the active user's session, on demand.
 //
-// The delegation addresses the session by ID via the WTS/token APIs and never
-// needs a username. That matters: an earlier attempt shelled out to
-// `schtasks /RU <user>`, which fails with "No mapping between account names and
-// security IDs" on Azure AD / Microsoft-account machines (there's no local
-// account to resolve) — i.e. most corporate fleets. WTSQueryUserToken has no such
-// problem, and it also sidesteps schtasks' /TR quoting and the fact that a
-// SYSTEM service's %TEMP% (C:\Windows\TEMP) isn't writable by the user.
+// Two things this got wrong before, both found the hard way on a real box:
+//   * schtasks /RU <user> — fails with "No mapping between account names and
+//     security IDs" on Azure AD / Microsoft-account machines (no local account to
+//     resolve). We now address the session by ID via WTS, so no username is ever
+//     involved.
+//   * launching the installed exe directly — it can live somewhere the logged-in
+//     user cannot read (e.g. C:\Users\<other>\airm.exe, ACL'd to that profile), so
+//     CreateProcessAsUser fails with access-denied. We stage a copy in %PUBLIC%
+//     (where INTERACTIVE has Modify) and launch that instead. The screenshot is
+//     written there too, since a service's %TEMP% isn't writable by the user.
+//
+// Every failure returns a specific reason — an opaque bool made this near
+// impossible to diagnose remotely.
 #![cfg(windows)]
 
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ALL_ACCESS,
 };
@@ -26,8 +33,8 @@ use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-/// True when we're running as SYSTEM in session 0 — i.e. a service with no access
-/// to the interactive desktop. Cached (it can't change over a run).
+/// True when we're running as SYSTEM in session 0 — a service with no access to
+/// the interactive desktop. Cached (it can't change over a run).
 pub fn is_session0() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
@@ -46,62 +53,76 @@ fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Grab one screen frame from the active user's session and return the JPEG.
-/// None if nobody's logged on or the capture produced nothing — the caller stays
-/// online regardless (only this screenshot fails).
-pub fn capture_once() -> Option<Vec<u8>> {
-    let exe = std::env::current_exe().ok()?;
-    // Both accounts must reach this file: the helper (the logged-in user) writes
-    // it, we (SYSTEM) read it. A service's %TEMP% is C:\Windows\TEMP, which the
-    // user can't write — so use the world-writable Public dir.
-    let dir = std::env::var("PUBLIC").unwrap_or_else(|_| "C:\\Users\\Public".into());
+fn public_dir() -> String {
+    std::env::var("PUBLIC").unwrap_or_else(|_| "C:\\Users\\Public".into())
+}
+
+/// Stage a copy of ourselves somewhere the logged-in user can actually execute.
+/// The installed exe may sit in another profile (ACL'd to that user), so we can't
+/// launch it as them. Refreshed when our binary changes (e.g. after auto-update).
+fn ensure_helper(exe: &Path, dir: &str) -> Result<String, String> {
+    let helper = format!("{dir}\\haive_helper.exe");
+    let stale = match (std::fs::metadata(&helper), std::fs::metadata(exe)) {
+        (Ok(h), Ok(e)) => h.len() != e.len(),
+        _ => true,
+    };
+    if stale {
+        // A copy can fail if a previous helper is still running; fall back to the
+        // existing one if it's there.
+        if let Err(e) = std::fs::copy(exe, &helper) {
+            if !Path::new(&helper).exists() {
+                return Err(format!("staging helper to {helper} failed: {e}"));
+            }
+        }
+    }
+    Ok(helper)
+}
+
+/// Grab one screen frame from the active user's session and return the JPEG, or a
+/// reason it couldn't. The caller stays online regardless — only this screenshot
+/// fails.
+pub fn capture_once() -> Result<Vec<u8>, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    let dir = public_dir();
+    let helper = ensure_helper(&exe, &dir)?;
     let shot = format!("{dir}\\haive_shot.jpg");
     let _ = std::fs::remove_file(&shot);
 
-    let cmdline = format!("\"{}\" --capture-once \"{}\"", exe.display(), shot);
-    let ok = unsafe { run_in_active_session(&cmdline) };
-    if !ok {
-        return None;
-    }
-    let bytes = std::fs::read(&shot).ok().filter(|b| !b.is_empty());
+    let cmdline = format!("\"{helper}\" --capture-once \"{shot}\"");
+    unsafe { run_in_active_session(&cmdline)? };
+
+    let bytes = std::fs::read(&shot).map_err(|e| format!("helper produced no frame ({e})"))?;
     let _ = std::fs::remove_file(&shot);
-    bytes
+    if bytes.is_empty() {
+        return Err("helper produced an empty frame".into());
+    }
+    Ok(bytes)
 }
 
-/// Run `cmdline` inside the active console session and wait (bounded) for it to
-/// exit. Returns whether it ran to completion.
-unsafe fn run_in_active_session(cmdline: &str) -> bool {
+/// Run `cmdline` inside the active console session, waiting (bounded) for it to
+/// exit. Addresses the session by ID — no username, so Azure AD / MSA is fine.
+unsafe fn run_in_active_session(cmdline: &str) -> Result<(), String> {
     let session = WTSGetActiveConsoleSessionId();
-    // 0xFFFFFFFF = no session attached to the console (nobody logged on).
     if session == u32::MAX {
-        return false;
+        return Err("no active console session".into());
     }
     let mut token: HANDLE = std::ptr::null_mut();
     if WTSQueryUserToken(session, &mut token) == 0 || token.is_null() || token == INVALID_HANDLE_VALUE {
-        return false; // no interactive user in that session
+        return Err(format!("no interactive user in session {session} (nobody logged in?) [err {}]", GetLastError()));
     }
 
     let mut primary: HANDLE = std::ptr::null_mut();
-    let dup = DuplicateTokenEx(
-        token,
-        TOKEN_ALL_ACCESS,
-        std::ptr::null(),
-        SecurityImpersonation,
-        TokenPrimary,
-        &mut primary,
-    );
+    let dup = DuplicateTokenEx(token, TOKEN_ALL_ACCESS, std::ptr::null(), SecurityImpersonation, TokenPrimary, &mut primary);
     CloseHandle(token);
     if dup == 0 || primary.is_null() {
-        return false;
+        return Err(format!("DuplicateTokenEx failed [err {}]", GetLastError()));
     }
 
-    // The user's environment, so the helper resolves their paths/profile.
     let mut env: *mut std::ffi::c_void = std::ptr::null_mut();
     let have_env = CreateEnvironmentBlock(&mut env, primary, 0) != 0;
 
     let mut si: STARTUPINFOW = std::mem::zeroed();
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-    // Target the interactive desktop of that session.
     let mut desktop = wide("winsta0\\default");
     si.lpDesktop = desktop.as_mut_ptr();
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
@@ -120,20 +141,25 @@ unsafe fn run_in_active_session(cmdline: &str) -> bool {
         &si,
         &mut pi,
     );
+    let spawn_err = GetLastError();
 
-    let mut ok = false;
+    let mut result = Ok(());
     if started != 0 {
-        // Bounded wait so a wedged helper can't hang the request.
         WaitForSingleObject(pi.hProcess, 15_000);
         let mut code: u32 = 1;
         GetExitCodeProcess(pi.hProcess, &mut code);
-        ok = code == 0;
+        if code != 0 {
+            result = Err(format!("helper exited {code} (capture failed in session {session})"));
+        }
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
+    } else {
+        // 5 = ACCESS_DENIED, typically the exe being unreadable by that user.
+        result = Err(format!("CreateProcessAsUser failed [err {spawn_err}]"));
     }
     if have_env {
         DestroyEnvironmentBlock(env);
     }
     CloseHandle(primary);
-    ok
+    result
 }
