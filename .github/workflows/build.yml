@@ -20,10 +20,10 @@ jobs:
           - os: macos-latest
             suffix: macos
             ext: ""
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             suffix: linux
             ext: ""
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             suffix: linux-arm64
             ext: ""
     runs-on: ${{ matrix.os }}
