@@ -20,20 +20,22 @@ jobs:
           - os: macos-latest
             suffix: macos
             ext: ""
-          - os: ubuntu-22.04
+          # Linux builds run on 24.04 (its PipeWire/SPA headers are new enough for
+          # the libspa crate) but link an OLD glibc via cargo-zigbuild, so the
+          # binaries also run on Debian 12 / Ubuntu 22.04 and ARM SBCs (Radxa).
+          - os: ubuntu-24.04
             suffix: linux
             ext: ""
-          - os: ubuntu-22.04-arm
+            triple: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
             suffix: linux-arm64
             ext: ""
+            triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        # Key by exact runner image: rust-cache defaults to runner.os ("Linux"),
-        # so ubuntu-22.04 and ubuntu-24.04 would otherwise share a cache and the
-        # 22.04 job would restore 24.04-built (glibc 2.39) build scripts it can't run.
         with:
           key: ${{ matrix.os }}
 
@@ -47,15 +49,29 @@ jobs:
           libpipewire-0.3-dev libclang-dev
           libegl-dev libgl-dev libgles-dev libgbm-dev libdrm-dev
 
-      - name: Build all binaries
+      - name: Install zig + cargo-zigbuild (Linux — link an older glibc)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          pip3 install "ziglang==0.13.0"
+          cargo install --locked cargo-zigbuild
+          rustup target add ${{ matrix.triple }}
+
+      - name: Build all binaries (Linux, glibc 2.31 floor)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo zigbuild --release --target ${{ matrix.triple }}.2.31
+
+      - name: Build all binaries (macOS / Windows)
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
         run: cargo build --release
 
       - name: Collect artifacts
         shell: bash
         run: |
           mkdir out
+          dir="target/release"
+          if [ -n "${{ matrix.triple }}" ]; then dir="target/${{ matrix.triple }}/release"; fi
           for b in HaiveControl HaiveHub haivectl haive-mcp; do
-            cp "target/release/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
+            cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
           done
 
       - uses: actions/upload-artifact@v4

@@ -60,6 +60,32 @@ fn upsert_agent(agents: &Agents, key: &str, agent_id: &str, data: &serde_json::V
     agents.lock().unwrap().insert(key.to_string(), Agent { data: d, last: std::time::SystemTime::now() });
 }
 
+/// Drop stale old-scheme rows for `hostname` once the machine reports under its
+/// stable hc-<machine-id> key. "Stale" = no heartbeat in 45s, so a genuinely
+/// separate but live machine with the same hostname is never removed.
+fn retire_superseded(agents: &Agents, keep_key: &str, hostname: &str) {
+    if hostname.is_empty() {
+        return;
+    }
+    let stale: Vec<String> = {
+        let map = agents.lock().unwrap();
+        map.iter()
+            .filter(|(k, a)| {
+                k.as_str() != keep_key
+                    && !k.starts_with("relay:hc-")
+                    && a.data.get("hostname").and_then(|x| x.as_str()) == Some(hostname)
+                    && a.last.elapsed().map(|e| e.as_secs() >= 45).unwrap_or(true)
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    for k in &stale {
+        agents.lock().unwrap().remove(k);
+        crate::clear_pending_dissolve(k);
+        println!("relay: retired superseded row {k} (now {keep_key})");
+    }
+}
+
 /// POST /relay/hello — register (or heartbeat) a relay agent.
 pub fn hello(agents: &Agents, data: serde_json::Value) {
     let agent_id = match data.get("relay_id").and_then(|x| x.as_str()) {
@@ -80,6 +106,15 @@ pub fn hello(agents: &Agents, data: serde_json::Value) {
     upsert_agent(agents, &format!("relay:{agent_id}"), &agent_id, &data);
     if fresh {
         println!("relay: {agent_id} connected");
+    }
+    // Auto-dedup: a machine now reporting under its stable machine-ID key (hc-…)
+    // supersedes any leftover pre-2.27 row (name-hash key) for the same hostname.
+    // Only retire ones that have gone stale — a *different* live machine that
+    // happens to share a hostname keeps a recent heartbeat and is left alone.
+    if agent_id.starts_with("hc-") {
+        if let Some(host) = data.get("hostname").and_then(|x| x.as_str()) {
+            retire_superseded(agents, &format!("relay:{agent_id}"), host);
+        }
     }
     // Dissolve-on-next-connect: if this device was queued to dissolve while
     // offline, deliver it now. Claim it atomically (clear returns true only for
