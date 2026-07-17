@@ -132,23 +132,64 @@ fn agent_direct_token(relay_token: &str, relay_id: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// A stable, machine-UNIQUE identifier: the OS's own machine id where available
+/// (unique per install, survives renames), falling back to hostname+os. Used so
+/// the device id is tied to the box, not its name.
+fn machine_id() -> String {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+            if let Ok(s) = std::fs::read_to_string(p) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(o) = std::process::Command::new("ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"]).output() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(line) = text.lines().find(|l| l.contains("IOPlatformUUID")) {
+                if let Some(uuid) = line.split('"').nth(3) {
+                    if !uuid.is_empty() {
+                        return uuid.to_string();
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        if let Ok(k) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\Microsoft\Cryptography") {
+            if let Ok(g) = k.get_value::<String, _>("MachineGuid") {
+                if !g.is_empty() {
+                    return g;
+                }
+            }
+        }
+    }
+    format!("{}:{}", hostname(), std::env::consts::OS)
+}
+
+/// A stable per-machine suffix — hash of the machine id, so a box gets ONE device
+/// id regardless of which account/session/NAME runs the agent. Machine-unique
+/// (avoids hostname collisions) and name-INDEPENDENT (renaming or re-enrolling
+/// under a different --name no longer creates a second inventory row).
 fn stable_suffix() -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    // Machine-based, NOT user-based: the same box gets ONE device id regardless of
-    // which account/session runs the agent — so a SYSTEM service and the logged-in
-    // user no longer split into two inventory entries (the Baruch2025 duplicate).
-    hostname().hash(&mut h);
-    std::env::consts::OS.hash(&mut h);
+    machine_id().hash(&mut h);
     format!("{:08x}", h.finish() as u32)
 }
 
-fn relay_id(name: &str) -> String {
-    let base: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
-        .collect();
-    format!("{base}-{}", stable_suffix())
+/// The device's relay id. Name-independent: `hc-<machinehash>`, so the same box is
+/// always the same id (the friendly name is carried separately, for display only).
+fn relay_id() -> String {
+    format!("hc-{}", stable_suffix())
 }
 
 /// The args to persist for autostart: the current invocation minus the one-shot
@@ -442,7 +483,7 @@ fn main() {
     }
     let mut direct_token = String::new();
     if let Some(relay_addr) = args.relay.clone() {
-        let rid = relay_id(&name);
+        let rid = relay_id();
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
         direct_token = agent_direct_token(&token, &rid);

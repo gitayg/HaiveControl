@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.26.0";
+const VERSION: &str = "2.27.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -169,12 +169,28 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
             let mut data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            if let (Some(ip), Some(o)) = (pip, data.as_object_mut()) {
-                o.insert("public_ip".into(), serde_json::json!(ip));
+            if let Some(o) = data.as_object_mut() {
+                if let Some(ip) = pip {
+                    o.insert("public_ip".into(), serde_json::json!(ip));
+                }
+                // Per-owner enrollment token used as the relay token → the device
+                // is owned by that account, no separate --owner needed. Recorded as
+                // a persistent override so it survives every check-in.
+                if let Some(owner) = query_param(&url, "tok").and_then(|t| resolve_owner_token(&t)) {
+                    if let Some(id) = o.get("relay_id").and_then(|x| x.as_str()) {
+                        set_owner(agents, &format!("relay:{id}"), &owner);
+                    }
+                    o.insert("owner".into(), serde_json::json!(owner));
+                }
             }
             relay::hello(agents, data);
             Response::from_string("").with_status_code(204)
         }
+        (Method::Get, "/whoami") => json_resp(&serde_json::json!({
+            "sso_user_raw": req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User")),
+            "derived_owner": user.as_deref(),
+            "note": "if sso_user_raw is null, the hub is not receiving your SSO identity — dashboard scoping and Claim can't work"
+        })),
         (Method::Post, "/relay/analysis") => recv_analysis(&mut req),
         (Method::Post, "/relay/cert") => {
             let mut body = String::new();
@@ -474,7 +490,13 @@ fn direct_token(relay_id: &str) -> String {
 /// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset.
 fn relay_ok(url: &str) -> bool {
     match std::env::var("RELAY_TOKEN") {
-        Ok(t) if !t.is_empty() => query_param(url, "tok").as_deref() == Some(t.as_str()),
+        Ok(t) if !t.is_empty() => {
+            let tok = query_param(url, "tok").unwrap_or_default();
+            // Accept the shared relay secret, OR any valid per-owner enrollment
+            // token — the latter both authenticates AND stamps ownership (below),
+            // so one `--relay-token htok_…` enrolls a device already owned.
+            tok == t || resolve_owner_token(&tok).is_some()
+        }
         _ => true,
     }
 }
@@ -2608,14 +2630,17 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
     let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
         Some(pub_url) => {
             let b = pub_url.trim_end_matches('/').to_string();
-            let tok = match std::env::var("RELAY_TOKEN") {
-                Ok(t) if !t.is_empty() => format!(" --relay-token {t}"),
-                _ => String::new(),
+            // One per-owner token that BOTH authenticates the relay AND stamps
+            // ownership — so a device enrolled from a logged-in dashboard is always
+            // owned (never "unclaimed"), with no separate --owner to forget. Falls
+            // back to the shared RELAY_TOKEN (unowned) only when not behind SSO.
+            let ex = match user {
+                Some(u) => format!(" --relay-token {}", enroll_token_for(u)),
+                None => match std::env::var("RELAY_TOKEN") {
+                    Ok(t) if !t.is_empty() => format!(" --relay-token {t}"),
+                    _ => String::new(),
+                },
             };
-            // Tag the device with the logged-in owner's enrollment token, so it
-            // lists only for them — the token resolves to their owner id on the hub.
-            let own = user.map(|u| format!(" --owner {}", enroll_token_for(u))).unwrap_or_default();
-            let ex = format!("{tok}{own}");
             (
                 cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --background")),
                 cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --background")),
