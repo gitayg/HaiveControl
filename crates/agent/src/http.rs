@@ -229,6 +229,19 @@ fn update_ep(req: &mut Request) -> Resp {
 /// process tried to bind :8765 before the old one released it and panicked with
 /// AddrInUse. On Windows it spawns a fresh process; the caller then exits.
 pub(crate) fn apply_update(bytes: &[u8]) -> bool {
+    // Resolve our own path BEFORE self_replace. Afterwards, on Linux, the running
+    // binary's inode is unlinked and current_exe() returns a stale
+    // ".../airm (deleted)" path — exec/spawn against that fail with ENOENT, so we'd
+    // be unable to restart. Capturing it here keeps a valid path that resolves to
+    // the freshly written binary. (This is what killed an unsupervised agent on
+    // 2.24.1→2.24.3: relaunch silently failed, yet the caller still exited.)
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("update: current_exe failed: {e}");
+            return false;
+        }
+    };
     let tmp = std::env::temp_dir().join("airm-update.bin");
     if std::fs::write(&tmp, bytes).is_err() {
         return false;
@@ -237,16 +250,25 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
         return false;
     }
     let _ = std::fs::remove_file(&tmp);
-    let Ok(exe) = std::env::current_exe() else { return true };
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // exec() only returns on failure; on success it never comes back.
-        let _ = std::process::Command::new(&exe).args(&args).exec();
+        // exec() replaces the process on success and never returns; if it returns,
+        // it failed — fall through and spawn a fresh process instead.
+        let e = std::process::Command::new(&exe).args(&args).exec();
+        eprintln!("update: exec failed ({e}); spawning a replacement instead");
     }
-    let _ = std::process::Command::new(&exe).args(&args).spawn();
-    true
+    // Report whether the replacement actually launched. Callers must NOT exit the
+    // still-running process when this is false — a failed relaunch with no
+    // supervisor would otherwise leave the device dead.
+    match std::process::Command::new(&exe).args(&args).spawn() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("update: relaunch failed: {e}; staying on the current version");
+            false
+        }
+    }
 }
 
 fn dissolve_ep() -> Resp {
