@@ -191,6 +191,7 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         }
         (Method::Post, "/update") => update_ep(&mut req),
         (Method::Post, "/dissolve") => dissolve_ep(),
+        (Method::Post, "/persist") => persist_ep(),
         (Method::Get, "/download") => download_ep(&url, cfg),
         (Method::Get, "/list") => list_ep(&url, cfg),
         (Method::Post, "/upload") => upload_ep(&mut req, cfg),
@@ -278,6 +279,13 @@ fn dissolve_ep() -> Resp {
         std::process::exit(0);
     });
     Response::from_string("dissolving — removing autostart and exiting")
+}
+
+/// POST /persist — promote this running agent to a persistent autostart install
+/// (per-user autostart with the current relay args), and keep it awake on AC.
+fn persist_ep() -> Resp {
+    crate::persistence::install(&crate::persist_args());
+    Response::from_string(format!("made persistent — {} (keep-awake on AC enabled)", crate::persistence::current_mode()))
 }
 
 fn download_bytes(url: &str) -> Option<Vec<u8>> {

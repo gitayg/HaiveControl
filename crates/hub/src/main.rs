@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.24.7";
+const VERSION: &str = "2.25.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -211,6 +211,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
@@ -287,6 +288,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/m/persist") => proxy_persist(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/claim-all") => claim_all_ep(&url, agents, mowner.as_deref()),
@@ -731,6 +733,15 @@ fn proxy_dissolve(url: &str) -> Resp {
             Response::from_string("device offline — dissolve queued; it will run on the device's next connect")
                 .with_header(hdr("Content-Type", "text/plain"))
         }
+    }
+}
+
+/// Promote a running agent to a persistent (autostart) install, remotely.
+fn proxy_persist(url: &str) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    match dev_unary(&target, "POST", "/persist", None) {
+        Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "text/plain")),
+        None => Response::from_string("persist failed — device unreachable").with_status_code(502),
     }
 }
 
@@ -3171,7 +3182,8 @@ var files='<button class="b" onclick="doGet()" title="download a file">Get file<
 var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
 var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
 var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<button class="b subtle" onclick="doClaim()" title="assign this device to your account so it lists under you">Claim</button>';
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+dbtn+claimbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
+var persistbtn=(d.install_mode&&d.install_mode!=='ephemeral')?'<span class="imchip im-'+(d.install_mode==='service'?'svc':'auto')+'" title="persistent — autostarts after reboot; kept awake on AC">'+esc2(d.install_mode)+' ✓</span>':'<button class="b subtle" onclick="doPersist()" title="make persistent: install autostart so it survives reboot, and keep the device awake while on AC power">Make persistent</button>';
+var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
 return groups+actionListHtml();}
@@ -3208,6 +3220,7 @@ function doForget(){if(!confirm('Forget this device? It is removed from the inve
 function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(function(r){return r.json();}).then(function(){out('claimed — this device is now under your account.');fetchAgents();}).catch(function(e){out('error: '+e);});}
 function doClaimAll(){var n=(LAST||[]).length;if(!confirm('Assign all '+n+' device'+(n===1?'':'s')+' to your account? They will list under you (and only you).'))return;fetch(API+'/x/claim-all').then(function(r){return r.json();}).then(function(j){alert('Claimed '+(j.count||0)+' device'+((j.count===1)?'':'s')+' to your account.');fetchAgents();}).catch(function(e){alert('error: '+e);});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
+function doPersist(){if(!confirm('Make this device persistent? Installs autostart so the agent survives reboot/login, and stops the machine sleeping while on AC power. Dissolve reverts both.'))return;out('making persistent…');fetch(API+'/x/persist?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);setTimeout(fetchAgents,1500);}).catch(function(e){out('error: '+e);});}
 function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 /* ---- file browser ---- */
 var fbBase=null,fbMode=null,fbPath='',fbParent='';

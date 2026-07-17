@@ -154,7 +154,7 @@ fn relay_id(name: &str) -> String {
 /// The args to persist for autostart: the current invocation minus the one-shot
 /// persistence/detach flags, so the installed command re-runs in the same mode
 /// (relay or LAN) without re-triggering install or backgrounding.
-fn persist_args() -> Vec<String> {
+pub(crate) fn persist_args() -> Vec<String> {
     std::env::args()
         .skip(1)
         .filter(|a| !matches!(a.as_str(), "--install" | "--persist" | "--background" | "--uninstall"))
