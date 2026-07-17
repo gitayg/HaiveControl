@@ -309,6 +309,13 @@ pub fn keep_awake_on_ac() {
             let _ = std::fs::write(sleep_prior_file(), mins.to_string());
         }
         let _ = pc(&["/change", "standby-timeout-ac", "0"]);
+        // Also stop hibernate and lid-close sleep on AC — a closed laptop lid would
+        // otherwise sleep the machine regardless of the idle timeout. Best-effort;
+        // needs elevation, so a non-admin enroll silently leaves these as-is and
+        // relies on the runtime wake lock instead.
+        let _ = pc(&["/change", "hibernate-timeout-ac", "0"]);
+        let _ = pc(&["/setacvalueindex", "SCHEME_CURRENT", "SUB_BUTTONS", "LIDACTION", "0"]);
+        let _ = pc(&["/setactive", "SCHEME_CURRENT"]);
     }
     #[cfg(target_os = "macos")]
     {

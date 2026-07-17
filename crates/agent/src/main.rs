@@ -8,6 +8,7 @@ mod discovery;
 mod http;
 mod input;
 mod persistence;
+mod wakelock;
 mod presence;
 mod relay;
 mod schedule;
@@ -414,6 +415,12 @@ fn main() {
         std::process::exit(2);
     }
     let mac_id_disp = mac_id.clone().unwrap_or_default();
+
+    // Keep the host reachable: stop the OS idle-sleeping while the agent runs.
+    // Applies on every real run (including a plain --background enroll), needs no
+    // elevation, and clears when we exit. Persist-mode adds a powercfg/pmset scheme
+    // change on top for lid-close/hibernate coverage.
+    wakelock::hold();
 
     let password = args.password.clone().unwrap_or_else(|| env_or("SCREEN_PW", ""));
     let port: u16 = env_or("SCREEN_PORT", "8765").parse().unwrap_or(8765);

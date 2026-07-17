@@ -31,6 +31,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        # Key by exact runner image: rust-cache defaults to runner.os ("Linux"),
+        # so ubuntu-22.04 and ubuntu-24.04 would otherwise share a cache and the
+        # 22.04 job would restore 24.04-built (glibc 2.39) build scripts it can't run.
+        with:
+          key: ${{ matrix.os }}
 
       - name: Linux capture/input build deps
         if: startsWith(matrix.os, 'ubuntu')
