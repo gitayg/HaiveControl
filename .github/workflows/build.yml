@@ -1,5 +1,9 @@
 name: build
 
+# Builds the HaiveHub server binary for self-hosters. The AppCrane deploy builds the
+# hub from source via the Dockerfile; the AGENT binaries (airm / haive-mcp / haivectl)
+# live in the public gitayg/haive-agent repo and are pulled from its releases.
+
 on:
   push:
     tags: ["v*"]
@@ -7,6 +11,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write        # OIDC — mint the Sigstore identity for provenance
+  attestations: write    # store the signed build-provenance attestation
 
 jobs:
   build:
@@ -20,9 +26,8 @@ jobs:
           - os: macos-latest
             suffix: macos
             ext: ""
-          # Linux builds run on 24.04 (its PipeWire/SPA headers are new enough for
-          # the libspa crate) but link an OLD glibc via cargo-zigbuild, so the
-          # binaries also run on Debian 12 / Ubuntu 22.04 and ARM SBCs (Radxa).
+          # Linux linked against an OLD glibc via cargo-zigbuild, so the hub binary
+          # runs on Debian 12 / Ubuntu 22.04 and older self-host boxes too.
           - os: ubuntu-24.04
             suffix: linux
             ext: ""
@@ -39,16 +44,6 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      - name: Linux capture/input build deps
-        if: startsWith(matrix.os, 'ubuntu')
-        run: >
-          sudo apt-get update && sudo apt-get install -y
-          libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
-          libx11-dev libxtst-dev libdbus-1-dev pkg-config
-          libwayland-dev libxkbcommon-dev
-          libpipewire-0.3-dev libclang-dev
-          libegl-dev libgl-dev libgles-dev libgbm-dev libdrm-dev
-
       - name: Install zig + cargo-zigbuild (Linux — link an older glibc)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -56,30 +51,56 @@ jobs:
           cargo install --locked cargo-zigbuild
           rustup target add ${{ matrix.triple }}
 
-      - name: Build all binaries (Linux, glibc 2.31 floor)
+      - name: Build HaiveHub (Linux, glibc 2.31 floor)
         if: startsWith(matrix.os, 'ubuntu')
-        run: cargo zigbuild --release --target ${{ matrix.triple }}.2.31
+        run: cargo zigbuild --release -p haive-hub --target ${{ matrix.triple }}.2.31
 
-      - name: Build all binaries (macOS / Windows)
+      - name: Build HaiveHub (macOS / Windows)
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
-        run: cargo build --release
+        run: cargo build --release -p haive-hub
 
-      - name: Collect artifacts
+      - name: Collect artifact
         shell: bash
         run: |
           mkdir out
           dir="target/release"
           if [ -n "${{ matrix.triple }}" ]; then dir="target/${{ matrix.triple }}/release"; fi
-          for b in HaiveControl HaiveHub haivectl haive-mcp; do
-            cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
-          done
+          cp "${dir}/HaiveHub${{ matrix.ext }}" "out/HaiveHub-${{ matrix.suffix }}${{ matrix.ext }}"
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*
 
       - uses: actions/upload-artifact@v4
         with:
-          name: HaiveControl-${{ matrix.suffix }}
+          name: HaiveHub-${{ matrix.suffix }}
           path: out/*
 
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: out/*
+
+  checksums:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Generate SHA256SUMS
+        run: |
+          : > SHA256SUMS
+          find dl -type f | while read -r f; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> SHA256SUMS
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS

@@ -13,13 +13,18 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
-# Agent binaries served at /bin/* — pulled from the latest GitHub release so the
-# image always ships current agents (install command + auto-update both use these).
+# Agent binaries served at /bin/* — pulled from the PUBLIC haive-agent release (an
+# anonymous download; no token needed) so the image always ships current agents
+# (install command + auto-update both use these).
 RUN mkdir -p /app/dist \
  && for a in HaiveControl-linux HaiveControl-linux-arm64 HaiveControl-macos HaiveControl-windows.exe \
-             haive-mcp-linux haive-mcp-macos haive-mcp-windows.exe; do \
-      curl -fsSL "https://github.com/gitayg/HaiveControl/releases/latest/download/$a" -o "/app/dist/$a"; \
+             haive-mcp-linux haive-mcp-linux-arm64 haive-mcp-macos haive-mcp-windows.exe; do \
+      curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a" -o "/app/dist/$a"; \
     done
+# Published checksums, served at /bin/SHA256SUMS, so the 'crane' install source can
+# verify integrity too. Non-fatal if a release predates checksums.
+RUN curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/SHA256SUMS" \
+      -o /app/dist/SHA256SUMS || echo "no SHA256SUMS in latest release yet"
 # Leaflet for the device map's real basemap (served at /bin/leaflet.*). Non-fatal:
 # if the fetch fails the map falls back to the offline graticule.
 RUN curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" -o /app/dist/leaflet.js \
