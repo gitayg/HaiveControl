@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.25.1";
+const VERSION: &str = "2.26.0";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -701,13 +701,15 @@ fn proxy_update(url: &str, agents: &Agents, hub_ip: &str, hub_port: u16) -> Resp
         Some(id) => format!("relay:{id}"),
         None => target.split("://").nth(1).and_then(|s| s.split(':').next()).unwrap_or("").to_string(),
     };
-    let platform = agents
-        .lock()
-        .unwrap()
-        .get(&key)
-        .and_then(|a| a.data.get("platform").and_then(|p| p.as_str()).map(String::from))
-        .unwrap_or_default();
-    let asset = match agent_asset(&platform) {
+    let (platform, arch) = {
+        let g = agents.lock().unwrap();
+        let a = g.get(&key);
+        (
+            a.and_then(|a| a.data.get("platform").and_then(|p| p.as_str()).map(String::from)).unwrap_or_default(),
+            a.and_then(|a| a.data.get("arch").and_then(|p| p.as_str()).map(String::from)).unwrap_or_default(),
+        )
+    };
+    let asset = match agent_asset(&platform, &arch) {
         Some(a) => a,
         None => return Response::from_string("unknown platform for device").with_status_code(400),
     };
@@ -1951,11 +1953,12 @@ fn agent_config() -> Resp {
     json_resp(&serde_json::json!({"ok": true, "tray": setting_str("tray", "on") == "on"}))
 }
 
-fn agent_asset(platform: &str) -> Option<&'static str> {
-    match platform {
-        "windows" => Some("HaiveControl-windows.exe"),
-        "macos" => Some("HaiveControl-macos"),
-        "linux" => Some("HaiveControl-linux"),
+fn agent_asset(platform: &str, arch: &str) -> Option<&'static str> {
+    match (platform, arch) {
+        ("windows", _) => Some("HaiveControl-windows.exe"),
+        ("macos", _) => Some("HaiveControl-macos"),
+        ("linux", "aarch64") => Some("HaiveControl-linux-arm64"),
+        ("linux", _) => Some("HaiveControl-linux"),
         _ => None,
     }
 }
@@ -1968,8 +1971,8 @@ fn bin_url(asset: &str, hub_ip: &str, hub_port: u16) -> String {
     }
 }
 /// Tell a device to self-update to the hub-served build for its platform.
-fn trigger_update(target: &str, platform: &str, hub_ip: &str, hub_port: u16) -> bool {
-    let Some(asset) = agent_asset(platform) else { return false };
+fn trigger_update(target: &str, platform: &str, arch: &str, hub_ip: &str, hub_port: u16) -> bool {
+    let Some(asset) = agent_asset(platform, arch) else { return false };
     let payload = serde_json::json!({ "url": bin_url(asset, hub_ip, hub_port) }).to_string().into_bytes();
     dev_unary(target, "POST", "/update", Some(("application/json".into(), payload))).is_some()
 }
@@ -1983,7 +1986,7 @@ fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
     if setting_str("agent_update", "manual") != "auto" {
         return;
     }
-    let stale: Vec<(String, String)> = {
+    let stale: Vec<(String, String, String)> = {
         let guard = agents.lock().unwrap();
         guard
             .values()
@@ -1994,18 +1997,19 @@ fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
                     return None;
                 }
                 let platform = d.get("platform").and_then(|x| x.as_str())?.to_string();
+                let arch = d.get("arch").and_then(|x| x.as_str()).unwrap_or_default().to_string();
                 let ip = d.get("ip").and_then(|x| x.as_str()).unwrap_or("");
                 let target = if d.get("scheme").and_then(|x| x.as_str()) == Some("relay") {
                     format!("relay://{ip}")
                 } else {
                     format!("{}://{ip}:{}", d.get("scheme").and_then(|x| x.as_str()).unwrap_or("http"), d.get("port").and_then(|x| x.as_i64()).unwrap_or(0))
                 };
-                Some((target, platform))
+                Some((target, platform, arch))
             })
             .collect()
     };
     let now = Instant::now();
-    for (target, platform) in stale {
+    for (target, platform, arch) in stale {
         {
             let mut cd = update_cooldown().lock().unwrap();
             if cd.get(&target).map(|t| now.duration_since(*t) < std::time::Duration::from_secs(300)).unwrap_or(false) {
@@ -2013,7 +2017,7 @@ fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
             }
             cd.insert(target.clone(), now);
         }
-        if trigger_update(&target, &platform, hub_ip, hub_port) {
+        if trigger_update(&target, &platform, &arch, hub_ip, hub_port) {
             audit("", "auto", "auto-update", &target, VERSION);
         }
     }
@@ -2495,7 +2499,7 @@ ID="__ID__"
 PASSWORD="${1:-$HIVE_PW}"
 case "$(uname -s)" in
   Darwin) ASSET="HaiveControl-macos" ;;
-  Linux)  ASSET="HaiveControl-linux" ;;
+  Linux)  case "$(uname -m)" in aarch64|arm64) ASSET="HaiveControl-linux-arm64" ;; *) ASSET="HaiveControl-linux" ;; esac ;;
   *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac
 DEST="$HOME/.airm/airm"; mkdir -p "$HOME/.airm"
@@ -2615,7 +2619,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             (
                 cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --background")),
                 cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --background")),
-                cmd_block("Linux", &format!("curl -L -o airm {b}/bin/HaiveControl-linux && chmod +x airm\n./airm --relay {b}{ex} --background")),
+                cmd_block("Linux (auto-detects x86_64 / arm64)", &format!("A=HaiveControl-linux; [ \"$(uname -m)\" = aarch64 ] && A=HaiveControl-linux-arm64\ncurl -L -o airm {b}/bin/$A && chmod +x airm\n./airm --relay {b}{ex} --background")),
             )
         }
         None => {

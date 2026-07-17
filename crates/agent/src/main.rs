@@ -154,6 +154,19 @@ fn relay_id(name: &str) -> String {
 /// The args to persist for autostart: the current invocation minus the one-shot
 /// persistence/detach flags, so the installed command re-runs in the same mode
 /// (relay or LAN) without re-triggering install or backgrounding.
+/// The release asset name for this platform + arch (matches build.yml suffixes),
+/// so auto-update pulls the right binary — e.g. an aarch64 Linux box (a Radxa/Pi)
+/// gets HaiveControl-linux-arm64, not the x86_64 one.
+fn agent_asset() -> String {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", _) => "HaiveControl-windows.exe",
+        ("macos", _) => "HaiveControl-macos",
+        ("linux", "aarch64") => "HaiveControl-linux-arm64",
+        _ => "HaiveControl-linux",
+    }
+    .to_string()
+}
+
 pub(crate) fn persist_args() -> Vec<String> {
     std::env::args()
         .skip(1)
@@ -423,12 +436,7 @@ fn main() {
     if let Some(mid) = mac_id.clone() {
         let (primary, fid, nm, si) = (mid.clone(), args.id.clone(), name.clone(), sysinfo.clone());
         std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, si));
-        let asset = match std::env::consts::OS {
-            "windows" => "HaiveControl-windows.exe",
-            "macos" => "HaiveControl-macos",
-            _ => "HaiveControl-linux",
-        }
-        .to_string();
+        let asset = agent_asset();
         let fid = args.id.clone();
         std::thread::spawn(move || discovery::auto_update_loop(mid, fid, asset));
     }
@@ -462,12 +470,7 @@ fn main() {
         println!("   relay: dialing {relay_addr} as {rid}");
         config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
         analysis::start(relay_addr.clone(), rid.clone(), token.clone());
-        let asset = match std::env::consts::OS {
-            "windows" => "HaiveControl-windows.exe",
-            "macos" => "HaiveControl-macos",
-            _ => "HaiveControl-linux",
-        }
-        .to_string();
+        let asset = agent_asset();
         discovery::auto_update_relay(relay_addr.clone(), asset);
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
