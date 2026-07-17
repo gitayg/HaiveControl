@@ -16,7 +16,7 @@ COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
 # Agent binaries served at /bin/* — pulled from the latest GitHub release so the
 # image always ships current agents (install command + auto-update both use these).
 RUN mkdir -p /app/dist \
- && for a in HaiveControl-linux HaiveControl-macos HaiveControl-windows.exe \
+ && for a in HaiveControl-linux HaiveControl-linux-arm64 HaiveControl-macos HaiveControl-windows.exe \
              haive-mcp-linux haive-mcp-macos haive-mcp-windows.exe; do \
       curl -fsSL "https://github.com/gitayg/HaiveControl/releases/latest/download/$a" -o "/app/dist/$a"; \
     done

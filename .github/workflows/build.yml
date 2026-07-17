@@ -23,6 +23,9 @@ jobs:
           - os: ubuntu-latest
             suffix: linux
             ext: ""
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
+            ext: ""
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +33,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Linux capture/input build deps
-        if: matrix.os == 'ubuntu-latest'
+        if: startsWith(matrix.os, 'ubuntu')
         run: >
           sudo apt-get update && sudo apt-get install -y
           libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
