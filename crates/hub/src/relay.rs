@@ -86,6 +86,31 @@ fn retire_superseded(agents: &Agents, keep_key: &str, hostname: &str) {
     }
 }
 
+/// Registry-wide dedup, run on a timer (and once at startup): for every hostname
+/// that has a stable hc-<machine-id> row, drop stale pre-2.27 (name-hash) rows for
+/// that same hostname — even when the hc- agent itself is offline (asleep). The
+/// hc- hello handler already does this at check-in; this widens *when* it fires so
+/// a machine that reported once under hc- and then went to sleep still gets its
+/// leftover old row cleared. retire_superseded's 45s guard still protects a live
+/// separate machine that happens to share the hostname.
+pub fn dedup_sweep(agents: &Agents) {
+    let hc: Vec<(String, String)> = {
+        let map = agents.lock().unwrap();
+        map.iter()
+            .filter(|(k, _)| k.starts_with("relay:hc-"))
+            .filter_map(|(k, a)| {
+                a.data
+                    .get("hostname")
+                    .and_then(|x| x.as_str())
+                    .map(|h| (k.clone(), h.to_string()))
+            })
+            .collect()
+    };
+    for (keep_key, host) in hc {
+        retire_superseded(agents, &keep_key, &host);
+    }
+}
+
 /// POST /relay/hello — register (or heartbeat) a relay agent.
 pub fn hello(agents: &Agents, data: serde_json::Value) {
     let agent_id = match data.get("relay_id").and_then(|x| x.as_str()) {

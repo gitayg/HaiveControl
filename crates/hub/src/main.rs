@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.27.3";
+const VERSION: &str = "2.27.4";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -2239,6 +2239,7 @@ fn run_scheduled(agents: &Agents, s: &serde_json::Value) {
 fn start_scheduler(agents: Arc<Agents>, hub_ip: String, hub_port: u16) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
+        relay::dedup_sweep(&agents);
         auto_update_pass(&agents, &hub_ip, hub_port);
         let now = now_secs();
         let mut all = load_schedules();
