@@ -2503,7 +2503,10 @@ $ErrorActionPreference = "Stop"
 $hub = "__HUB__"
 $id  = "__ID__"
 $dir = Join-Path $env:LOCALAPPDATA "airm"
-$dest = Join-Path $dir "airm.exe"
+# Unique filename: a running airm.exe locks the file, so overwriting it fails and
+# you'd launch the stale binary. A fresh name always downloads; machine-id keeps
+# it the same device, so the old copy is superseded on its next self-update.
+$dest = Join-Path $dir ("airm-" + (Get-Random) + ".exe")
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Write-Host "Downloading airm from $hub ..."
 Invoke-WebRequest -Uri "http://$hub/bin/HaiveControl-windows.exe" -OutFile $dest
@@ -2524,7 +2527,11 @@ case "$(uname -s)" in
   Linux)  case "$(uname -m)" in aarch64|arm64) ASSET="HaiveControl-linux-arm64" ;; *) ASSET="HaiveControl-linux" ;; esac ;;
   *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac
-DEST="$HOME/.airm/airm"; mkdir -p "$HOME/.airm"
+mkdir -p "$HOME/.airm"
+# Unique filename so a download can't be blocked by an already-running airm; the
+# machine-id keeps it the same device, so the old copy is superseded on its next
+# self-update.
+DEST="$HOME/.airm/airm-$$"
 echo "Downloading airm ($ASSET) from $HUB ..."
 curl -fsSL "http://$HUB/bin/$ASSET" -o "$DEST"
 chmod +x "$DEST"
@@ -2627,7 +2634,14 @@ fn json_audit(user: Option<&str>) -> Resp {
 fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: Option<&str>, accepts_gzip: bool) -> Resp {
     // When the hub is reachable at a public URL (a cloud deploy), show relay-mode
     // install commands (device dials out); otherwise LAN-mode (hub reaches in).
-    let (win, mac, lin) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+    // Two blocks: ONE Unix script that auto-detects macOS / Linux-x86_64 /
+    // Linux-arm64 (covers everything from a Mac to a Radxa), and ONE Windows
+    // Command-Prompt line (no PowerShell). Both download to a UNIQUE filename
+    // (airm-$$ / airm-!random!.exe) so a currently-running, file-locked airm can't
+    // block the download — machine-id keeps it the same device, so the old copy is
+    // just superseded on its next self-update. `cmd /v:on` enables delayed
+    // expansion so !f! resolves in a one-liner.
+    let (unix, windows) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
         Some(pub_url) => {
             let b = pub_url.trim_end_matches('/').to_string();
             // One per-owner token that BOTH authenticates the relay AND stamps
@@ -2642,17 +2656,15 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
                 },
             };
             (
-                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe {b}/bin/HaiveControl-windows.exe\n.\\airm.exe --relay {b}{ex} --background")),
-                cmd_block("macOS", &format!("curl -L -o airm {b}/bin/HaiveControl-macos && chmod +x airm\n./airm --relay {b}{ex} --background")),
-                cmd_block("Linux (auto-detects x86_64 / arm64)", &format!("A=HaiveControl-linux; [ \"$(uname -m)\" = aarch64 ] && A=HaiveControl-linux-arm64\ncurl -L -o airm {b}/bin/$A && chmod +x airm\n./airm --relay {b}{ex} --background")),
+                cmd_block("Linux & macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && \"./$f\" --relay {b}{ex} --background")),
+                cmd_block("Windows — Command Prompt (no PowerShell)", &format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! {b}/bin/HaiveControl-windows.exe& !f! --relay {b}{ex} --background\"")),
             )
         }
         None => {
             let hub = format!("{hub_ip}:{hub_port}");
             (
-                cmd_block("Windows (PowerShell or cmd)", &format!("curl.exe -L -o airm.exe http://{hub}/bin/HaiveControl-windows.exe\n.\\airm.exe {hub} --id {mac_id}")),
-                cmd_block("macOS", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-macos && chmod +x airm\n./airm {hub} --id {mac_id}")),
-                cmd_block("Linux", &format!("curl -L -o airm http://{hub}/bin/HaiveControl-linux && chmod +x airm\n./airm {hub} --id {mac_id}")),
+                cmd_block("Linux & macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
+                cmd_block("Windows — Command Prompt (no PowerShell)", &format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! http://{hub}/bin/HaiveControl-windows.exe& !f! {hub} --id {mac_id}\"")),
             )
         }
     };
@@ -2694,7 +2706,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <main class=\"stage\">\
-<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{win}{mac}{lin}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
+<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{unix}{windows}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
 <div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div><button class=\"b subtle\" style=\"margin-left:auto\" onclick=\"doClaimAll()\" title=\"assign every device to your account so the whole fleet lists under you\">Claim all to me</button></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
