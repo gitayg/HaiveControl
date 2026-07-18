@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.28.0";
+const VERSION: &str = "2.28.1";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -3243,11 +3243,19 @@ function schTypeChg(i){var row=rowOf(i),t=row.querySelector('.sch-type').value;r
 function doSchedRow(i){var r=allRows()[i],row=rowOf(i);var kind=rowKind(r,row),arg=rowArg(r,row);if(r.arg&&!arg){out('[enter '+r.arg+']');return;}var t=row.querySelector('.sch-type').value,when={type:t};if(t==='daily'){when.hhmm=row.querySelector('.sch-hhmm').value;}else{when.mins=parseInt(row.querySelector('.sch-mins').value,10)||1;}out('scheduling '+r.nm+'…');fetch(API+'/x/schedule-add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,kind:kind,arg:arg,label:r.nm,when:when})}).then(function(rr){return rr.json();}).then(function(j){out(j.ok?('Scheduled: '+r.nm+' ('+schedWhen(when)+'). See ⏰ Scheduled.'):('[error] '+(j.error||'failed')));row.querySelector('.arow-sched').style.display='none';}).catch(function(e){out('error: '+e);});}
 function schedWhen(w){return w.type==='once'?('once, in '+w.mins+'m'):w.type==='interval'?('every '+w.mins+'m'):('daily '+w.hhmm+' UTC');}
 function camI(){var s=document.getElementById('campick');return (s&&s.value)?s.value:'0';}
-function setView(url){var v=document.getElementById('view');v.src=url;v.style.display='block';document.getElementById('vp-hint').style.display='none';document.getElementById('vp-tools').style.display='flex';}
-function stopView(){var v=document.getElementById('view');v.removeAttribute('src');v.style.display='none';document.getElementById('vp-hint').style.display='block';document.getElementById('vp-tools').style.display='none';}
+var LIVE=null,LIVETOK=0;
+function stopLive(){LIVETOK++;if(LIVE){clearTimeout(LIVE);LIVE=null;}}
+function vpBusy(m){var h=document.getElementById('vp-hint');h.textContent=m;h.style.display='block';document.getElementById('view').style.display='none';document.getElementById('vp-tools').style.display='flex';}
+function vpShow(){document.getElementById('vp-hint').style.display='none';document.getElementById('view').style.display='block';}
+function setView(url){stopLive();var v=document.getElementById('view');v.onload=function(){vpShow();};v.onerror=function(){document.getElementById('vp-hint').textContent='Request failed — the device may be offline or busy.';};vpBusy('Requesting… (relay devices can take a moment)');v.src=url;}
+function stopView(){stopLive();var v=document.getElementById('view');v.onload=null;v.onerror=null;v.removeAttribute('src');v.style.display='none';var h=document.getElementById('vp-hint');h.textContent='Press Live screen, Screenshot, or a Camera action — it renders here.';h.style.display='block';document.getElementById('vp-tools').style.display='none';}
 function openTab(){var v=document.getElementById('view');var s=v.getAttribute('src');if(s)window.open(s,'_blank');}
-function doLive(){setView(API+'/x/stream?target='+enc(SEL));}
-function doCamLive(){setView(API+'/x/camstream?target='+enc(SEL)+'&index='+camI());}
+/* Relay devices can't carry an endless MJPEG body through the unary tunnel, so 'live'
+   is a fast frame-poll (each shot is a unary request). Direct/LAN devices keep true MJPEG. */
+function startPoll(mk){stopLive();var v=document.getElementById('view');v.onload=null;v.onerror=null;var t=SEL,tok=++LIVETOK;vpBusy('Starting live view…');pollFrame(t,tok,mk);}
+function pollFrame(t,tok,mk){if(tok!==LIVETOK||SEL!==t)return;var v=document.getElementById('view');var img=new Image();img.onload=function(){if(tok!==LIVETOK||SEL!==t)return;v.src=img.src;vpShow();LIVE=setTimeout(function(){pollFrame(t,tok,mk);},120);};img.onerror=function(){if(tok!==LIVETOK||SEL!==t)return;vpBusy('Live view unreachable — retrying…');LIVE=setTimeout(function(){pollFrame(t,tok,mk);},1000);};img.src=mk(t);}
+function doLive(){var d=DEV[SEL]||{};if(d.scheme!=='relay'){setView(API+'/x/stream?target='+enc(SEL));return;}startPoll(function(t){return API+'/x/frame?target='+enc(t)+'&_t='+Date.now();});}
+function doCamLive(){var d=DEV[SEL]||{};if(d.scheme!=='relay'){setView(API+'/x/camstream?target='+enc(SEL)+'&index='+camI());return;}var ix=camI();startPoll(function(t){return API+'/x/camera?target='+enc(t)+'&index='+ix+'&_t='+Date.now();});}
 function doShot(){setView(API+'/x/frame?target='+enc(SEL)+'&_t='+Date.now());}
 function doCamSnap(){setView(API+'/x/camera?target='+enc(SEL)+'&index='+camI()+'&_t='+Date.now());}
 function out(t){var o=document.getElementById('out');o.style.display='block';o.textContent=t;o.scrollIntoView({behavior:'smooth',block:'nearest'});o.classList.remove('flash');void o.offsetWidth;o.classList.add('flash');}
