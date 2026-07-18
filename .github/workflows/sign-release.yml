@@ -1,0 +1,145 @@
+name: sign-release
+
+# Plan B — the code-signing cert never sits in the PUBLIC repo.
+#
+# The public gitayg/haive-agent CI builds + attests + publishes UNSIGNED binaries.
+# This PRIVATE workflow downloads those binaries, Authenticode/Developer-ID signs
+# them here (all signing secrets live in THIS private repo), and re-uploads the
+# signed binaries + a refreshed SHA256SUMS to the same public release.
+#
+# Run it after the public release publishes:
+#   Actions → sign-release → Run workflow → tag = v2.28.0
+#
+# Secrets required in THIS repo (NOT the public one):
+#   HAIVE_AGENT_RELEASE_TOKEN  PAT with contents:write on gitayg/haive-agent (upload assets)
+#   macOS:  MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
+#   Windows (pick one): SIGNPATH_ORGANIZATION_ID + SIGNPATH_API_TOKEN  (preferred; needs the
+#                       SignPath GitHub App on THIS repo + a project + 'release-signing' policy)
+#                    OR AZURE_TENANT_ID + AZURE_CLIENT_ID + AZURE_CLIENT_SECRET +
+#                       AZURE_TS_ENDPOINT + AZURE_TS_ACCOUNT + AZURE_TS_PROFILE
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: haive-agent release tag to sign (e.g. v2.28.0)
+        required: true
+
+env:
+  PUB: gitayg/haive-agent
+  GH_TOKEN: ${{ secrets.HAIVE_AGENT_RELEASE_TOKEN }}
+  TAG: ${{ inputs.tag }}   # referenced as "$TAG" in run: blocks, never inlined (injection-safe)
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Download unsigned macOS binaries
+        run: |
+          mkdir out
+          gh release download "$TAG" --repo "$PUB" --dir out --pattern '*-macos'
+      - name: Sign & notarize
+        env:
+          MAC_CSC_B64: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_PASS: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$MAC_CSC_B64" ]; then echo "::error::MAC_CSC_LINK not set"; exit 1; fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KCPASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KCPASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPASS" "$KC"
+          echo "$MAC_CSC_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CSC_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          ID="$(security find-identity -v -p codesigning "$KC" | awk '/Developer ID Application/{print $2; exit}')"
+          echo "Signing with $ID"
+          for f in out/*-macos; do
+            codesign --force --options runtime --timestamp --keychain "$KC" --sign "$ID" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          # Bare Mach-O binaries submit for notarization but can't be stapled — fine for a
+          # curl'd terminal binary. Non-fatal so a notary flake never blocks the release.
+          ( cd out && zip -q notarize.zip *-macos )
+          xcrun notarytool submit out/notarize.zip --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait \
+            || echo "⚠ notarization failed (binaries still Developer-ID signed)"
+          rm -f out/notarize.zip
+      - name: Re-upload signed macOS binaries
+        run: gh release upload "$TAG" --repo "$PUB" --clobber out/*-macos
+
+  windows:
+    runs-on: ubuntu-latest
+    env:
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+    steps:
+      - name: Download unsigned Windows binaries
+        run: |
+          mkdir out
+          gh release download "$TAG" --repo "$PUB" --dir out --pattern '*-windows.exe'
+
+      # SignPath (preferred): submit the run artifact, get signed .exe files back into out/.
+      - name: Upload for SignPath
+        id: signpath-upload
+        if: env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows-exe
+          path: out/*-windows.exe
+          if-no-files-found: error
+      - name: Sign (SignPath Foundation)
+        if: env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: haive-agent
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.signpath-upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: out
+
+      # Azure Trusted Signing (fallback): signs the .exe files in place.
+      - name: Sign (Azure Trusted Signing)
+        if: env.AZURE_CLIENT_ID != '' && env.SIGNPATH_ORGANIZATION_ID == ''
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/out
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Re-upload signed Windows binaries
+        run: gh release upload "$TAG" --repo "$PUB" --clobber out/*-windows.exe
+
+  # Signing rewrote the mac/win bytes, so the published SHA256SUMS is now stale.
+  # Download the FINAL asset set (signed mac/win + unsigned linux) and regenerate it.
+  refresh-checksums:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Recompute SHA256SUMS over the final assets
+        run: |
+          mkdir dl
+          gh release download "$TAG" --repo "$PUB" --dir dl \
+            --pattern 'HaiveControl-*' --pattern 'haive-mcp-*' --pattern 'haivectl-*'
+          : > SHA256SUMS
+          for f in dl/*; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> SHA256SUMS
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+      - name: Re-upload SHA256SUMS
+        run: gh release upload "$TAG" --repo "$PUB" --clobber SHA256SUMS
