@@ -16,7 +16,14 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.28.1";
+const VERSION: &str = "2.28.2";
+
+/// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
+/// the device unclaimed — i.e. visible to every user on the hub — while reporting
+/// success, so we fail loudly with the exact thing to check.
+const NO_IDENTITY: &str = "Cannot claim: the hub did not receive your SSO identity (X-AppCrane-User-Email). \
+Open /whoami — if sso_user_raw is empty, the app's auth_mode must be 'authenticated' and '/' and '/x' \
+must NOT be in auth_bypass_paths. Fix that, reload, then claim again.";
 const HUB_SERVICE: &str = "_rmtscrn._tcp.local.";
 const STALE: Duration = Duration::from_secs(40);
 
@@ -1266,9 +1273,15 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
         return Response::from_string("no target").with_status_code(400);
     }
     let owner = match query_param(url, "owner") {
-        Some(o) if o.is_empty() => String::new(),
+        Some(o) if o.is_empty() => String::new(), // explicit ?owner= — an intentional unclaim
         Some(o) => canon_owner(&o),
-        None => user.unwrap_or("").to_string(),
+        // No identity reached the hub. Writing "" here would leave the device
+        // unclaimed (= visible to EVERY user) while reporting success — the silent
+        // no-op that made earlier claims look like they worked. Refuse instead.
+        None => match user {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
+        },
     };
     set_owner(agents, &device_key(&target), &owner);
     json_resp(&serde_json::json!({"ok": true, "owner": owner}))
@@ -1278,9 +1291,12 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
 /// (or `?owner=`). One click to consolidate the fleet under one account.
 fn claim_all_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
     let owner = match query_param(url, "owner") {
-        Some(o) if o.is_empty() => String::new(),
+        Some(o) if o.is_empty() => String::new(), // explicit ?owner= — an intentional unclaim
         Some(o) => canon_owner(&o),
-        None => user.unwrap_or("").to_string(),
+        None => match user {
+            Some(u) if !u.is_empty() => u.to_string(),
+            _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
+        },
     };
     let keys: Vec<String> = agents.lock().unwrap().keys().cloned().collect();
     for k in &keys {
@@ -3271,8 +3287,9 @@ function doGet(){openFb(SEL,'get');}
 function doPut(){openFb(SEL,'put');}
 function doUpd(){if(!confirm('Update the agent on this device to the latest build?'))return;out('updating…');fetch(API+'/x/update?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
 function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
-function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(function(r){return r.json();}).then(function(){out('claimed — this device is now under your account.');fetchAgents();}).catch(function(e){out('error: '+e);});}
-function doClaimAll(){var n=(LAST||[]).length;if(!confirm('Assign all '+n+' device'+(n===1?'':'s')+' to your account? They will list under you (and only you).'))return;fetch(API+'/x/claim-all').then(function(r){return r.json();}).then(function(j){alert('Claimed '+(j.count||0)+' device'+((j.count===1)?'':'s')+' to your account.');fetchAgents();}).catch(function(e){alert('error: '+e);});}
+function okJson(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});return r.json();}
+function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(okJson).then(function(j){out('claimed — this device is now owned by '+(j.owner||'you')+'.');fetchAgents();}).catch(function(e){out('claim failed: '+(e.message||e));});}
+function doClaimAll(){var n=(LAST||[]).length;if(!confirm('Assign all '+n+' device'+(n===1?'':'s')+' to your account? They will list under you (and only you).'))return;fetch(API+'/x/claim-all').then(okJson).then(function(j){alert('Claimed '+(j.count||0)+' device'+((j.count===1)?'':'s')+' to '+(j.owner||'your account')+'.');fetchAgents();}).catch(function(e){alert('Claim failed:\n\n'+(e.message||e));});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 function doPersist(){if(!confirm('Make this device persistent? Installs autostart so the agent survives reboot/login, and stops the machine sleeping while on AC power. Dissolve reverts both.'))return;out('making persistent…');fetch(API+'/x/persist?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);setTimeout(fetchAgents,1500);}).catch(function(e){out('error: '+e);});}
 function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
