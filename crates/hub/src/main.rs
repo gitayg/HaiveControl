@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.28.2";
+const VERSION: &str = "2.28.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -193,11 +193,39 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             relay::hello(agents, data);
             Response::from_string("").with_status_code(204)
         }
-        (Method::Get, "/whoami") => json_resp(&serde_json::json!({
-            "sso_user_raw": req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User")),
-            "derived_owner": user.as_deref(),
-            "note": "if sso_user_raw is null, the hub is not receiving your SSO identity — dashboard scoping and Claim can't work"
-        })),
+        (Method::Get, "/whoami") => {
+            // Dump every header the proxy actually sends so we can see what identity
+            // header (if any) AppCrane injects, instead of guessing at the name.
+            // Cookie/Authorization are redacted — this output is meant to be pasted.
+            let all: Vec<serde_json::Value> = req
+                .headers()
+                .iter()
+                .map(|h| {
+                    let name = h.field.as_str().as_str().to_string();
+                    let lower = name.to_ascii_lowercase();
+                    let val = if lower == "cookie" || lower == "authorization" {
+                        "[redacted]".to_string()
+                    } else {
+                        h.value.as_str().to_string()
+                    };
+                    serde_json::json!({ "name": name, "value": val })
+                })
+                .collect();
+            let identity_like: Vec<&serde_json::Value> = all
+                .iter()
+                .filter(|h| {
+                    let n = h["name"].as_str().unwrap_or("").to_ascii_lowercase();
+                    n.starts_with("x-") && (n.contains("user") || n.contains("email") || n.contains("auth") || n.contains("crane"))
+                })
+                .collect();
+            json_resp(&serde_json::json!({
+                "sso_user_raw": req_header(&req, "X-AppCrane-User-Email").or_else(|| req_header(&req, "X-AppCrane-User")),
+                "derived_owner": user.as_deref(),
+                "identity_like_headers": identity_like,
+                "all_headers": all,
+                "note": "if sso_user_raw is null, the hub is not receiving your SSO identity — dashboard scoping and Claim can't work. Check identity_like_headers for the name AppCrane actually uses."
+            }))
+        }
         (Method::Post, "/relay/analysis") => recv_analysis(&mut req),
         (Method::Post, "/relay/cert") => {
             let mut body = String::new();
