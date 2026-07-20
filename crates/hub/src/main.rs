@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.29.0";
+const VERSION: &str = "2.29.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -542,10 +542,11 @@ fn build_session_summary(actor: &str, sess: &Session) -> String {
     use std::collections::{BTreeMap, BTreeSet};
     let mut by_action: BTreeMap<String, u32> = BTreeMap::new();
     let mut devices: BTreeSet<String> = BTreeSet::new();
+    let mut cmds: BTreeMap<String, u32> = BTreeMap::new();
     let mut total = 0u32;
     {
         let log = audit_log().lock().unwrap();
-        for (at, a, source, action, device, _) in log.iter() {
+        for (at, a, source, action, device, detail) in log.iter() {
             if a != actor || source == "summary" || *at < sess.start || *at > sess.last {
                 continue;
             }
@@ -553,6 +554,15 @@ fn build_session_summary(actor: &str, sess: &Session) -> String {
             *by_action.entry(action.clone()).or_default() += 1;
             if !device.is_empty() && device != "—" && !device.starts_with("all (") {
                 devices.insert(device.clone());
+            }
+            // Summarize commands by their verb (first token, path-stripped) rather
+            // than storing the whole line in the rollup — a secret typed inline stays
+            // out of the summary.
+            if (action == "run command" || action == "launch command") && !detail.is_empty() {
+                let v = cmd_verb(detail);
+                if !v.is_empty() {
+                    *cmds.entry(v).or_default() += 1;
+                }
             }
         }
     }
@@ -570,12 +580,36 @@ fn build_session_summary(actor: &str, sess: &Session) -> String {
         let n = d.len();
         if n > 6 { d.truncate(6); format!("{} +{} more", d.join(", "), n - 6) } else { d.join(", ") }
     };
+    let cmd_txt = if cmds.is_empty() {
+        String::new()
+    } else {
+        let mut items: Vec<String> = cmds
+            .iter()
+            .map(|(k, v)| if *v > 1 { format!("{k} ×{v}") } else { k.clone() })
+            .collect();
+        let n = items.len();
+        if n > 8 {
+            items.truncate(8);
+            format!(" Commands: {} +{} more.", items.join(", "), n - 8)
+        } else {
+            format!(" Commands: {}.", items.join(", "))
+        }
+    };
     let who = if actor.is_empty() { "Operator" } else { actor };
     format!(
-        "{who}: {total} action{as_} over {dur} across {dev_count} device{ds} — {breakdown}. Devices: {dev_txt}.",
+        "{who}: {total} action{as_} over {dur} across {dev_count} device{ds} — {breakdown}.{cmd_txt} Devices: {dev_txt}.",
         as_ = if total == 1 { "" } else { "s" },
         ds = if dev_count == 1 { "" } else { "s" },
     )
+}
+
+/// A concise label for a command: its first token, path- and quote-stripped.
+/// Used to summarize what commands ran without echoing full (possibly secret-
+/// bearing) command lines into the session summary.
+fn cmd_verb(cmd: &str) -> String {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    base.trim_matches(|c| c == '"' || c == '\'').chars().take(32).collect()
 }
 
 /// Human label for an auditable action path (`/x/*` or `/m/*`).
@@ -3509,17 +3543,21 @@ mod session_tests {
         let actor = "alice@test";
         audit(actor, "browser", "screenshot", "Baruch", "");
         audit(actor, "browser", "screenshot", "Baruch", "");
-        audit(actor, "mcp", "run command", "LE11", "");
+        audit(actor, "mcp", "run command", "LE11", "whoami /all");
+        audit(actor, "mcp", "run command", "LE11", "C:\\Windows\\System32\\systeminfo.exe");
         // A different operator's activity must never leak into alice's summary.
         audit("bob@test", "browser", "screenshot", "AIO", "");
         let now = Instant::now();
         let sess = Session { start: now - Duration::from_secs(120), last: now, summarized: false };
         let s = build_session_summary(actor, &sess);
         assert!(s.contains("alice@test"), "{s}");
-        assert!(s.contains("3 actions"), "{s}");
+        assert!(s.contains("4 actions"), "{s}");
         assert!(s.contains("2 devices"), "{s}");
         assert!(s.contains("2\u{00d7} screenshot"), "{s}");
-        assert!(s.contains("1\u{00d7} run command"), "{s}");
+        assert!(s.contains("2\u{00d7} run command"), "{s}");
+        // command verbs are summarized, path- and arg-stripped
+        assert!(s.contains("Commands:") && s.contains("whoami") && s.contains("systeminfo.exe"), "{s}");
+        assert!(!s.contains("/all"), "full command args leaked into summary: {s}");
         assert!(s.contains("Baruch") && s.contains("LE11"), "{s}");
         assert!(!s.contains("AIO"), "bob's device leaked: {s}");
     }
