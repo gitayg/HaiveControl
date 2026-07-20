@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.29.1";
+const VERSION: &str = "2.29.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2975,8 +2975,13 @@ pre{margin:0}
 .aud-src.mcp{background:rgba(91,157,255,.16);color:var(--accent)}
 .aud-src.browser{background:var(--surface2);color:var(--muted)}
 .aud-src.summary{background:rgba(123,216,143,.16);color:#7bd88f}
-.aud-row.aud-summary{background:rgba(123,216,143,.06);border-left:2px solid #7bd88f}
-.aud-row.aud-summary .aud-detail{color:var(--text);font-weight:500}
+.aud-row.aud-summary{background:rgba(123,216,143,.06);border-left:2px solid #7bd88f;align-items:start}
+.aud-row.aud-summary .aud-detail{color:var(--text);font-weight:500;white-space:normal;overflow:visible;line-height:1.55}
+.aud-sum-head{display:block}
+.aud-sum-row{display:block;margin-top:5px;font-weight:400}
+.aud-sum-lbl{color:var(--muted);margin-right:6px;font-size:11px}
+.aud-cmd{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:var(--surface2);border:.5px solid var(--line);border-radius:4px;padding:1px 5px;margin:0 5px 3px 0;color:var(--accent);white-space:nowrap;display:inline-block}
+.aud-sum-dev{color:var(--muted)}
 .aud-act{color:#d7dbe6;font-weight:600}
 .aud-dev{color:#c3c9d8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .aud-detail{color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3372,7 +3377,8 @@ function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var n=(LAST||[]).length;if(!confirm('Run this command on ALL '+n+' device'+(n===1?'':'s')+'?\n\n'+c))return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch(API+'/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 var AUD_ALL=[];
 function loadAudit(){fetch(API+'/audit').then(function(r){return r.json();}).then(function(j){AUD_ALL=j.audit||[];renderAudit();}).catch(function(){});}
-function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){var isS=e.source==='summary';return '<div class="aud-row'+(isS?' aud-summary':'')+'"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(isS?'session':(e.source||''))+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}
+function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){var isS=e.source==='summary';return '<div class="aud-row'+(isS?' aud-summary':'')+'"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(isS?'session':(e.source||''))+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+(isS?fmtSummary(e.detail||''):esc2(e.detail||''))+'</span></div>';}).join('');}
+function fmtSummary(t){var devs='',cmds='',head=t;var di=t.indexOf(' Devices: ');if(di>=0){devs=t.slice(di+10).replace(/\.\s*$/,'');head=t.slice(0,di);}var ci=head.indexOf(' Commands: ');if(ci>=0){cmds=head.slice(ci+11).replace(/\.\s*$/,'');head=head.slice(0,ci);}var h='<span class="aud-sum-head">'+esc2(head)+'</span>';if(cmds){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Commands</span>'+cmds.split(', ').map(function(c){return '<code class="aud-cmd">'+esc2(c)+'</code>';}).join('')+'</span>';}if(devs){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Devices</span><span class="aud-sum-dev">'+esc2(devs)+'</span></span>';}return h;}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
