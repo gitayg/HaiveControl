@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.28.3";
+const VERSION: &str = "2.29.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -463,16 +463,119 @@ fn audit_log() -> &'static Mutex<std::collections::VecDeque<AuditEvent>> {
 }
 
 fn audit(actor: &str, source: &str, action: &str, device: &str, detail: &str) {
-    let mut m = audit_log().lock().unwrap();
-    m.push_front((
-        Instant::now(),
-        actor.to_string(),
-        source.to_string(),
-        action.to_string(),
-        device.to_string(),
-        detail.chars().take(180).collect(),
-    ));
-    m.truncate(500);
+    {
+        let mut m = audit_log().lock().unwrap();
+        m.push_front((
+            Instant::now(),
+            actor.to_string(),
+            source.to_string(),
+            action.to_string(),
+            device.to_string(),
+            detail.chars().take(180).collect(),
+        ));
+        m.truncate(500);
+    }
+    // Feed the idle-summary tracker with real operator activity only — never the
+    // summary events this produces (that would loop forever).
+    if source != "summary" {
+        touch_session(actor);
+    }
+}
+
+// ---- Operator session summaries -------------------------------------------
+// After SESSION_IDLE of no activity from an operator, a rollup of everything
+// that operator did in the session is appended to the audit log (as a
+// source="summary" event, visible only to that operator). In-memory, exactly
+// like the audit log it summarizes.
+const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone)]
+struct Session {
+    start: Instant,
+    last: Instant,
+    summarized: bool,
+}
+
+fn sessions() -> &'static Mutex<HashMap<String, Session>> {
+    static S: std::sync::OnceLock<Mutex<HashMap<String, Session>>> = std::sync::OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Mark operator activity now. A gap ≥ SESSION_IDLE (or a session already
+/// summarized) starts a fresh session window.
+fn touch_session(actor: &str) {
+    let now = Instant::now();
+    let mut s = sessions().lock().unwrap();
+    let e = s.entry(actor.to_string()).or_insert(Session { start: now, last: now, summarized: false });
+    if e.summarized || now.duration_since(e.last) >= SESSION_IDLE {
+        *e = Session { start: now, last: now, summarized: false };
+    }
+    e.last = now;
+}
+
+/// Append a summary for every operator idle past the threshold. Runs on the
+/// hub's periodic sweep, so the 30s granularity is well under SESSION_IDLE.
+fn session_summary_sweep() {
+    let now = Instant::now();
+    let due: Vec<(String, Session)> = {
+        let mut s = sessions().lock().unwrap();
+        s.iter_mut()
+            .filter(|(_, e)| !e.summarized && now.duration_since(e.last) >= SESSION_IDLE)
+            .map(|(a, e)| { e.summarized = true; (a.clone(), e.clone()) })
+            .collect()
+    };
+    for (actor, sess) in due {
+        let text = build_session_summary(&actor, &sess);
+        audit(&actor, "summary", "session summary", "—", &text);
+    }
+}
+
+fn fmt_dur(secs: u64) -> String {
+    if secs < 60 { format!("{secs}s") }
+    else if secs < 3600 { format!("{}m", secs / 60) }
+    else { format!("{}h {}m", secs / 3600, (secs % 3600) / 60) }
+}
+
+/// Roll up an operator's session by scanning the audit log for their events
+/// within the session window.
+fn build_session_summary(actor: &str, sess: &Session) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut by_action: BTreeMap<String, u32> = BTreeMap::new();
+    let mut devices: BTreeSet<String> = BTreeSet::new();
+    let mut total = 0u32;
+    {
+        let log = audit_log().lock().unwrap();
+        for (at, a, source, action, device, _) in log.iter() {
+            if a != actor || source == "summary" || *at < sess.start || *at > sess.last {
+                continue;
+            }
+            total += 1;
+            *by_action.entry(action.clone()).or_default() += 1;
+            if !device.is_empty() && device != "—" && !device.starts_with("all (") {
+                devices.insert(device.clone());
+            }
+        }
+    }
+    let dur = fmt_dur(sess.last.duration_since(sess.start).as_secs());
+    let breakdown = if by_action.is_empty() {
+        "no recorded actions".to_string()
+    } else {
+        by_action.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join(", ")
+    };
+    let dev_count = devices.len();
+    let dev_txt = if devices.is_empty() {
+        "none".to_string()
+    } else {
+        let mut d: Vec<String> = devices.into_iter().collect();
+        let n = d.len();
+        if n > 6 { d.truncate(6); format!("{} +{} more", d.join(", "), n - 6) } else { d.join(", ") }
+    };
+    let who = if actor.is_empty() { "Operator" } else { actor };
+    format!(
+        "{who}: {total} action{as_} over {dur} across {dev_count} device{ds} — {breakdown}. Devices: {dev_txt}.",
+        as_ = if total == 1 { "" } else { "s" },
+        ds = if dev_count == 1 { "" } else { "s" },
+    )
 }
 
 /// Human label for an auditable action path (`/x/*` or `/m/*`).
@@ -2284,6 +2387,7 @@ fn start_scheduler(agents: Arc<Agents>, hub_ip: String, hub_port: u16) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
         relay::dedup_sweep(&agents);
+        session_summary_sweep();
         auto_update_pass(&agents, &hub_ip, hub_port);
         let now = now_secs();
         let mut all = load_schedules();
@@ -2836,6 +2940,9 @@ pre{margin:0}
 .aud-src{font-size:9px;text-transform:uppercase;font-weight:700;padding:2px 0;border-radius:5px;text-align:center}
 .aud-src.mcp{background:rgba(91,157,255,.16);color:var(--accent)}
 .aud-src.browser{background:var(--surface2);color:var(--muted)}
+.aud-src.summary{background:rgba(123,216,143,.16);color:#7bd88f}
+.aud-row.aud-summary{background:rgba(123,216,143,.06);border-left:2px solid #7bd88f}
+.aud-row.aud-summary .aud-detail{color:var(--text);font-weight:500}
 .aud-act{color:#d7dbe6;font-weight:600}
 .aud-dev{color:#c3c9d8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .aud-detail{color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3231,7 +3338,7 @@ function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var n=(LAST||[]).length;if(!confirm('Run this command on ALL '+n+' device'+(n===1?'':'s')+'?\n\n'+c))return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch(API+'/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 var AUD_ALL=[];
 function loadAudit(){fetch(API+'/audit').then(function(r){return r.json();}).then(function(j){AUD_ALL=j.audit||[];renderAudit();}).catch(function(){});}
-function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){return '<div class="aud-row"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(e.source||'')+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}
+function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||'').toLowerCase();var el=document.getElementById('audit-rows');var ev=q?AUD_ALL.filter(function(e){return ((e.source||'')+' '+(e.action||'')+' '+(e.device||'')+' '+(e.actor||'')+' '+(e.detail||'')).toLowerCase().indexOf(q)>=0;}):AUD_ALL;if(!ev.length){el.innerHTML='<div class="aud-empty">'+(AUD_ALL.length?'No matching events.':'No device actions recorded yet.')+'</div>';return;}el.innerHTML=ev.map(function(e){var isS=e.source==='summary';return '<div class="aud-row'+(isS?' aud-summary':'')+'"><span class="aud-when">'+agoTxt(e.secs)+'</span><span class="aud-src '+(e.source||'')+'">'+esc2(isS?'session':(e.source||''))+'</span><span class="aud-act">'+esc2(e.action||'')+'</span><span class="aud-dev">'+esc2(e.device||'')+'</span><span class="aud-actor">'+esc2(e.actor||'—')+'</span><span class="aud-detail" title="'+attrEsc(e.detail||'')+'">'+esc2(e.detail||'')+'</span></div>';}).join('');}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
@@ -3391,4 +3498,66 @@ fn hdr(k: &str, v: &str) -> Header {
 
 fn json_resp(v: &serde_json::Value) -> Resp {
     Response::from_string(v.to_string()).with_header(hdr("Content-Type", "application/json"))
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn summary_rolls_up_one_operator_only() {
+        let actor = "alice@test";
+        audit(actor, "browser", "screenshot", "Baruch", "");
+        audit(actor, "browser", "screenshot", "Baruch", "");
+        audit(actor, "mcp", "run command", "LE11", "");
+        // A different operator's activity must never leak into alice's summary.
+        audit("bob@test", "browser", "screenshot", "AIO", "");
+        let now = Instant::now();
+        let sess = Session { start: now - Duration::from_secs(120), last: now, summarized: false };
+        let s = build_session_summary(actor, &sess);
+        assert!(s.contains("alice@test"), "{s}");
+        assert!(s.contains("3 actions"), "{s}");
+        assert!(s.contains("2 devices"), "{s}");
+        assert!(s.contains("2\u{00d7} screenshot"), "{s}");
+        assert!(s.contains("1\u{00d7} run command"), "{s}");
+        assert!(s.contains("Baruch") && s.contains("LE11"), "{s}");
+        assert!(!s.contains("AIO"), "bob's device leaked: {s}");
+    }
+
+    #[test]
+    fn idle_gap_starts_a_fresh_session() {
+        let a = "carol@test";
+        touch_session(a);
+        {
+            let mut s = sessions().lock().unwrap();
+            let e = s.get_mut(a).unwrap();
+            e.last = Instant::now() - SESSION_IDLE - Duration::from_secs(5);
+            e.start = e.last;
+            e.summarized = true;
+        }
+        touch_session(a); // operator returns after the idle gap
+        let s = sessions().lock().unwrap();
+        let e = s.get(a).unwrap();
+        assert!(!e.summarized, "returning after idle must open a new (un-summarized) session");
+        assert!(Instant::now().duration_since(e.start) < Duration::from_secs(2), "session start should reset to now");
+    }
+
+    #[test]
+    fn sweep_summarizes_only_the_idle_operator() {
+        let idle = "dave@test";
+        let active = "erin@test";
+        audit(idle, "browser", "screenshot", "Baruch", "");
+        audit(active, "browser", "screenshot", "LE11", "");
+        {
+            let mut s = sessions().lock().unwrap();
+            s.get_mut(idle).unwrap().last = Instant::now() - SESSION_IDLE - Duration::from_secs(1);
+        }
+        session_summary_sweep();
+        // idle operator got a summary event; active one did not.
+        let log = audit_log().lock().unwrap();
+        let idle_sum = log.iter().filter(|(_, a, src, ..)| a == idle && src == "summary").count();
+        let active_sum = log.iter().filter(|(_, a, src, ..)| a == active && src == "summary").count();
+        assert_eq!(idle_sum, 1, "idle operator should have exactly one summary");
+        assert_eq!(active_sum, 0, "active operator should have none");
+    }
 }
