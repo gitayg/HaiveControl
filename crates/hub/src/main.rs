@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.29.2";
+const VERSION: &str = "2.29.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -102,7 +102,13 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     let user = req_header(&req, "X-AppCrane-User-Email")
         .or_else(|| req_header(&req, "X-AppCrane-User"))
         .filter(|s| !s.is_empty())
-        .map(|e| canon_owner(&e));
+        .map(|e| canon_owner(&e))
+        // Header missing (AppCrane not forwarding identity): resolve via the
+        // forwarded session cookie against /api/me. No-op once the header arrives.
+        .or_else(|| match (req_header(&req, "Cookie"), req_header(&req, "X-Forwarded-Host")) {
+            (Some(c), Some(h)) if !c.is_empty() => identity_from_cookie(&h, &c),
+            _ => None,
+        });
     // /x/set-owner is an ownership op (behind SSO) — it must work on devices the
     // caller doesn't yet own, so it's exempt from the may_control target gate.
     if path.starts_with("/x/") && path != "/x/exec" && path != "/x/set-owner" {
@@ -721,6 +727,54 @@ fn http() -> &'static reqwest::blocking::Client {
             .build()
             .expect("http client")
     })
+}
+
+/// Cache of cookie → resolved email, so the dashboard's 5s poll doesn't call
+/// AppCrane's /api/me on every request. Keyed by a hash of (cookie, host).
+fn me_cache() -> &'static Mutex<HashMap<u64, (Instant, String)>> {
+    static C: std::sync::OnceLock<Mutex<HashMap<u64, (Instant, String)>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fallback identity resolution for deployments whose reverse proxy authenticates
+/// the request but does not forward X-AppCrane-User-Email (an AppCrane Caddy-reload
+/// bug: verify emits the header, the on-disk Caddyfile copies it, but the running
+/// process serves a stale config that doesn't). The Cookie IS forwarded, so we ask
+/// AppCrane's own /api/me who the session belongs to. This is a stopgap: header
+/// resolution runs first, so the moment the platform starts forwarding the header
+/// this path is never reached. Cached ~60s; SSRF-guarded to the glick.run family.
+fn identity_from_cookie(host: &str, cookie: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    host.hash(&mut h);
+    cookie.hash(&mut h);
+    let key = h.finish();
+    let now = Instant::now();
+    {
+        let c = me_cache().lock().unwrap();
+        if let Some((at, email)) = c.get(&key) {
+            if now.duration_since(*at) < Duration::from_secs(60) {
+                return if email.is_empty() { None } else { Some(email.clone()) };
+            }
+        }
+    }
+    // Only ever call an AppCrane host — X-Forwarded-Host is attacker-shaped, so
+    // never let it point our authenticated call at an arbitrary origin.
+    if host != "crane.glick.run" && !host.ends_with(".glick.run") {
+        return None;
+    }
+    let email = http()
+        .get(format!("https://{host}/api/me"))
+        .header("Cookie", cookie)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|j| j.get("user").and_then(|u| u.get("email")).and_then(|e| e.as_str()).map(canon_owner))
+        .unwrap_or_default();
+    me_cache().lock().unwrap().insert(key, (now, email.clone()));
+    if email.is_empty() { None } else { Some(email) }
 }
 
 /// A separate client with NO read timeout — live MJPEG streams never end, so the
