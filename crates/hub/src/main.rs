@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.30.0";
+const VERSION: &str = "2.31.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2908,11 +2908,13 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             let n_persist = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Installs autostart for this user — the agent returns after a reboot (once you log in). No admin needed.</div>";
             let n_bg = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Runs now only — stops on reboot/logout and the device drops off the inventory. No admin needed.</div>";
             let n_svc = "<div style=\"font-size:12px;color:#e0a94a;margin:0 0 8px\">Run in an <b>elevated</b> shell (<code>sudo</code>, or \"Run as administrator\"). Installs a boot service: starts before login and auto-restarts the agent if it dies.</div>";
-            let sel = "<div style=\"margin:2px 0 12px\"><label for=\"inst-mode\" style=\"font-size:12px;color:#8a93a6;margin-right:8px\">Installation type</label><select id=\"inst-mode\" onchange=\"instMode(this.value)\" style=\"background:#1a1a1a;color:#e8e8e8;border:1px solid #2b3346;border-radius:6px;padding:6px 9px;font-size:12px\"><option value=\"persist\" selected>Autostart at login — survives reboot (recommended)</option><option value=\"bg\">Quick — this session only</option><option value=\"service\">Service — starts at boot, auto-restarts (needs admin)</option></select></div>";
+            let n_ttl = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Time-boxed support session: runs for <b>60 minutes</b>, then the agent exits and <b>dissolves itself</b> — nothing stays installed. Edit <code>--ttl 60</code> to change the window.</div>";
+            let sel = "<div style=\"margin:2px 0 12px\"><label for=\"inst-mode\" style=\"font-size:12px;color:#8a93a6;margin-right:8px\">Installation type</label><select id=\"inst-mode\" onchange=\"instMode(this.value)\" style=\"background:#1a1a1a;color:#e8e8e8;border:1px solid #2b3346;border-radius:6px;padding:6px 9px;font-size:12px\"><option value=\"persist\" selected>Autostart at login — survives reboot (recommended)</option><option value=\"bg\">Quick — this session only</option><option value=\"ttl\">One-time — auto-removes after 60 min (support session)</option><option value=\"service\">Service — starts at boot, auto-restarts (needs admin)</option></select></div>";
             format!(
-                "{sel}{}{}{}",
+                "{sel}{}{}{}{}",
                 variant("persist", true, n_persist, &format!("{pre}\"./$f\" --relay {b}{ex} --persist --background"), &win_for(" --persist --background")),
                 variant("bg", false, n_bg, &format!("{pre}\"./$f\" --relay {b}{ex} --background"), &win_for(" --background")),
+                variant("ttl", false, n_ttl, &format!("{pre}\"./$f\" --relay {b}{ex} --ttl 60 --background"), &win_for(" --ttl 60 --background")),
                 variant("service", false, n_svc, &format!("{pre}sudo \"./$f\" --relay {b}{ex} --service"), &win_for(" --service")),
             )
         }
