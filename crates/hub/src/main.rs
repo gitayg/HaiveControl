@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.31.4";
+const VERSION: &str = "2.32.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -314,6 +314,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         }
         (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
+        (Method::Post, "/x/ai-chat") => ai_chat_ep(&mut req, &url, agents, user.as_deref()),
         (Method::Get, "/x/analysis") => proxy_analysis(&url, agents, user.as_deref()),
         (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
         (Method::Get, "/scripts") => scripts_list(&url),
@@ -1577,6 +1578,201 @@ fn proxy_compliance_fleet(url: &str, agents: &Agents, user: Option<&str>, via_mc
 }
 
 /// One canned management action on one device.
+// ---- AI assistant (Phase 1: read-only diagnostics) --------------------------
+// A dashboard-driven chat where Claude diagnoses the selected device using ONLY
+// read-only tools dispatched over the relay. The org's Anthropic key lives on the
+// hub (ANTHROPIC_API_KEY env); it never reaches the endpoint or the browser.
+
+fn ai_model() -> String {
+    std::env::var("HAIVE_AI_MODEL").unwrap_or_else(|_| "claude-sonnet-5".to_string())
+}
+
+fn ai_tools() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": "system_report",
+            "description": "Pull a read-only system report from the user's computer (raw command output). Use this first for a broad look at one area.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"kind": {"type": "string", "enum": ["hardware","services","processes","network","updates","encryption","firewall","av","packages"]}},
+                "required": ["kind"]
+            }
+        },
+        {
+            "name": "run_readonly_command",
+            "description": "Run ONE read-only shell command to inspect state — e.g. `df -h`, `systemctl status cups`, `ipconfig /all`, `tasklist`, `journalctl -u NetworkManager --no-pager -n 50`. A pipe to a filter is allowed (`tasklist | findstr chrome`). Chaining, redirection, and any state-changing command are rejected.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            }
+        }
+    ])
+}
+
+/// Conservative read-only gate: no chaining/redirection/substitution, and every
+/// pipeline stage must be an allowlisted read-only program (dual-use tools also
+/// require a read-only subcommand). Deny-by-default — unknown → false.
+fn is_readonly_cmd(cmd: &str) -> bool {
+    let c = cmd.trim();
+    if c.is_empty() || c.len() > 400 {
+        return false;
+    }
+    if c.contains(';') || c.contains('&') || c.contains('>') || c.contains('<')
+        || c.contains('`') || c.contains("$(") || c.contains('\n') || c.contains('\r')
+    {
+        return false;
+    }
+    c.split('|').all(|stage| ro_stage_ok(stage.trim()))
+}
+
+fn ro_stage_ok(stage: &str) -> bool {
+    let mut it = stage.split_whitespace();
+    let Some(p0) = it.next() else { return false };
+    let base = p0.rsplit(['/', '\\']).next().unwrap_or(p0).to_ascii_lowercase();
+    let prog = base.strip_suffix(".exe").unwrap_or(&base);
+    let sub = it.next().map(|s| s.to_ascii_lowercase());
+    const RO: &[&str] = &[
+        "uname","whoami","id","hostname","hostnamectl","uptime","df","free","ps","top","vmstat","iostat","nproc","arch","getconf","lscpu","lsblk","lsusb","lspci","lsof","stat","file","du","mount","dmesg","printenv","env","date","which","where","echo",
+        "ip","ifconfig","ss","netstat","route","arp","ping","ping6","nslookup","dig","host","traceroute","tracert",
+        "journalctl","cat","head","tail","ls","dir","find","findstr","grep","egrep","awk","sed","sort","uniq","wc","cut","tr","column","xargs","select-string",
+        "systeminfo","tasklist","ipconfig","ver","type","driverquery","gpresult","query",
+    ];
+    match prog {
+        "systemctl" => matches!(sub.as_deref(), Some("status" | "is-active" | "is-enabled" | "list-units" | "list-unit-files" | "show" | "cat")),
+        "sc" => matches!(sub.as_deref(), Some("query" | "queryex" | "qc")),
+        "service" => stage.to_ascii_lowercase().trim_end().ends_with("status"),
+        "wmic" => { let l = stage.to_ascii_lowercase(); l.contains(" get") || l.contains("/format") }
+        "reg" => matches!(sub.as_deref(), Some("query")),
+        "dpkg" => matches!(sub.as_deref(), Some("-l" | "--list" | "-s" | "--status")),
+        "rpm" => sub.as_deref().map(|s| s.starts_with("-q")).unwrap_or(false),
+        "apt" | "apt-get" => matches!(sub.as_deref(), Some("list" | "show" | "policy")),
+        "brew" => matches!(sub.as_deref(), Some("list" | "info" | "config")),
+        "git" => matches!(sub.as_deref(), Some("status" | "log" | "diff" | "branch" | "remote" | "show")),
+        p => RO.contains(&p),
+    }
+}
+
+fn ai_clip(s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… [output truncated]", &s[..end])
+}
+
+/// Execute one AI tool call against the device. Read-only only.
+fn run_ai_tool(agents: &Agents, target: &str, name: &str, input: &serde_json::Value) -> (String, bool) {
+    match name {
+        "system_report" => {
+            let kind = input.get("kind").and_then(|k| k.as_str()).unwrap_or("hardware");
+            let platform = device_platform(agents, target);
+            match os_command(&platform, kind, "") {
+                Some(cmd) => (ai_clip(exec_output(target, &cmd), 8000), true),
+                None => (format!("'{kind}' report is not available on {platform}"), false),
+            }
+        }
+        "run_readonly_command" => {
+            let cmd = input.get("command").and_then(|c| c.as_str()).unwrap_or("").trim();
+            if !is_readonly_cmd(cmd) {
+                return (format!("Refused: `{cmd}` is not an allowed read-only command in diagnostics mode."), false);
+            }
+            (ai_clip(exec_output(target, cmd), 8000), true)
+        }
+        _ => (format!("unknown tool: {name}"), false),
+    }
+}
+
+fn ai_chat_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs an Anthropic API key. Set ANTHROPIC_API_KEY on the hub (AppCrane → env), then reload."})),
+    };
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let inp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let message = inp.get("message").and_then(|m| m.as_str()).unwrap_or("").trim().to_string();
+    if message.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "empty message"}));
+    }
+    // Prior turns as Anthropic messages [{role, content}]; content is a string or a blocks array.
+    let mut messages: Vec<serde_json::Value> = inp.get("history").and_then(|h| h.as_array()).cloned().unwrap_or_default();
+    messages.push(serde_json::json!({"role": "user", "content": message}));
+
+    let dev = device_name(agents, &target);
+    let platform = device_platform(agents, &target);
+    let system = format!(
+        "You are an IT support assistant built into HaiveControl, helping with the computer '{dev}' ({platform}). \
+You have READ-ONLY access: inspect the machine with the system_report and run_readonly_command tools, but you CANNOT change anything in this mode. \
+Diagnose the user's problem — run the checks you need, then explain what you found and the concrete fix in plain, non-technical language. \
+If a fix needs a system change, spell out the exact steps but say you can't apply them yet. Keep replies short and skimmable. \
+Prefer system_report for a broad look; use run_readonly_command for targeted checks."
+    );
+
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..6 {
+        let reqbody = serde_json::json!({
+            "model": ai_model(),
+            "max_tokens": 1024,
+            "system": system,
+            "tools": ai_tools(),
+            "messages": messages,
+        });
+        let resp = http()
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(reqbody.to_string())
+            .send();
+        let val: serde_json::Value = match resp.and_then(|r| r.text()) {
+            Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| serde_json::json!({"error": {"message": t}})),
+            Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": format!("LLM call failed: {e}"), "steps": steps})),
+        };
+        if let Some(err) = val.get("error") {
+            let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("LLM error");
+            return json_resp(&serde_json::json!({"ok": false, "error": msg, "steps": steps}));
+        }
+        let content = val.get("content").cloned().unwrap_or_else(|| serde_json::json!([]));
+        messages.push(serde_json::json!({"role": "assistant", "content": content.clone()}));
+        if val.get("stop_reason").and_then(|s| s.as_str()) != Some("tool_use") {
+            let text = content.as_array().map(|a| {
+                a.iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }).unwrap_or_default();
+            return json_resp(&serde_json::json!({"ok": true, "reply": text, "steps": steps, "history": messages}));
+        }
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        if let Some(blocks) = content.as_array() {
+            for b in blocks {
+                if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let tid = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let tinput = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                let (out, ok) = run_ai_tool(agents, &target, name, &tinput);
+                let label = tinput.get("command").and_then(|c| c.as_str()).or_else(|| tinput.get("kind").and_then(|k| k.as_str())).unwrap_or("");
+                steps.push(serde_json::json!({"tool": name, "arg": label, "ok": ok}));
+                audit(user.unwrap_or(""), "ai", name, &dev, label);
+                results.push(serde_json::json!({"type": "tool_result", "tool_use_id": tid, "content": out}));
+            }
+        }
+        messages.push(serde_json::json!({"role": "user", "content": results}));
+    }
+    json_resp(&serde_json::json!({"ok": true, "reply": "I ran several checks but hit the step limit — say \"continue\" and I'll keep going.", "steps": steps, "history": messages}))
+}
+
 fn proxy_sys(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     let kind = query_param(url, "kind").unwrap_or_default();
@@ -2995,6 +3191,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div id=\"d-activity\"></div>\
 <div id=\"d-analysis\" class=\"an-panel\"></div>\
 <div id=\"d-controls\"></div>\
+<div id=\"ai-panel\" style=\"display:none\"><div class=\"ai-head\"><span>🤖 AI assistant <span class=\"dim2\">— read-only diagnostics</span></span><button class=\"b subtle\" onclick=\"aiClose()\">Close</button></div><div id=\"ai-log\" class=\"ai-log\"></div><div class=\"ai-input\"><input id=\"ai-in\" placeholder=\"Describe the problem — e.g. 'my wifi keeps dropping'\" onkeydown=\"if(event.key==='Enter')aiSend()\"><button class=\"b\" id=\"ai-send\" onclick=\"aiSend()\">Send</button></div></div>\
 <div class=\"viewport\" id=\"viewport\"><div class=\"vp-hint\" id=\"vp-hint\">Press <b>Live screen</b>, <b>Screenshot</b>, or a <b>Camera</b> action — it renders here.</div><img id=\"view\" alt=\"\" style=\"display:none\"><div class=\"vp-tools\" id=\"vp-tools\" style=\"display:none\"><button class=\"b\" onclick=\"stopView()\">Stop</button><button class=\"b\" onclick=\"openTab()\">Open in tab&nbsp;↗</button></div></div>\
 <div class=\"term\" id=\"terminal\" style=\"display:none\"><div class=\"term-head\"><span>interactive shell</span><button class=\"b\" onclick=\"closeShell()\">Close shell</button></div><div id=\"xterm\" class=\"xterm-host\"></div></div>\
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
@@ -3065,6 +3262,20 @@ pre{margin:0}
 .aud-sum-lbl{color:var(--muted);margin-right:6px;font-size:11px}
 .aud-cmd{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:var(--surface2);border:.5px solid var(--line);border-radius:4px;padding:1px 5px;margin:0 5px 3px 0;color:var(--accent);white-space:nowrap;display:inline-block}
 .aud-sum-dev{color:var(--muted)}
+#ai-panel{background:#0f131b;border:1px solid #1c2130;border-radius:12px;margin:0 0 14px;overflow:hidden}
+.ai-head{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid #1c2130;font-size:13px;font-weight:500}
+.ai-log{max-height:340px;overflow:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.ai-msg{font-size:13px;line-height:1.5;padding:8px 11px;border-radius:10px;max-width:88%}
+.ai-user{align-self:flex-end;background:var(--accent);color:#fff}
+.ai-bot{align-self:flex-start;background:#161c27;border:1px solid #212836}
+.ai-bot code{background:#0b0d13;padding:1px 5px;border-radius:4px;font-size:12px}
+.ai-err{border-color:#5b2b2b;color:#f0a0a0}
+.ai-think{opacity:.65}
+.ai-steps{background:transparent;border:none;padding:2px 0;display:flex;flex-wrap:wrap;gap:6px;max-width:100%}
+.ai-step{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:2px 7px;color:#7bd88f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}
+.ai-step.bad{color:#f0a0a0;border-color:#5b2b2b}
+.ai-input{display:flex;gap:8px;padding:10px 14px;border-top:1px solid #1c2130}
+.ai-input input{flex:1;background:#0b0d13;border:1px solid #212836;border-radius:8px;padding:8px 11px;color:#e7ebf2;font-size:13px}
 .aud-act{color:#d7dbe6;font-weight:600}
 .aud-dev{color:#c3c9d8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .aud-detail{color:var(--muted);font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3465,7 +3676,7 @@ function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||
 function fmtSummary(t){var devs='',cmds='',head=t;var di=t.indexOf(' Devices: ');if(di>=0){devs=t.slice(di+10).replace(/\.\s*$/,'');head=t.slice(0,di);}var ci=head.indexOf(' Commands: ');if(ci>=0){cmds=head.slice(ci+11).replace(/\.\s*$/,'');head=head.slice(0,ci);}var h='<span class="aud-sum-head">'+esc2(head)+'</span>';if(cmds){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Commands</span>'+cmds.split(', ').map(function(c){return '<code class="aud-cmd">'+esc2(c)+'</code>';}).join('')+'</span>';}if(devs){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Devices</span><span class="aud-sum-dev">'+esc2(devs)+'</span></span>';}return h;}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);AI_HIST=[];var __aip=document.getElementById('ai-panel');if(__aip)__aip.style.display='none';document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':((relay&&d.connected===false)?' <span class="recon-pill">RECONNECTING</span>':''));var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
 var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];
@@ -3506,7 +3717,8 @@ var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<butto
 var persistbtn=(d.install_mode&&d.install_mode!=='ephemeral')?'<span class="imchip im-'+(d.install_mode==='service'?'svc':'auto')+'" title="persistent — autostarts after reboot; kept awake on AC">'+esc2(d.install_mode)+' ✓</span>':'<button class="b subtle" onclick="doPersist()" title="make persistent: install autostart so it survives reboot, and keep the device awake while on AC power">Make persistent</button>';
 var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
-var groups='<div class="controls">'+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
+var ai='<button class="b" onclick="aiOpen()" title="ask an AI to diagnose this device using read-only checks">🤖 Ask AI</button>';
+var groups='<div class="controls">'+g('AI assistant',ai)+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
 return groups+actionListHtml();}
 function rowOf(i){return document.querySelector('.arow[data-i="'+i+'"]');}
 function rowKind(r,row){return r.opts?row.querySelector('.arow-opt').value:r.kind;}
@@ -3534,6 +3746,13 @@ function doCamLive(){var d=DEV[SEL]||{};if(d.scheme!=='relay'){setView(API+'/x/c
 function doShot(){setView(API+'/x/frame?target='+enc(SEL)+'&_t='+Date.now());}
 function doCamSnap(){setView(API+'/x/camera?target='+enc(SEL)+'&index='+camI()+'&_t='+Date.now());}
 function out(t){var o=document.getElementById('out');o.style.display='block';o.textContent=t;o.scrollIntoView({behavior:'smooth',block:'nearest'});o.classList.remove('flash');void o.offsetWidth;o.classList.add('flash');}
+var AI_HIST=[],AI_BUSY=false;
+function aiOpen(){var p=document.getElementById('ai-panel');p.style.display='block';if(!AI_HIST.length){document.getElementById('ai-log').innerHTML='<div class="ai-msg ai-bot">Hi — describe an IT problem on <b>'+esc2((DEV[SEL]&&(DEV[SEL].name||DEV[SEL].hostname))||'this device')+'</b> and I\'ll investigate with read-only checks.</div>';}document.getElementById('ai-in').focus();p.scrollIntoView({behavior:'smooth',block:'nearest'});}
+function aiClose(){document.getElementById('ai-panel').style.display='none';}
+function aiAppend(cls,html){var l=document.getElementById('ai-log');var d=document.createElement('div');d.className='ai-msg '+cls;d.innerHTML=html;l.appendChild(d);l.scrollTop=l.scrollHeight;return d;}
+function aiMd(t){return esc2(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>');}
+function aiSend(){if(AI_BUSY||!SEL)return;var inp=document.getElementById('ai-in');var msg=(inp.value||'').trim();if(!msg)return;inp.value='';aiAppend('ai-user',esc2(msg));AI_BUSY=true;document.getElementById('ai-send').disabled=true;var think=aiAppend('ai-bot ai-think','investigating…');
+fetch(API+'/x/ai-chat?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:AI_HIST})}).then(function(r){return r.json();}).then(function(j){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;if(!j.ok){aiAppend('ai-bot ai-err','⚠ '+esc2(j.error||'failed'));return;}if(j.steps&&j.steps.length){aiAppend('ai-bot ai-steps',j.steps.map(function(t){return '<span class="ai-step'+(t.ok?'':' bad')+'" title="'+attrEsc(t.arg||'')+'">'+esc2(t.tool==='system_report'?('report: '+(t.arg||'')):('$ '+(t.arg||t.tool)))+'</span>';}).join(''));}aiAppend('ai-bot',aiMd(j.reply||'(no answer)'));AI_HIST=j.history||AI_HIST;document.getElementById('ai-in').focus();}).catch(function(e){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;aiAppend('ai-bot ai-err','error: '+esc2(''+e));});}
 function doRun(){var c=prompt('Command to run:');if(!c)return;out('$ '+c+'\n…');fetch(API+'/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:c})}).then(function(r){return r.json();}).then(function(j){out('$ '+c+'\n'+(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed'))));}).catch(function(e){out('error: '+e);});}
 var SHSID=null,SHOFF=0,TERM=null,FIT=null;
 function ensureTerm(){if(TERM)return;TERM=new Terminal({fontSize:12,fontFamily:'ui-monospace,SFMono-Regular,Menlo,monospace',cursorBlink:true,theme:{background:'#0b0d13',foreground:'#d3d8e4'}});FIT=new FitAddon.FitAddon();TERM.loadAddon(FIT);TERM.open(document.getElementById('xterm'));TERM.onData(function(d){if(SHSID)fetch(API+'/x/shell/input?target='+enc(SEL)+'&sid='+enc(SHSID),{method:'POST',body:d});});}
@@ -3687,5 +3906,34 @@ mod session_tests {
         let active_sum = log.iter().filter(|(_, a, src, ..)| a == active && src == "summary").count();
         assert_eq!(idle_sum, 1, "idle operator should have exactly one summary");
         assert_eq!(active_sum, 0, "active operator should have none");
+    }
+}
+
+#[cfg(test)]
+mod ai_readonly_tests {
+    use super::is_readonly_cmd;
+
+    #[test]
+    fn allows_genuine_readonly() {
+        for c in ["df -h", "systemctl status cups", "ipconfig /all", "tasklist",
+                  "journalctl -u NetworkManager --no-pager -n 50", "tasklist | findstr chrome",
+                  "sc query spooler", "ps aux", "free -m", "cat /var/log/syslog | tail -100",
+                  "wmic logicaldisk get size,freespace,caption", "dpkg -l", "ping -c 3 8.8.8.8"] {
+            assert!(is_readonly_cmd(c), "should ALLOW: {c}");
+        }
+    }
+
+    #[test]
+    fn blocks_mutations_and_tricks() {
+        for c in [
+            "rm -rf /", "shutdown now", "systemctl stop cups", "sc delete spooler",
+            "reg delete HKLM\\x /f", "apt-get install curl", "del C:\\Windows",
+            "whoami; rm -rf ~", "df -h && rm x", "cat x > /etc/passwd", "curl x | sh",
+            "echo hi > file", "ping 8.8.8.8 & del x", "$(rm -rf /)", "ls `rm x`",
+            "wmic process call create calc.exe", "reg add HKLM\\x /v y", "powershell -Command \"Remove-Item x\"",
+            "df -h | rm x", "git push",
+        ] {
+            assert!(!is_readonly_cmd(c), "should BLOCK: {c}");
+        }
     }
 }
