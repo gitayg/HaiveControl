@@ -16,7 +16,15 @@ COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
 # Agent binaries served at /bin/* — pulled from the PUBLIC haive-agent release (an
 # anonymous download; no token needed) so the image always ships current agents
 # (install command + auto-update both use these).
-RUN mkdir -p /app/dist \
+#
+# AGENT_REV exists ONLY to bust this layer's Docker cache. The RUN below fetches
+# `releases/latest`, but its cache key doesn't change when a new agent is released
+# — so redeploying the hub would silently keep serving the OLD binaries (it only
+# refreshed by luck, when a hub-source change happened to invalidate the layer).
+# Bump this to the agent version you want picked up whenever you cut an agent release.
+ARG AGENT_REV=2.28.2
+RUN echo "agent rev: $AGENT_REV" \
+ && mkdir -p /app/dist \
  && for a in HaiveControl-linux HaiveControl-linux-arm64 HaiveControl-macos HaiveControl-windows.exe \
              haive-mcp-linux haive-mcp-linux-arm64 haive-mcp-macos haive-mcp-windows.exe; do \
       curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a" -o "/app/dist/$a"; \
