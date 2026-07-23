@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.31.1";
+const VERSION: &str = "2.31.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2896,13 +2896,20 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             // a bare --background enroll dies on reboot/logout, which is why devices
             // used to quietly vanish from the inventory a day later.
             let pre = format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && ");
-            let win_for = |flags: &str| format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! {b}/bin/HaiveControl-windows.exe& !f! --relay {b}{ex}{flags}\"");
+            // TWO lines, deliberately. The old one-liner used !f! (delayed expansion),
+            // which only exists inside a `cmd /v:on /c "…"` wrapper — pasted into an
+            // already-open Command Prompt it failed with «'!f!' is not recognized», and
+            // in bash the `!` triggered history expansion («event not found»). %F% can't
+            // be used on ONE line either (cmd expands it at parse time, before `set`
+            // runs, giving an empty name). Two lines sidesteps both: line 2 is parsed
+            // after line 1 executed, so %F% resolves — no wrapper, no `!`.
+            let win_for = |flags: &str| format!("set \"F=airm-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" {b}/bin/HaiveControl-windows.exe && \"%F%\" --relay {b}{ex}{flags}");
             let variant = |m: &str, shown: bool, note: &str, u: &str, w: &str| {
                 format!(
                     "<div class=\"instv\" data-m=\"{m}\" style=\"display:{}\">{note}{}{}</div>",
                     if shown { "block" } else { "none" },
                     cmd_block("Linux &amp; macOS — any architecture (one script)", u),
-                    cmd_block("Windows — Command Prompt (no PowerShell)", w),
+                    cmd_block("Windows — Command Prompt (paste both lines)", w),
                 )
             };
             let n_persist = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Installs autostart for this user — the agent returns after a reboot (once you log in). No admin needed.</div>";
@@ -2923,7 +2930,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             format!(
                 "{}{}",
                 cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
-                cmd_block("Windows — Command Prompt (no PowerShell)", &format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! http://{hub}/bin/HaiveControl-windows.exe& !f! {hub} --id {mac_id}\"")),
+                cmd_block("Windows — Command Prompt (paste both lines)", &format!("set \"F=airm-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" http://{hub}/bin/HaiveControl-windows.exe && \"%F%\" {hub} --id {mac_id}")),
             )
         }
     };
