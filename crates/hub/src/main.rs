@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.32.0";
+const VERSION: &str = "2.32.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -298,6 +298,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref(), true),
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
+        (Method::Post, "/m/ai-chat") => ai_chat_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/ca") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, "/m/direct") => {
