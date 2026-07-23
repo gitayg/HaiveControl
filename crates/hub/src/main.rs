@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.29.3";
+const VERSION: &str = "2.30.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2878,7 +2878,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
     // block the download — machine-id keeps it the same device, so the old copy is
     // just superseded on its next self-update. `cmd /v:on` enables delayed
     // expansion so !f! resolves in a one-liner.
-    let (unix, windows) = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+    let enroll = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
         Some(pub_url) => {
             let b = pub_url.trim_end_matches('/').to_string();
             // One per-owner token that BOTH authenticates the relay AND stamps
@@ -2892,15 +2892,35 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
                     _ => String::new(),
                 },
             };
-            (
-                cmd_block("Linux & macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && \"./$f\" --relay {b}{ex} --background")),
-                cmd_block("Windows — Command Prompt (no PowerShell)", &format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! {b}/bin/HaiveControl-windows.exe& !f! --relay {b}{ex} --background\"")),
+            // Three install tiers, chosen from the dropdown. Autostart is the DEFAULT:
+            // a bare --background enroll dies on reboot/logout, which is why devices
+            // used to quietly vanish from the inventory a day later.
+            let pre = format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && ");
+            let win_for = |flags: &str| format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! {b}/bin/HaiveControl-windows.exe& !f! --relay {b}{ex}{flags}\"");
+            let variant = |m: &str, shown: bool, note: &str, u: &str, w: &str| {
+                format!(
+                    "<div class=\"instv\" data-m=\"{m}\" style=\"display:{}\">{note}{}{}</div>",
+                    if shown { "block" } else { "none" },
+                    cmd_block("Linux &amp; macOS — any architecture (one script)", u),
+                    cmd_block("Windows — Command Prompt (no PowerShell)", w),
+                )
+            };
+            let n_persist = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Installs autostart for this user — the agent returns after a reboot (once you log in). No admin needed.</div>";
+            let n_bg = "<div style=\"font-size:12px;color:#8a93a6;margin:0 0 8px\">Runs now only — stops on reboot/logout and the device drops off the inventory. No admin needed.</div>";
+            let n_svc = "<div style=\"font-size:12px;color:#e0a94a;margin:0 0 8px\">Run in an <b>elevated</b> shell (<code>sudo</code>, or \"Run as administrator\"). Installs a boot service: starts before login and auto-restarts the agent if it dies.</div>";
+            let sel = "<div style=\"margin:2px 0 12px\"><label for=\"inst-mode\" style=\"font-size:12px;color:#8a93a6;margin-right:8px\">Installation type</label><select id=\"inst-mode\" onchange=\"instMode(this.value)\" style=\"background:#1a1a1a;color:#e8e8e8;border:1px solid #2b3346;border-radius:6px;padding:6px 9px;font-size:12px\"><option value=\"persist\" selected>Autostart at login — survives reboot (recommended)</option><option value=\"bg\">Quick — this session only</option><option value=\"service\">Service — starts at boot, auto-restarts (needs admin)</option></select></div>";
+            format!(
+                "{sel}{}{}{}",
+                variant("persist", true, n_persist, &format!("{pre}\"./$f\" --relay {b}{ex} --persist --background"), &win_for(" --persist --background")),
+                variant("bg", false, n_bg, &format!("{pre}\"./$f\" --relay {b}{ex} --background"), &win_for(" --background")),
+                variant("service", false, n_svc, &format!("{pre}sudo \"./$f\" --relay {b}{ex} --service"), &win_for(" --service")),
             )
         }
         None => {
             let hub = format!("{hub_ip}:{hub_port}");
-            (
-                cmd_block("Linux & macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
+            format!(
+                "{}{}",
+                cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
                 cmd_block("Windows — Command Prompt (no PowerShell)", &format!("cmd /v:on /c \"set f=airm-!random!.exe& curl.exe -L -o !f! http://{hub}/bin/HaiveControl-windows.exe& !f! {hub} --id {mac_id}\"")),
             )
         }
@@ -2943,7 +2963,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <main class=\"stage\">\
-<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{unix}{windows}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
+<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
 <div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div><button class=\"b subtle\" style=\"margin-left:auto\" onclick=\"doClaimAll()\" title=\"assign every device to your account so the whole fleet lists under you\">Claim all to me</button></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
@@ -3320,6 +3340,7 @@ function esc2(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').rep
 function attrEsc(s){return esc2(s).replace(/"/g,'&quot;');}
 function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(1)+' GB';}
 function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';}}
+function instMode(m){var v=document.querySelectorAll('.instv');for(var i=0;i<v.length;i++){v[i].style.display=(v[i].getAttribute('data-m')===m)?'block':'none';}}
 function rotateEnrollTok(){if(!confirm('Rotate your enrollment token? The old token stops working for new enrollments. Devices already enrolled are unaffected.'))return;fetch(API+'/x/enroll-token?rotate=1').then(function(r){return r.json();}).then(function(j){if(j&&j.ok){location.reload();}else{alert((j&&j.error)||'rotate failed');}}).catch(function(e){alert('error: '+e);});}
 /* ---- devices ---- */
 var DEV={},SEL=null,SEARCH='',LAST=[];
