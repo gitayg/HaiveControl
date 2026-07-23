@@ -22,7 +22,7 @@ COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
 # — so redeploying the hub would silently keep serving the OLD binaries (it only
 # refreshed by luck, when a hub-source change happened to invalidate the layer).
 # Bump this to the agent version you want picked up whenever you cut an agent release.
-ARG AGENT_REV=2.28.2
+ARG AGENT_REV=2.28.3
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
  && for a in HaiveControl-linux HaiveControl-linux-arm64 HaiveControl-macos HaiveControl-windows.exe \
