@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.32.2";
+const VERSION: &str = "2.32.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -1762,7 +1762,12 @@ fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, histor
         Ok(k) if !k.is_empty() => k,
         _ => return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs an Anthropic API key (ANTHROPIC_API_KEY) set on the hub."})),
     };
-    let mut messages: Vec<serde_json::Value> = history;
+    // `incoming` is the clean, text-only transcript we hand back to the client each
+    // turn. `messages` is the internal working copy that accumulates tool_use /
+    // tool_result blocks during THIS turn only — those are never persisted, so a
+    // replayed history can't carry a dangling tool_use (the API rejects that).
+    let incoming = history;
+    let mut messages: Vec<serde_json::Value> = incoming.clone();
     messages.push(serde_json::json!({"role": "user", "content": message}));
 
     let dev = device_name(agents, target);
@@ -1810,7 +1815,7 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
         if results.is_empty() {
             let text = ai_text(&content);
             if !text.trim().is_empty() {
-                return json_resp(&serde_json::json!({"ok": true, "reply": text, "steps": steps, "history": messages}));
+                return ai_finish(&incoming, message, text, steps);
             }
             break; // empty final (e.g. truncated) — force a synthesis below
         }
@@ -1829,7 +1834,18 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
     } else {
         text
     };
-    json_resp(&serde_json::json!({"ok": true, "reply": reply, "steps": steps, "history": messages}))
+    ai_finish(&incoming, message, reply, steps)
+}
+
+/// Finish a turn: return the reply plus a CLEAN history (the incoming text-only
+/// transcript + this user message + the final assistant text). No tool blocks are
+/// persisted, so the client can replay `history` next turn without ever producing
+/// a dangling tool_use.
+fn ai_finish(incoming: &[serde_json::Value], message: &str, reply: String, steps: Vec<serde_json::Value>) -> Resp {
+    let mut clean = incoming.to_vec();
+    clean.push(serde_json::json!({"role": "user", "content": message}));
+    clean.push(serde_json::json!({"role": "assistant", "content": reply.clone()}));
+    json_resp(&serde_json::json!({"ok": true, "reply": reply, "steps": steps, "history": clean}))
 }
 
 /// One Messages-API call. Omitting `tools` (empty array) forces a text answer.
