@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.32.5";
+const VERSION: &str = "2.33.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -174,6 +174,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
         (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
+        (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
         (Method::Post, "/relay/hello") => {
             // The device dials out, so the socket (or X-Forwarded-For behind the
             // AppCrane proxy) carries its real public IP — capture it for geo.
@@ -300,6 +301,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
         (Method::Post, "/m/ai-chat") => ai_chat_ep(&mut req, &url, agents, mowner.as_deref()),
+        (Method::Post, "/m/ai-apply") => ai_apply_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/ca") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, "/m/direct") => {
@@ -317,6 +319,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/fleet") => proxy_fleet(&url, agents, mowner.as_deref(), true),
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
         (Method::Post, "/x/ai-chat") => ai_chat_ep(&mut req, &url, agents, user.as_deref()),
+        (Method::Post, "/x/ai-apply") => ai_apply_ep(&mut req, &url, agents, user.as_deref()),
         (Method::Get, "/x/analysis") => proxy_analysis(&url, agents, user.as_deref()),
         (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
         (Method::Get, "/scripts") => scripts_list(&url),
@@ -1608,8 +1611,71 @@ fn ai_tools() -> serde_json::Value {
                 "properties": {"command": {"type": "string"}},
                 "required": ["command"]
             }
+        },
+        {
+            "name": "propose_fix",
+            "description": "Propose a corrective action for the user to approve. You CANNOT run it — it's shown to the user as an Apply button and only runs if they approve. Use this once you've diagnosed the problem and know the fix. Pick from the fixed menu; give a plain-language `explanation` of what it does and why.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["flush_dns", "restart_service", "kill_process", "clear_temp", "empty_recycle_bin"], "description": "which fix"},
+                    "arg": {"type": "string", "description": "service name (restart_service) or process/app name (kill_process); empty otherwise"},
+                    "explanation": {"type": "string", "description": "one sentence: what this does and why it should help"}
+                },
+                "required": ["kind", "explanation"]
+            }
         }
     ])
+}
+
+/// Argument for a fix (a service or process name): keep it to a safe character set
+/// so it can't smuggle shell metacharacters into the fixed command template.
+fn sanitize_fix_arg(arg: &str) -> Option<String> {
+    let a = arg.trim();
+    if a.is_empty() || a.len() > 80 {
+        return None;
+    }
+    if a.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-')) {
+        Some(a.to_string())
+    } else {
+        None
+    }
+}
+
+/// The curated write-fix menu: (kind, platform) → (human title, exact command).
+/// The hub owns the command; the model only picks a kind + arg. Returns None if
+/// the fix isn't available on this platform or the arg is bad — the single gate
+/// that both propose_fix and apply go through, so a client can't smuggle a command.
+fn fix_command(platform: &str, kind: &str, arg: &str) -> Option<(String, String)> {
+    match kind {
+        "flush_dns" => match platform {
+            "windows" => Some(("Flush the DNS cache".into(), "ipconfig /flushdns".into())),
+            "linux" => Some(("Flush the DNS cache".into(), "resolvectl flush-caches || systemd-resolve --flush-caches || echo 'no systemd-resolved'".into())),
+            "macos" => Some(("Flush the DNS cache".into(), "sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder".into())),
+            _ => None,
+        },
+        "restart_service" => {
+            let a = sanitize_fix_arg(arg)?;
+            match platform {
+                "windows" => Some((format!("Restart the '{a}' service"), format!("net stop \"{a}\" & net start \"{a}\""))),
+                "linux" => Some((format!("Restart the {a} service"), format!("sudo systemctl restart {a}"))),
+                "macos" => Some((format!("Restart {a}"), format!("sudo launchctl kickstart -k system/{a}"))),
+                _ => None,
+            }
+        }
+        "kill_process" => {
+            let a = sanitize_fix_arg(arg)?;
+            match platform {
+                "windows" => Some((format!("Force-quit {a}"), format!("taskkill /F /IM \"{a}\""))),
+                "linux" | "macos" => Some((format!("Force-quit {a}"), format!("pkill -f \"{a}\""))),
+                _ => None,
+            }
+        }
+        // Windows-only for v1: %TEMP% and the Recycle Bin are per-user and safe.
+        "clear_temp" if platform == "windows" => Some(("Clear your temporary files".into(), "del /q /f /s \"%TEMP%\\*\" >nul 2>&1 & echo done".into())),
+        "empty_recycle_bin" if platform == "windows" => Some(("Empty the Recycle Bin".into(), "powershell -Command \"Clear-RecycleBin -Force -ErrorAction SilentlyContinue\"".into())),
+        _ => None,
+    }
 }
 
 /// Conservative read-only gate: no chaining/redirection/substitution, and every
@@ -1756,6 +1822,59 @@ fn parse_ai_body(req: &mut Request) -> Option<(String, Vec<serde_json::Value>)> 
     Some((message, history))
 }
 
+fn parse_apply_body(req: &mut Request) -> Option<(String, String)> {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let inp: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let kind = inp.get("kind").and_then(|k| k.as_str()).unwrap_or("").trim().to_string();
+    if kind.is_empty() {
+        return None;
+    }
+    let arg = inp.get("arg").and_then(|a| a.as_str()).unwrap_or("").to_string();
+    Some((kind, arg))
+}
+
+/// Execute an approved fix. This is the ONLY place a write runs, and it re-derives
+/// the exact command from the same fix_command menu the model proposed against — the
+/// client sends only `kind`+`arg`, never a command, so nothing arbitrary can execute.
+fn ai_apply_run(agents: &Agents, target: &str, owner: &str, kind: &str, arg: &str) -> Resp {
+    let platform = device_platform(agents, target);
+    let (title, command) = match fix_command(&platform, kind, arg) {
+        Some(v) => v,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "That fix isn't available on this device, or the name is invalid."})),
+    };
+    let dev = device_name(agents, target);
+    audit(owner, "ai-fix", kind, &dev, &title);
+    let output = exec_output(target, &command);
+    json_resp(&serde_json::json!({"ok": true, "title": title, "command": command, "output": ai_clip(output, 4000)}))
+}
+
+fn ai_apply_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    match parse_apply_body(req) {
+        Some((kind, arg)) => ai_apply_run(agents, &target, user.unwrap_or(""), &kind, &arg),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "no fix specified"})),
+    }
+}
+
+/// Relay path: an endpoint approves a fix ON ITSELF from the tray chat. The /relay/
+/// guard already validated the token; owner + self-target come from it.
+fn relay_ai_apply_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
+    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let id = query_param(url, "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
+    }
+    let target = format!("relay://{id}");
+    match parse_apply_body(req) {
+        Some((kind, arg)) => ai_apply_run(agents, &target, &owner, &kind, &arg),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "no fix specified"})),
+    }
+}
+
 /// The read-only diagnostic loop, shared by every entry point (SSO, MCP, relay).
 fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, history: Vec<serde_json::Value>) -> Resp {
     let key = match std::env::var("ANTHROPIC_API_KEY") {
@@ -1778,13 +1897,15 @@ fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, histor
     let platform = device_platform(agents, target);
     let system = format!(
         "You are an IT support assistant built into HaiveControl, helping with the computer '{dev}' ({platform}). \
-You have READ-ONLY access: inspect the machine with the system_report and run_readonly_command tools, but you CANNOT change anything in this mode. \
-Diagnose the user's problem — run the checks you need, then explain what you found and the concrete fix in plain, non-technical language. \
-If a fix needs a system change, spell out the exact steps but say you can't apply them yet. Keep replies short and skimmable. \
-Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows reach for a single PowerShell read pipeline rather than repeated `dir /s`. When you have enough to answer, stop and answer."
+Inspect the machine with the system_report and run_readonly_command tools — these READ only and change nothing. \
+Diagnose the user's problem first: run the checks you need, then explain what you found in plain, non-technical language. \
+When you've diagnosed a problem that one of the standard fixes can solve, call propose_fix — this does NOT run the fix; it shows the user an Apply button, and the fix runs only if they approve it. \
+Only propose a fix you're confident addresses the diagnosis; if none of the menu fixes fit, just describe the manual steps instead. Never claim you already fixed something — a fix only happens after the user clicks Apply. \
+Keep replies short and skimmable. Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows reach for a single PowerShell read pipeline rather than repeated `dir /s`. When you have enough to answer, stop and answer."
     );
 
     let mut steps: Vec<serde_json::Value> = Vec::new();
+    let mut proposals: Vec<serde_json::Value> = Vec::new();
     for _ in 0..10 {
         let val = match ai_call(&key, &system, ai_tools(), &messages) {
             Ok(v) => v,
@@ -1809,6 +1930,25 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
                 let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let tid = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
                 let tinput = b.get("input").cloned().unwrap_or_else(|| serde_json::json!({}));
+                // propose_fix is NOT executed here — the hub records it and surfaces it
+                // to the user as an Apply card. It runs only via ai_apply_ep after the
+                // human approves, re-validated through the same fix_command menu.
+                if name == "propose_fix" {
+                    let kind = tinput.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let farg = tinput.get("arg").and_then(|a| a.as_str()).unwrap_or("");
+                    let why = tinput.get("explanation").and_then(|e| e.as_str()).unwrap_or("");
+                    let out = match fix_command(&platform, kind, farg) {
+                        Some((title, command)) => {
+                            let ack = format!("Proposed to the user for approval: {title}. NOT executed — it runs only if they click Apply.");
+                            steps.push(serde_json::json!({"tool": "propose_fix", "arg": title.clone(), "ok": true}));
+                            proposals.push(serde_json::json!({"kind": kind, "arg": farg, "title": title, "command": command, "explanation": why}));
+                            ack
+                        }
+                        None => format!("Fix '{kind}' isn't available on {platform}, or the name is invalid — pick another approach."),
+                    };
+                    results.push(serde_json::json!({"type": "tool_result", "tool_use_id": tid, "content": out}));
+                    continue;
+                }
                 let (out, ok) = run_ai_tool(agents, target, name, &tinput);
                 let label = tinput.get("command").and_then(|c| c.as_str()).or_else(|| tinput.get("kind").and_then(|k| k.as_str())).unwrap_or("");
                 steps.push(serde_json::json!({"tool": name, "arg": label, "ok": ok}));
@@ -1819,7 +1959,7 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
         if results.is_empty() {
             let text = ai_text(&content);
             if !text.trim().is_empty() {
-                return ai_finish(&incoming, message, text, steps);
+                return ai_finish(&incoming, message, text, steps, proposals);
             }
             break; // empty final (e.g. truncated) — force a synthesis below
         }
@@ -1838,7 +1978,7 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
     } else {
         text
     };
-    ai_finish(&incoming, message, reply, steps)
+    ai_finish(&incoming, message, reply, steps, proposals)
 }
 
 /// Reduce any client-sent history to clean, text-only, strictly-alternating turns
@@ -1867,11 +2007,11 @@ fn sanitize_history(h: &[serde_json::Value]) -> Vec<serde_json::Value> {
 /// transcript + this user message + the final assistant text). No tool blocks are
 /// persisted, so the client can replay `history` next turn without ever producing
 /// a dangling tool_use.
-fn ai_finish(incoming: &[serde_json::Value], message: &str, reply: String, steps: Vec<serde_json::Value>) -> Resp {
+fn ai_finish(incoming: &[serde_json::Value], message: &str, reply: String, steps: Vec<serde_json::Value>, proposals: Vec<serde_json::Value>) -> Resp {
     let mut clean = incoming.to_vec();
     clean.push(serde_json::json!({"role": "user", "content": message}));
     clean.push(serde_json::json!({"role": "assistant", "content": reply.clone()}));
-    json_resp(&serde_json::json!({"ok": true, "reply": reply, "steps": steps, "history": clean}))
+    json_resp(&serde_json::json!({"ok": true, "reply": reply, "steps": steps, "proposals": proposals, "history": clean}))
 }
 
 /// One Messages-API call. Omitting `tools` (empty array) forces a text answer.
@@ -3409,6 +3549,17 @@ pre{margin:0}
 .ai-steps{background:transparent;border:none;padding:2px 0;display:flex;flex-wrap:wrap;gap:6px;max-width:100%}
 .ai-step{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:2px 7px;color:#7bd88f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px}
 .ai-step.bad{color:#f0a0a0;border-color:#5b2b2b}
+.ai-fix{background:#0e1626;border:1px solid #2a3a55;border-left:3px solid #5b9dff;border-radius:8px;padding:10px 12px}
+.ai-fix.done{opacity:.85}
+.aifix-t{font-weight:600;color:#dbe6ff;margin-bottom:3px}
+.aifix-x{font-size:12px;color:#9fb0c8;margin-bottom:7px}
+.aifix-cmd{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:4px 7px;color:#8fb3ff;white-space:pre-wrap;word-break:break-all;margin-bottom:8px}
+.aifix-row{display:flex;gap:8px}
+.aifix-skip{font-size:12px;color:#8a94a6}
+.aifix-res{font-size:12.5px}
+.aifix-res.ok{color:#7bd88f}
+.aifix-res.bad{color:#f0a0a0}
+.aifix-out{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:4px 7px;color:#c3ccdb;white-space:pre-wrap;word-break:break-word;margin-top:6px;max-height:160px;overflow:auto}
 .ai-input{display:flex;gap:8px;padding:10px 14px;border-top:1px solid #1c2130}
 .ai-input input{flex:1;background:#0b0d13;border:1px solid #212836;border-radius:8px;padding:8px 11px;color:#e7ebf2;font-size:13px}
 .aud-act{color:#d7dbe6;font-weight:600}
@@ -3887,7 +4038,9 @@ function aiClose(){document.getElementById('ai-panel').style.display='none';}
 function aiAppend(cls,html){var l=document.getElementById('ai-log');var d=document.createElement('div');d.className='ai-msg '+cls;d.innerHTML=html;l.appendChild(d);l.scrollTop=l.scrollHeight;return d;}
 function aiMd(t){return esc2(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/\n/g,'<br>');}
 function aiSend(){if(AI_BUSY||!SEL)return;var inp=document.getElementById('ai-in');var msg=(inp.value||'').trim();if(!msg)return;inp.value='';aiAppend('ai-user',esc2(msg));AI_BUSY=true;document.getElementById('ai-send').disabled=true;var think=aiAppend('ai-bot ai-think','investigating…');
-fetch(API+'/x/ai-chat?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:AI_HIST})}).then(function(r){return r.json();}).then(function(j){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;if(!j.ok){aiAppend('ai-bot ai-err','⚠ '+esc2(j.error||'failed'));return;}if(j.steps&&j.steps.length){aiAppend('ai-bot ai-steps',j.steps.map(function(t){return '<span class="ai-step'+(t.ok?'':' bad')+'" title="'+attrEsc(t.arg||'')+'">'+esc2(t.tool==='system_report'?('report: '+(t.arg||'')):('$ '+(t.arg||t.tool)))+'</span>';}).join(''));}aiAppend('ai-bot',aiMd(j.reply||'(no answer)'));AI_HIST=j.history||AI_HIST;document.getElementById('ai-in').focus();}).catch(function(e){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;aiAppend('ai-bot ai-err','error: '+esc2(''+e));});}
+fetch(API+'/x/ai-chat?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:AI_HIST})}).then(function(r){return r.json();}).then(function(j){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;if(!j.ok){aiAppend('ai-bot ai-err','⚠ '+esc2(j.error||'failed'));return;}if(j.steps&&j.steps.length){aiAppend('ai-bot ai-steps',j.steps.map(function(t){return '<span class="ai-step'+(t.ok?'':' bad')+'" title="'+attrEsc(t.arg||'')+'">'+esc2(t.tool==='system_report'?('report: '+(t.arg||'')):('$ '+(t.arg||t.tool)))+'</span>';}).join(''));}aiAppend('ai-bot',aiMd(j.reply||'(no answer)'));if(j.proposals&&j.proposals.length){j.proposals.forEach(aiProposal);}AI_HIST=j.history||AI_HIST;document.getElementById('ai-in').focus();}).catch(function(e){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;aiAppend('ai-bot ai-err','error: '+esc2(''+e));});}
+function aiProposal(p){var card=aiAppend('ai-bot ai-fix','');var t=document.createElement('div');t.className='aifix-t';t.innerHTML='🔧 '+esc2(p.title||'Proposed fix');var ex=document.createElement('div');ex.className='aifix-x';ex.textContent=p.explanation||'';var cmd=document.createElement('div');cmd.className='aifix-cmd';cmd.textContent=p.command||'';var row=document.createElement('div');row.className='aifix-row';var ap=document.createElement('button');ap.className='b bsend';ap.textContent='Apply';var sk=document.createElement('button');sk.className='b subtle';sk.textContent='Skip';ap.onclick=function(){aiApply(p,card,ap,sk);};sk.onclick=function(){card.classList.add('done');row.innerHTML='<span class="aifix-skip">Skipped</span>';};row.appendChild(ap);row.appendChild(sk);card.appendChild(t);card.appendChild(ex);card.appendChild(cmd);card.appendChild(row);}
+function aiApply(p,card,ap,sk){ap.disabled=true;sk.disabled=true;ap.textContent='Applying…';fetch(API+'/x/ai-apply?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:p.kind,arg:p.arg||''})}).then(function(r){return r.json();}).then(function(j){card.classList.add('done');var res=document.createElement('div');if(!j.ok){res.className='aifix-res bad';res.textContent='⚠ '+(j.error||'failed');}else{res.className='aifix-res ok';res.innerHTML='✓ Applied — '+esc2(j.title||'')+(j.output&&j.output.trim()?('<pre class="aifix-out">'+esc2(j.output)+'</pre>'):'');}ap.parentElement.replaceWith(res);}).catch(function(e){ap.disabled=false;sk.disabled=false;ap.textContent='Apply';aiAppend('ai-bot ai-err','apply error: '+esc2(''+e));});}
 function doRun(){var c=prompt('Command to run:');if(!c)return;out('$ '+c+'\n…');fetch(API+'/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:c})}).then(function(r){return r.json();}).then(function(j){out('$ '+c+'\n'+(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed'))));}).catch(function(e){out('error: '+e);});}
 var SHSID=null,SHOFF=0,TERM=null,FIT=null;
 function ensureTerm(){if(TERM)return;TERM=new Terminal({fontSize:12,fontFamily:'ui-monospace,SFMono-Regular,Menlo,monospace',cursorBlink:true,theme:{background:'#0b0d13',foreground:'#d3d8e4'}});FIT=new FitAddon.FitAddon();TERM.loadAddon(FIT);TERM.open(document.getElementById('xterm'));TERM.onData(function(d){if(SHSID)fetch(API+'/x/shell/input?target='+enc(SEL)+'&sid='+enc(SHSID),{method:'POST',body:d});});}
@@ -4076,6 +4229,44 @@ mod ai_readonly_tests {
             "powershell -EncodedCommand ZgBv", "powershell -Command \"Invoke-Expression 'rm x'\"",
         ] {
             assert!(!is_readonly_cmd(c), "should BLOCK: {c}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ai_fix_tests {
+    use super::{fix_command, sanitize_fix_arg};
+
+    #[test]
+    fn known_fixes_resolve_per_platform() {
+        // flush_dns needs no arg and exists on all three.
+        for p in ["windows", "linux", "macos"] {
+            assert!(fix_command(p, "flush_dns", "").is_some(), "flush_dns on {p}");
+        }
+        // arg'd fixes build a command that embeds the sanitized name.
+        let (_, cmd) = fix_command("linux", "restart_service", "cups").unwrap();
+        assert!(cmd.contains("cups") && cmd.contains("systemctl"));
+        let (_, cmd) = fix_command("windows", "kill_process", "chrome.exe").unwrap();
+        assert!(cmd.contains("taskkill") && cmd.contains("chrome.exe"));
+        // Windows-only fixes are absent elsewhere.
+        assert!(fix_command("windows", "clear_temp", "").is_some());
+        assert!(fix_command("linux", "clear_temp", "").is_none());
+        assert!(fix_command("windows", "empty_recycle_bin", "").is_some());
+        assert!(fix_command("macos", "empty_recycle_bin", "").is_none());
+    }
+
+    #[test]
+    fn unknown_or_bad_input_is_rejected() {
+        assert!(fix_command("linux", "rm_rf", "/").is_none()); // not in the menu
+        assert!(fix_command("linux", "restart_service", "").is_none()); // arg required
+        // A name with shell metacharacters can never reach a command template.
+        for bad in ["cups; rm -rf /", "a`b`", "x$(y)", "a|b", "a&b", "a>b", "a\"b"] {
+            assert!(sanitize_fix_arg(bad).is_none(), "should reject arg: {bad}");
+            assert!(fix_command("linux", "restart_service", bad).is_none(), "should reject fix arg: {bad}");
+        }
+        // Ordinary service/app names pass.
+        for ok in ["cups", "NetworkManager", "com.apple.something", "My App.exe", "spooler_2"] {
+            assert!(sanitize_fix_arg(ok).is_some(), "should allow arg: {ok}");
         }
     }
 }
