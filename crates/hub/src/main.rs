@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.32.3";
+const VERSION: &str = "2.32.4";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -1766,7 +1766,11 @@ fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, histor
     // turn. `messages` is the internal working copy that accumulates tool_use /
     // tool_result blocks during THIS turn only — those are never persisted, so a
     // replayed history can't carry a dangling tool_use (the API rejects that).
-    let incoming = history;
+    // Sanitize whatever the client sent: keep only clean text turns in strict
+    // alternation. A client cached from before the text-only-history fix can still
+    // send tool_use/tool_result blocks (or a dangling tool_use), which the API
+    // rejects — stripping them here makes the loop robust to any stale history.
+    let incoming = sanitize_history(&history);
     let mut messages: Vec<serde_json::Value> = incoming.clone();
     messages.push(serde_json::json!({"role": "user", "content": message}));
 
@@ -1835,6 +1839,28 @@ Prefer system_report for a broad look; use run_readonly_command for targeted che
         text
     };
     ai_finish(&incoming, message, reply, steps)
+}
+
+/// Reduce any client-sent history to clean, text-only, strictly-alternating turns
+/// starting with the user — dropping tool blocks, empties, and role repeats. This
+/// is what keeps a stale/poisoned client history from causing an API rejection.
+fn sanitize_history(h: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for m in h {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if (role != "user" && role != "assistant") || text.trim().is_empty() {
+            continue; // drop tool blocks (content is an array, not a str) and empties
+        }
+        if out.last().and_then(|p| p.get("role")).and_then(|r| r.as_str()) == Some(role) {
+            continue; // enforce alternation
+        }
+        out.push(serde_json::json!({"role": role, "content": text}));
+    }
+    while out.first().and_then(|p| p.get("role")).and_then(|r| r.as_str()) == Some("assistant") {
+        out.remove(0); // a conversation must start with the user
+    }
+    out
 }
 
 /// Finish a turn: return the reply plus a CLEAN history (the incoming text-only
@@ -4051,5 +4077,43 @@ mod ai_readonly_tests {
         ] {
             assert!(!is_readonly_cmd(c), "should BLOCK: {c}");
         }
+    }
+}
+
+#[cfg(test)]
+mod ai_history_tests {
+    use super::sanitize_history;
+    use serde_json::json;
+
+    #[test]
+    fn strips_tool_blocks_and_fixes_alternation() {
+        // A poisoned history like a stale client sends: tool_use / tool_result blocks
+        // (array content) plus text turns, out of alternation.
+        let h = vec![
+            json!({"role":"user","content":"hi"}),
+            json!({"role":"assistant","content":[{"type":"tool_use","id":"x","name":"y","input":{}}]}),
+            json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"out"}]}),
+            json!({"role":"assistant","content":"the answer"}),
+            json!({"role":"assistant","content":"dup role"}),
+        ];
+        let out = sanitize_history(&h);
+        let roles: Vec<&str> = out.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant"], "only clean alternating text turns survive: {out:?}");
+        assert!(out.iter().all(|m| m["content"].is_string()), "no tool blocks remain");
+        assert_eq!(out[0]["content"], "hi");
+        assert_eq!(out[1]["content"], "the answer");
+    }
+
+    #[test]
+    fn drops_leading_assistant_and_empties() {
+        let h = vec![
+            json!({"role":"assistant","content":"orphan"}),
+            json!({"role":"user","content":"  "}),
+            json!({"role":"user","content":"real question"}),
+        ];
+        let out = sanitize_history(&h);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"], "real question");
     }
 }

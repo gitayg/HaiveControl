@@ -3,6 +3,6 @@ resolver = "2"
 members = ["crates/hub"]
 
 [workspace.package]
-version = "2.32.3"
+version = "2.32.4"
 edition = "2021"
 license = "AGPL-3.0-or-later"
