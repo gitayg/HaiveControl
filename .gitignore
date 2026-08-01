@@ -8,3 +8,16 @@ dist/
 out/
 target/
 Cargo.lock
+
+.squash/
+
+# secrets — never commit (defensive for an open-source repo)
+.env
+.env.*
+*.pem
+*.p12
+*.key
+id_rsa*
+*_secret*
+*-key.local
+.appcrane-key.local
