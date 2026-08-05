@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.34.0";
+const VERSION: &str = "2.35.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -176,30 +176,43 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
         (Method::Post, "/relay/hello") => {
-            // The device dials out, so the socket (or X-Forwarded-For behind the
-            // AppCrane proxy) carries its real public IP — capture it for geo.
-            let pip = req_header(&req, "X-Forwarded-For")
-                .and_then(|h| h.split(',').next().map(|s| s.trim().to_string()))
-                .or_else(|| req.remote_addr().map(|a| a.ip().to_string()));
-            let mut body = String::new();
-            let _ = req.as_reader().read_to_string(&mut body);
-            let mut data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            if let Some(o) = data.as_object_mut() {
-                if let Some(ip) = pip {
-                    o.insert("public_ip".into(), serde_json::json!(ip));
-                }
-                // Per-owner enrollment token used as the relay token → the device
-                // is owned by that account, no separate --owner needed. Recorded as
-                // a persistent override so it survives every check-in.
-                if let Some(owner) = query_param(&url, "tok").and_then(|t| resolve_owner_token(&t)) {
-                    if let Some(id) = o.get("relay_id").and_then(|x| x.as_str()) {
-                        set_owner(agents, &format!("relay:{id}"), &owner);
+            // Strict enrollment: when the hub is authed (RELAY_TOKEN set), a device
+            // must present a per-owner enrollment token (htok_…) so it enrolls UNDER
+            // an owner — never un-owned. relay_ok already blocks a wholly tokenless
+            // call; this additionally rejects a bare shared-token enrollment that
+            // would otherwise land un-owned (and thus invisible to everyone).
+            let owner = query_param(&url, "tok").and_then(|t| resolve_owner_token(&t));
+            let authed = std::env::var("RELAY_TOKEN").map(|t| !t.is_empty()).unwrap_or(false);
+            if authed && owner.is_none() {
+                Response::from_string(
+                    "enrollment requires a personal enrollment token (--relay-token htok_…) — get one from the dashboard's Register a device panel",
+                )
+                .with_status_code(403)
+            } else {
+                // The device dials out, so the socket (or X-Forwarded-For behind the
+                // AppCrane proxy) carries its real public IP — capture it for geo.
+                let pip = req_header(&req, "X-Forwarded-For")
+                    .and_then(|h| h.split(',').next().map(|s| s.trim().to_string()))
+                    .or_else(|| req.remote_addr().map(|a| a.ip().to_string()));
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let mut data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if let Some(o) = data.as_object_mut() {
+                    if let Some(ip) = pip {
+                        o.insert("public_ip".into(), serde_json::json!(ip));
                     }
-                    o.insert("owner".into(), serde_json::json!(owner));
+                    // Per-owner enrollment token → the device is owned by that account,
+                    // recorded as a persistent override so it survives every check-in.
+                    if let Some(owner) = &owner {
+                        if let Some(id) = o.get("relay_id").and_then(|x| x.as_str()) {
+                            set_owner(agents, &format!("relay:{id}"), owner);
+                        }
+                        o.insert("owner".into(), serde_json::json!(owner));
+                    }
                 }
+                relay::hello(agents, data);
+                Response::from_string("").with_status_code(204)
             }
-            relay::hello(agents, data);
-            Response::from_string("").with_status_code(204)
         }
         (Method::Get, "/whoami") => {
             // Dump every header the proxy actually sends so we can see what identity
@@ -275,7 +288,6 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
-        (Method::Get, "/x/claim-all") => claim_all_ep(&url, agents, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
@@ -361,7 +373,6 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/persist") => proxy_persist(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
-        (Method::Get, "/m/claim-all") => claim_all_ep(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
@@ -659,8 +670,12 @@ fn auditable(path: &str) -> bool {
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
 fn may_control(user: Option<&str>, agents: &Agents, target: &str) -> bool {
     match user {
+        // No SSO identity (trusted LAN / dev, RELAY_TOKEN unset) = full access.
         None => true,
-        Some(u) => { let o = device_owner(agents, target).unwrap_or_default(); o.is_empty() || o == u }
+        // Strict ownership: an authenticated user may only see/drive devices whose
+        // owner is exactly them. Un-owned devices are invisible — and they shouldn't
+        // exist, since enrollment requires a personal token and unclaiming is off.
+        Some(u) => device_owner(agents, target).as_deref() == Some(u),
     }
 }
 
@@ -1504,20 +1519,21 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
     if target.is_empty() {
         return Response::from_string("no target").with_status_code(400);
     }
-    // Ownership guard. set-owner is exempt from the preamble may_control gate so it
-    // can CLAIM an unowned device — but it must never let one user seize a device
-    // that already belongs to another. may_control returns true for unowned
-    // (o.is_empty()) and for your own, and false only when a different owner holds
-    // it — exactly the claim/transfer rule we want.
+    // Ownership guard: you may only (re)assign a device you already own — never one
+    // that belongs to another user. Under strict ownership every device is owned
+    // (enrollment requires a personal token), so this is a transfer-your-own gate.
     if !may_control(user, agents, &target) {
         return Response::from_string("forbidden: that device belongs to another user").with_status_code(403);
     }
     let owner = match query_param(url, "owner") {
-        Some(o) if o.is_empty() => String::new(), // explicit ?owner= — an intentional unclaim
+        // Unclaiming (empty owner) is not allowed — a device must never become
+        // un-owned. Transfer it to another owner instead of releasing it.
+        Some(o) if o.is_empty() => {
+            return Response::from_string("unclaiming a device is not allowed (a device must always have an owner)")
+                .with_status_code(400)
+        }
         Some(o) => canon_owner(&o),
-        // No identity reached the hub. Writing "" here would leave the device
-        // unclaimed (= visible to EVERY user) while reporting success — the silent
-        // no-op that made earlier claims look like they worked. Refuse instead.
+        // No identity reached the hub and no explicit owner given — nothing to set.
         None => match user {
             Some(u) if !u.is_empty() => u.to_string(),
             _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
@@ -1527,40 +1543,6 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
     json_resp(&serde_json::json!({"ok": true, "owner": owner}))
 }
 
-/// GET /x/claim-all[?owner=Y] — assign every device in the inventory to the caller
-/// (or `?owner=`). One click to consolidate the fleet under one account.
-fn claim_all_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
-    let owner = match query_param(url, "owner") {
-        Some(o) if o.is_empty() => String::new(), // explicit ?owner= — an intentional unclaim
-        Some(o) => canon_owner(&o),
-        None => match user {
-            Some(u) if !u.is_empty() => u.to_string(),
-            _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
-        },
-    };
-    // Only claim devices that are currently unowned or already the caller's. A
-    // shared/multi-user hub must never let "claim all" seize devices owned by
-    // someone else — without this filter one click would transfer every other
-    // user's fleet to the caller. (No SSO identity = LAN/admin = claim everything,
-    // matching may_control's None => true.)
-    let claimable: Vec<String> = {
-        let g = agents.lock().unwrap();
-        g.iter()
-            .filter(|(_, a)| {
-                let cur = a.data.get("owner").and_then(|o| o.as_str()).unwrap_or("");
-                match user {
-                    None => true,
-                    Some(u) => cur.is_empty() || cur == u,
-                }
-            })
-            .map(|(k, _)| k.clone())
-            .collect()
-    };
-    for k in &claimable {
-        set_owner(agents, k, &owner);
-    }
-    json_resp(&serde_json::json!({"ok": true, "owner": owner, "count": claimable.len()}))
-}
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
     let checks = [("disk encryption", "encryption"), ("firewall", "firewall"), ("antivirus", "av"), ("OS updates", "updates")];
@@ -3469,7 +3451,9 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
         .iter()
         .filter(|(_, a)| match user {
             None => true,
-            Some(u) => { let o = a.data.get("owner").and_then(|o| o.as_str()).unwrap_or(""); o.is_empty() || o == u },
+            // Strict: an authenticated user sees only devices they own. Un-owned
+            // devices are hidden (they shouldn't exist under token-gated enrollment).
+            Some(u) => a.data.get("owner").and_then(|o| o.as_str()) == Some(u),
         })
         .map(|(key, a)| {
             let mut d = a.data.clone();
@@ -3631,7 +3615,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <main class=\"stage\">\
 <div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
-<div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div><button class=\"b subtle\" style=\"margin-left:auto\" onclick=\"doClaimAll()\" title=\"assign every device to your account so the whole fleet lists under you\">Claim all to me</button></div>\
+<div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account · last 500 events</span></div><input id=\"aud-q\" class=\"devsearch\" placeholder=\"Filter by device / action / who / via…\" autocomplete=\"off\" oninput=\"renderAudit();\"><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
 <div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span><button class=\"b subtle ov-refresh\" onclick=\"refreshInv(this)\" title=\"refresh device list now\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic-rf\"><path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/><path d=\"M21 3v5h-5\"/><path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/><path d=\"M3 21v-5h5\"/></svg>Refresh</button></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th><th>Agent</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
@@ -4140,7 +4124,7 @@ function ovSort(k){if(OV_SORT.key===k){OV_SORT.dir*=-1;}else{OV_SORT.key=k;OV_SO
 function ovVal(d,k){switch(k){case 'name':return (d.name||d.hostname||d.ip||'').toLowerCase();case 'os':return (d.os||'').toLowerCase();case 'user':return (d.user||'').toLowerCase();case 'cpu':return (d.cpu_pct==null?-1:d.cpu_pct);case 'ram':return (d.free_gb==null?-1:d.free_gb);case 'seen':return (d.last_seen_secs==null?1e9:d.last_seen_secs);case 'status':return ({on:0,idle:1,off:2}[statusOf(d)]);default:return 0;}}
 function refreshInv(btn){if(btn){btn.classList.add('spin');setTimeout(function(){btn.classList.remove('spin');},700);}fetchAgents();}
 function scopeHint(){var o=(window.HB&&HB.owner)||'';return o?('<div class="scope-hint">Viewing as owner <code>'+esc2(o)+'</code> — only devices enrolled with a matching <code>--owner</code> value appear here.</div>'):'<div class="scope-hint">Viewing all owners.</div>';}
-function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0,uncl=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(!d.owner)uncl++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(uncl?'<span class="ovs uncl-sum" title="devices with no owner — visible to every user on this hub" onclick="doClaimAll()">⚠ '+uncl+' unclaimed → Claim all</span>':'')+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices in your view.'+scopeHint()+'</td></tr>';return;}var sorted=(SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr).slice();sorted.sort(function(a,b){var va=ovVal(a,OV_SORT.key),vb=ovVal(b,OV_SORT.key);return (va<vb?-1:va>vb?1:0)*OV_SORT.dir;});if(!sorted.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices match “'+esc2(SEARCH)+'”.</td></tr>';return;}body.innerHTML=sorted.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+ownerChip(d)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+instChip(d)+'</td><td>'+presCell(d)+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td><td><button class="b subtle agi-btn" title="copy how to connect: MCP + curl + commands" onclick="copyConn(event,\''+attrEsc(b)+'\')">🔌 Connect</button></td></tr>';}).join('');}
+function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0,uncl=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(!d.owner)uncl++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices in your view.'+scopeHint()+'</td></tr>';return;}var sorted=(SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr).slice();sorted.sort(function(a,b){var va=ovVal(a,OV_SORT.key),vb=ovVal(b,OV_SORT.key);return (va<vb?-1:va>vb?1:0)*OV_SORT.dir;});if(!sorted.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices match “'+esc2(SEARCH)+'”.</td></tr>';return;}body.innerHTML=sorted.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+ownerChip(d)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+instChip(d)+'</td><td>'+presCell(d)+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td><td><button class="b subtle agi-btn" title="copy how to connect: MCP + curl + commands" onclick="copyConn(event,\''+attrEsc(b)+'\')">🔌 Connect</button></td></tr>';}).join('');}
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var n=(LAST||[]).length;if(!confirm('Run this command on ALL '+n+' device'+(n===1?'':'s')+'?\n\n'+c))return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch(API+'/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 var AUD_ALL=[];
 function loadAudit(){fetch(API+'/audit').then(function(r){return r.json();}).then(function(j){AUD_ALL=j.audit||[];renderAudit();}).catch(function(){});}
@@ -4241,7 +4225,6 @@ function doUpd(){if(!confirm('Update the agent on this device to the latest buil
 function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
 function okJson(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});return r.json();}
 function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(okJson).then(function(j){out('claimed — this device is now owned by '+(j.owner||'you')+'.');fetchAgents();}).catch(function(e){out('claim failed: '+(e.message||e));});}
-function doClaimAll(){var n=(LAST||[]).length;if(!confirm('Assign all '+n+' device'+(n===1?'':'s')+' to your account? They will list under you (and only you).'))return;fetch(API+'/x/claim-all').then(okJson).then(function(j){alert('Claimed '+(j.count||0)+' device'+((j.count===1)?'':'s')+' to '+(j.owner||'your account')+'.');fetchAgents();}).catch(function(e){alert('Claim failed:\n\n'+(e.message||e));});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 function doPersist(){if(!confirm('Make this device persistent? Installs autostart so the agent survives reboot/login, and stops the machine sleeping while on AC power. Dissolve reverts both.'))return;out('making persistent…');fetch(API+'/x/persist?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);setTimeout(fetchAgents,1500);}).catch(function(e){out('error: '+e);});}
 function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
@@ -4409,15 +4392,16 @@ mod ownership_tests {
     }
 
     #[test]
-    fn unowned_device_is_claimable_by_anyone() {
-        let a = agents_with("relay:dev2", None); // no owner yet
-        assert!(may_control(Some("bob"), &a, "relay://dev2"), "unclaimed devices are visible so they can be claimed");
+    fn unowned_device_is_invisible_to_authenticated_users() {
+        let a = agents_with("relay:dev2", None); // no owner
+        assert!(!may_control(Some("bob"), &a, "relay://dev2"), "strict: an un-owned device is NOT controllable by a logged-in user");
+        assert!(may_control(None, &a, "relay://dev2"), "no SSO identity (LAN/admin) still has access");
     }
 
     #[test]
-    fn unknown_target_has_no_owner() {
+    fn unknown_target_is_not_controllable() {
         let a = agents_with("relay:dev1", Some("alice"));
-        assert!(may_control(Some("bob"), &a, "relay://ghost"), "a target with no registered agent resolves to unowned");
+        assert!(!may_control(Some("bob"), &a, "relay://ghost"), "strict: an unknown/unregistered target has no owner, so no access");
     }
 }
 

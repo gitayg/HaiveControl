@@ -412,9 +412,23 @@ the destination (temp-file + rename). To pull a file *off* a device, use `/x|/m/
 A device's owner is a **stable id derived from the owner's email** (`UUIDv5(namespace,
 lower(trim(email)))`) — deterministic across redeploys and hub instances, with no dependence
 on any machine MAC/hostname (which is ephemeral in containers) and no persistence needed.
-Emails, pre-hashed ids, and the SSO identity all canonicalize to the same key. The owner id
-is only a **scope selector** — the MCP/relay **token is the auth boundary**, so its
-guessability is harmless. `HIVE_OWNER` is optional (unset = see all the token reaches).
+Emails, pre-hashed ids, and the SSO identity all canonicalize to the same key.
+
+**Strict ownership (multi-tenant safe).** When the hub is authed (`RELAY_TOKEN` set):
+
+- **Every device is owned from birth** — enrollment requires a *personal* enrollment token
+  (`--relay-token htok_…`, minted from the dashboard's *Register a device* panel). A device
+  cannot enroll un-owned.
+- **A device can never become un-owned** — there is no "unclaim". You may *transfer* a device
+  to another owner, but not release it into the pool.
+- **An authenticated user sees and drives only their own devices** — the list, screen, shell,
+  files, AI assistant, and every device action are gated on `owner == you`. A user can never
+  see, reach, or seize another user's device (nor guess their way to an un-owned one).
+
+Ownership assignments persist to `owner_overrides.json` (survive redeploys). With **no** SSO
+identity — a trusted LAN / dev hub with `RELAY_TOKEN` unset — the hub is unscoped (full
+access), which is also the path an admin uses to adopt any legacy un-owned devices. For the
+MCP, `HIVE_OWNER` selects which owner the token acts as (unset = the unscoped admin view).
 
 ## Reverse-tunnel relay (control beyond the LAN)
 
