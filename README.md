@@ -1,4 +1,4 @@
-# HaiveControl
+# IT-AI
 
 **A hive of your machines, one AI mind.** Self-hosted, LAN-first remote control with a
 built-in **MCP interface** — so an AI (Claude, etc.) can see the screen, run commands,
@@ -19,8 +19,8 @@ or an **MCP-enabled AI** — nothing to install on the viewing side.
 ## How it works
 
 ```
-  Mac:      HaiveHub                 → prints  "Mac ID: itays-macbook-pro"
-  Windows:  HaiveControl.exe itays-macbook-pro
+  Mac:      it-ai-hub                 → prints  "Mac ID: itays-macbook-pro"
+  Windows:  it-ai.exe itays-macbook-pro
                  └─ finds the Mac by that id (Bonjour), registers itself,
                     then serves screen + control + shell on port 8765
   Mac:      open the hub dashboard  → the Windows box is listed → click to view
@@ -30,14 +30,14 @@ The only thing you configure on Windows is **one argument: the Mac's ID**.
 
 ## Built in Rust
 
-HaiveControl is a Rust workspace producing four small, dependency-free binaries:
+IT-AI is a Rust workspace producing four small, dependency-free binaries:
 
 | Binary | Role | ~size |
 |---|---|---|
-| `HaiveControl` | agent (runs on each device) | 5 MB |
-| `HaiveHub` | hub (runs on the Mac) | 3 MB |
-| `haivectl` | CLI (Mac) | 5 MB |
-| `haive-mcp` | MCP server (Mac) | 6 MB |
+| `IT-AI` | agent (runs on each device) | 5 MB |
+| `it-ai-hub` | hub (runs on the Mac) | 3 MB |
+| `itai` | CLI (Mac) | 5 MB |
+| `it-ai-mcp` | MCP server (Mac) | 6 MB |
 
 **Build from source:** `cargo build --release` → binaries land in `target/release/`.
 
@@ -45,9 +45,9 @@ HaiveControl is a Rust workspace producing four small, dependency-free binaries:
 **Windows + macOS + Linux** matrix (`cargo build --release`) and attaches all four
 binaries per OS to the release:
 
-- Tag a release: `git tag v1.0.0 && git push --tags` → e.g. `HaiveControl-windows.exe`,
-  `HaiveControl-macos`, `HaiveControl-linux`, plus the `HaiveHub-*`, `haivectl-*`,
-  `haive-mcp-*` sets.
+- Tag a release: `git tag v1.0.0 && git push --tags` → e.g. `it-ai-windows.exe`,
+  `it-ai-macos`, `it-ai-linux`, plus the `it-ai-hub-*`, `itai-*`,
+  `it-ai-mcp-*` sets.
 - Or run the **build** workflow manually (workflow_dispatch) → download from Artifacts.
 
 Nothing to install to *run* them — they're static native binaries.
@@ -63,18 +63,18 @@ Nothing to install to *run* them — they're static native binaries.
   box. On **GNOME/KDE Wayland** (no wlr-screencopy) it uses the **xdg-desktop-portal
   ScreenCast** API: the first capture raises a one-time "Share your screen" consent
   dialog on the device's display — approve it once (with "remember") and every later
-  capture is silent (a `restore_token` is stashed in `~/.haive/screencast.token`).
+  capture is silent (a `restore_token` is stashed in `~/.it-ai/screencast.token`).
   Until consent is given, capture reports "consent pending" rather than a blank error.
   Input control still needs X11. Build deps: `libxcb1-dev libx11-dev libxtst-dev
   libpipewire-0.3-dev libdbus-1-dev` (already in CI).
 
 ## Step 1 — start the hub on the Mac
 
-Run `HaiveHub` (`./HaiveHub-macos`). It prints your **Mac ID** and a dashboard URL, e.g.:
+Run `it-ai-hub` (`./it-ai-hub-macos`). It prints your **Mac ID** and a dashboard URL, e.g.:
 ```
 Mac ID:  itays-macbook-pro
 Dashboard: http://localhost:8770/
-On Windows run:  HaiveControl.exe itays-macbook-pro
+On Windows run:  it-ai.exe itays-macbook-pro
 ```
 Keep it running. Both machines must be on the **same LAN**.
 
@@ -82,17 +82,17 @@ Keep it running. Both machines must be on the **same LAN**.
 
 **The hub hosts the binaries**, so the target downloads and runs in one line — no manual
 copy. The dashboard shows a ready-made, per-OS command with a copy button. It downloads
-the file as **`airm`** and registers it. For example:
+the file as **`it-ai`** and registers it. For example:
 
 ```powershell
 # Windows (PowerShell or cmd) — works in both
-curl.exe -L -o airm.exe http://MAC_IP:8770/bin/HaiveControl-windows.exe
-.\airm.exe MAC_IP:8770 --id itays-macbook-pro
+curl.exe -L -o it-ai.exe http://MAC_IP:8770/bin/it-ai-windows.exe
+.\it-ai.exe MAC_IP:8770 --id itays-macbook-pro
 ```
 ```bash
 # macOS / Linux
-curl -L -o airm http://MAC_IP:8770/bin/HaiveControl-macos && chmod +x airm
-./airm MAC_IP:8770 --id itays-macbook-pro
+curl -L -o it-ai http://MAC_IP:8770/bin/it-ai-macos && chmod +x it-ai
+./it-ai MAC_IP:8770 --id itays-macbook-pro
 ```
 
 The target can be given by **direct IP** (`MAC_IP:8770`), by **Mac ID** (Bonjour
@@ -116,13 +116,13 @@ Pick how long the agent sticks around (default = one-time):
 | Timed | `--ttl MIN` | Runs for `MIN` minutes, then exits and removes any autostart. |
 
 ```bat
-HaiveControl.exe mymac secret --persist       :: survives reboot
-HaiveControl.exe mymac secret --ttl 30         :: self-dissolves after 30 min
-HaiveControl.exe --uninstall                   :: remove autostart, exit
+it-ai.exe mymac secret --persist       :: survives reboot
+it-ai.exe mymac secret --ttl 30         :: self-dissolves after 30 min
+it-ai.exe --uninstall                   :: remove autostart, exit
 ```
 
 Autostart uses the **standard, visible** mechanism per OS — Windows `HKCU\…\Run`,
-a macOS **LaunchAgent** (`~/Library/LaunchAgents/com.haive.agent.plist`), or a
+a macOS **LaunchAgent** (`~/Library/LaunchAgents/com.itai.agent.plist`), or a
 Linux XDG **autostart `.desktop`**. Nothing hidden; `--uninstall` (or deleting that
 entry) removes it. "Dissolve" stops the process and clears autostart — it does **not**
 delete the binary (self-deleting executables are a malware pattern, intentionally
@@ -152,14 +152,14 @@ passed); otherwise the live screen opens directly. No IP to look up.
 ## HTTPS (on by default)
 
 The agent serves over **TLS** using a self-signed certificate it generates on first
-run (stored in `~/.haive/` on the Windows box, so it's stable across restarts).
+run (stored in `~/.it-ai/` on the Windows box, so it's stable across restarts).
 Traffic — screen, keystrokes, password, command output — is encrypted.
 
 Because the cert is self-signed, the first time you connect the browser shows a
 **"Not private / not secure"** warning. Two options:
 
 - **Quick:** click *Advanced → Proceed*. You're now on an encrypted connection.
-- **No more warnings:** copy `~/.haive/cert.pem` from the Windows box to the
+- **No more warnings:** copy `~/.it-ai/cert.pem` from the Windows box to the
   Mac, open it in **Keychain Access**, and set it to *Always Trust*. The lock goes
   green for that machine.
 
@@ -277,14 +277,14 @@ live. Recorded server-side (in memory, last 500 events).
 Everything the browser does is a plain HTTP API on the agent, so you can drive a
 device from a script. Two ways:
 
-**`haivectl` (recommended)** — resolves the device through the hub by name, so you
+**`itai` (recommended)** — resolves the device through the hub by name, so you
 never type its IP:
 
 ```bash
-haivectl list                          # list registered devices
-haivectl exec mymac "ipconfig /all"    # run a command, print output
-haivectl get  mymac C:\logs\app.log    # download a file
-haivectl put  mymac ./patch.zip C:\tmp # upload a file
+itai list                          # list registered devices
+itai exec mymac "ipconfig /all"    # run a command, print output
+itai get  mymac C:\logs\app.log    # download a file
+itai put  mymac ./patch.zip C:\tmp # upload a file
 ```
 Global flags come **before** the subcommand: `--hub` (default `http://localhost:8770`),
 `--password` (if the agent set one), `--cafile` (agent `cert.pem` to verify TLS).
@@ -299,7 +299,7 @@ Returns `{"ok":true,"code":0,"stdout":"…","stderr":"…"}`. Other endpoints:
 
 ## Use it as an MCP server (drive devices from an AI)
 
-The `haive-mcp` binary wraps the same API as MCP tools, so an AI client (Claude Code,
+The `it-ai-mcp` binary wraps the same API as MCP tools, so an AI client (Claude Code,
 Claude Desktop, etc.) can operate a device by name. Tools exposed:
 
 - `list_devices()` — registered devices, with full details (OS, CPU, memory, logged-in
@@ -317,19 +317,19 @@ MCP tool because a stream isn't a single tool response — use `screenshot` /
 `camera_snapshot` for AI-driven stills.
 
 ### One MCP server, many devices
-The hub tracks every registered agent, so a single `haive-mcp` controls them all —
+The hub tracks every registered agent, so a single `it-ai-mcp` controls them all —
 just run the agent on each device with the **same Mac ID**. They each register and you
 target them by name: `run_command("linux-box", …)`, `screenshot("macmini")`. Give each
 a clear label with `--name` (or `SCREEN_NAME`) so they're easy to tell apart:
 
 ```bat
-HaiveControl.exe mymac secret --name reception-pc
+it-ai.exe mymac secret --name reception-pc
 ```
 
 Runs on the Mac next to the hub. Register the binary:
 
 ```bash
-claude mcp add haive -- /full/path/to/haive-mcp
+claude mcp add itai -- /full/path/to/it-ai-mcp
 ```
 
 The MCP drives devices **entirely through the hub's `/m` API** (it never talks to an
@@ -439,8 +439,8 @@ hub and holds the connection, and the hub drives it back down that channel. The 
 never needs a public address.
 
 ```bash
-HaiveControl <mac-id> --relay https://your-hub.example.com     # cloud hub
-HaiveControl <mac-id> --relay http://192.168.1.10:8770         # or any reachable hub
+IT-AI <mac-id> --relay https://your-hub.example.com     # cloud hub
+IT-AI <mac-id> --relay http://192.168.1.10:8770         # or any reachable hub
 ```
 
 - The tunnel is **HTTP long-poll on the hub's normal port** (`/relay/hello`, `/relay/poll`,
@@ -475,7 +475,7 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
    the platform edge, so the tunnel is encrypted even though it's plain HTTP inside. `/bin`
    serves only public binaries, so it needs no token.
 4. Deploy, then on each device run the relay command the dashboard shows
-   (`./airm --relay https://<your-app-url> --relay-token <token> --name <device>`).
+   (`./it-ai --relay https://<your-app-url> --relay-token <token> --name <device>`).
 
 **Relay auth:** with `RELAY_TOKEN` set, every `/relay/*` call must carry `?tok=<token>` —
 the agent sends it (`--relay-token` or `HIVE_RELAY_TOKEN`); wrong/absent → `401`. Unset =
@@ -539,9 +539,9 @@ SSO) is the API. An email or a raw owner id still works as `--owner`, for backwa
 | `SCREEN_NAME`    | *hostname* | Friendly device label shown in the hub (also `--name`) |
 
 ## Unattended / start at login
-Put a shortcut to `HaiveControl.exe` in the Startup folder
+Put a shortcut to `it-ai.exe` in the Startup folder
 (`shell:startup`), or create a Task Scheduler task "At log on". To pass a password,
-point the shortcut at a small `.bat` that does `set SCREEN_PW=… & HaiveControl.exe`.
+point the shortcut at a small `.bat` that does `set SCREEN_PW=… & it-ai.exe`.
 
 ## Security — read this
 - **LAN-only, open by default.** With no `SCREEN_PW`, anyone on the same LAN who
@@ -557,25 +557,25 @@ point the shortcut at a small `.bat` that does `set SCREEN_PW=… & HaiveControl
 - Intended for **your own devices**. Don't deploy it to watch someone without consent.
 
 ## Layout (Rust workspace)
-- `crates/agent` → **`HaiveControl`** — the agent (Windows/macOS/Linux): screen capture,
+- `crates/agent` → **`IT-AI`** — the agent (Windows/macOS/Linux): screen capture,
   `/frame`, `/stream` (live MJPEG), `/camera` + `/camstream` (webcam), `/input`, `/exec`,
   `/shell/*` (interactive PTY shell), `/upload`, `/download`, `/list`, `/update`,
   `/dissolve`; registers to the hub and reports full sysinfo + live CPU/RAM. Modules:
   `capture` (xcap + nokhwa), `input` (enigo), `shell` (portable-pty), `tls` (rcgen),
   `discovery` (mdns-sd, self-update), `relay` (outbound long-poll tunnel), `http`
   (which also runs a loopback twin the relay self-calls), `persistence`.
-- `crates/hub` → **`HaiveHub`** — the Mac hub: Bonjour advertise, `/register`, `/agents`,
+- `crates/hub` → **`it-ai-hub`** — the Mac hub: Bonjour advertise, `/register`, `/agents`,
   the single-page dashboard (with a bundled xterm.js terminal at `/assets/*`), hosts the
   agent binaries (`/bin/*`), proxies device actions (`/x/*`, incl. live-stream
   passthrough), and terminates the reverse tunnel (`/relay/*`, see `relay.rs`).
-- `crates/cli` → **`haivectl`** — Mac CLI: `list` / `exec` / `get` / `put` by device name.
-- `crates/mcp` → **`haive-mcp`** — Mac MCP server: `list_devices` / `screenshot` /
+- `crates/cli` → **`itai`** — Mac CLI: `list` / `exec` / `get` / `put` by device name.
+- `crates/mcp` → **`it-ai-mcp`** — Mac MCP server: `list_devices` / `screenshot` /
   `run_command` / `download_file` / `upload_file` tools (rmcp).
 - `.github/workflows/build.yml` — `cargo build --release` matrix (Windows/macOS/Linux).
 
 ## License
 
-HaiveControl is free software licensed under the **GNU Affero General Public License
+IT-AI is free software licensed under the **GNU Affero General Public License
 v3.0 or later** (AGPL-3.0-or-later) — see [LICENSE](LICENSE). In short: you may use,
 modify, and redistribute it, but if you run a modified version as a network service,
 you must offer that service's users the corresponding source. It comes with **no

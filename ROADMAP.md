@@ -1,4 +1,4 @@
-# HaiveControl — RMM feature roadmap
+# IT-AI — RMM feature roadmap
 
 Distilled from 8 research passes. Effort is rough dev-days for a shippable MVP.
 Everything is owner-scoped and, per our rule, must surface in the **dashboard** too —

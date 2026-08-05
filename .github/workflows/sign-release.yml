@@ -134,7 +134,7 @@ jobs:
         run: |
           mkdir dl
           gh release download "$TAG" --repo "$PUB" --dir dl \
-            --pattern 'HaiveControl-*' --pattern 'haive-mcp-*' --pattern 'haivectl-*'
+            --pattern 'it-ai-*' --pattern 'it-ai-mcp-*' --pattern 'itai-*'
           : > SHA256SUMS
           for f in dl/*; do
             printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> SHA256SUMS

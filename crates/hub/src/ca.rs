@@ -26,7 +26,7 @@ fn ca() -> &'static (String, KeyPair) {
         let mut params = CertificateParams::new(Vec::new()).expect("ca params");
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "HaiveControl Hub CA");
+        dn.push(DnType::CommonName, "IT-AI Hub CA");
         params.distinguished_name = dn;
         let key = KeyPair::generate().expect("ca key");
         let cert = params.self_signed(&key).expect("ca self-signed");
@@ -52,7 +52,7 @@ pub fn sign_leaf(sans: Vec<String>) -> Option<(String, String)> {
     let ca_cert = ca_params.self_signed(ca_key).ok()?;
     let mut leaf = CertificateParams::new(sans).ok()?;
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "haive-agent");
+    dn.push(DnType::CommonName, "it-ai");
     leaf.distinguished_name = dn;
     let leaf_key = KeyPair::generate().ok()?;
     let leaf_cert = leaf.signed_by(&leaf_key, &ca_cert, ca_key).ok()?;
