@@ -1,11 +1,11 @@
 [package]
-name = "haive-hub"
+name = "it-ai-hub"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "HaiveHub"
+name = "it-ai-hub"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,8 +1,8 @@
-// HaiveControl — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The HaiveControl Authors.
+// IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
+// Copyright (C) 2026 The IT-AI Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// HaiveHub — runs on the Mac. Advertises a Mac ID over Bonjour, collects agent
+// it-ai-hub — runs on the Mac. Advertises a Mac ID over Bonjour, collects agent
 // registrations, and serves a dashboard + JSON list of registered devices.
 mod ca;
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.35.0";
+const VERSION: &str = "3.0.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -36,8 +36,8 @@ struct Agent {
 }
 
 #[derive(Parser)]
-#[command(name = "HaiveHub", version = VERSION,
-    about = "HaiveControl hub — advertises a Mac ID, collects agent registrations, serves a dashboard.\n\nenv: HUB_PORT (default 8770), MAC_ID (override advertised id)")]
+#[command(name = "it-ai-hub", version = VERSION,
+    about = "IT-AI hub — advertises a Mac ID, collects agent registrations, serves a dashboard.\n\nenv: HUB_PORT (default 8770), MAC_ID (override advertised id)")]
 struct Args {}
 
 fn main() {
@@ -52,10 +52,10 @@ fn main() {
     let ip = local_ip();
     let _mdns = advertise(&mid, port, &ip);
 
-    println!("HaiveControl hub {VERSION}");
+    println!("IT-AI hub {VERSION}");
     println!("   Mac ID:  {mid}");
     println!("   Dashboard: http://localhost:{port}/  (or http://{ip}:{port}/)");
-    println!("   On a device run:  HaiveControl {mid}");
+    println!("   On a device run:  IT-AI {mid}");
 
     let agents: Arc<Agents> = Arc::new(Mutex::new(HashMap::new()));
     load_state(&agents);
@@ -70,7 +70,7 @@ fn main() {
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
     // (/relay/hello, /relay/poll, /relay/reply — see relay.rs), so it works
-    // behind a single HTTPS endpoint. `HaiveControl --relay http://<hub-host>:<port>`.
+    // behind a single HTTPS endpoint. `IT-AI --relay http://<hub-host>:<port>`.
 
     let server = Arc::new(Server::http(format!("0.0.0.0:{port}")).expect("bind hub port"));
     let mut handles = Vec::new();
@@ -309,7 +309,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/file-status") => file_status_ep(&url),
         (Method::Get, "/live") => live_page(&url),
         // MCP API (token-authed, owner-scoped) — mirrors the device actions the
-        // haive-mcp server needs, routed through the hub so it works over relay.
+        // it-ai-mcp server needs, routed through the hub so it works over relay.
         (Method::Get, "/m/agents") => json_agents(agents, mowner.as_deref()),
         (Method::Get, "/m/frame") => proxy_frame(&url),
         (Method::Get, "/m/camera") => proxy_camera(&url),
@@ -1112,8 +1112,8 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("usb_lock", "windows") => "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\USBSTOR\" /v Start /t REG_DWORD /d 4 /f".into(),
         ("usb_unlock", "windows") => "reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Services\\USBSTOR\" /v Start /t REG_DWORD /d 3 /f".into(),
         ("message", "windows") => format!("msg * \"{}\"", arg.replace('"', "'")),
-        ("message", "macos") => format!("osascript -e 'display dialog \"{}\" buttons {{\"OK\"}} with title \"HaiveControl\"'", arg.replace('"', "'").replace('\'', "’")),
-        ("message", "linux") => format!("notify-send \"HaiveControl\" \"{}\"", arg.replace('"', "'")),
+        ("message", "macos") => format!("osascript -e 'display dialog \"{}\" buttons {{\"OK\"}} with title \"IT-AI\"'", arg.replace('"', "'").replace('\'', "’")),
+        ("message", "linux") => format!("notify-send \"IT-AI\" \"{}\"", arg.replace('"', "'")),
         ("install", "windows") => format!("winget install --silent --accept-package-agreements --accept-source-agreements {}", shell_arg(arg)),
         ("install", "macos") => format!("brew install {}", shell_arg(arg)),
         ("install", "linux") => format!("sudo apt-get install -y {}", shell_arg(arg)),
@@ -1126,7 +1126,7 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("update_all", "windows") => "winget upgrade --all --silent --accept-package-agreements --accept-source-agreements".into(),
         ("update_all", "macos") => "softwareupdate -ia".into(),
         ("update_all", "linux") => "sudo apt-get update && sudo apt-get upgrade -y".into(),
-        ("power_report", "windows") => "powercfg /getactivescheme & powercfg /batteryreport /output %TEMP%\\haive-battery.html & echo saved to %TEMP%\\haive-battery.html".into(),
+        ("power_report", "windows") => "powercfg /getactivescheme & powercfg /batteryreport /output %TEMP%\\it-ai-battery.html & echo saved to %TEMP%\\it-ai-battery.html".into(),
         ("power_report", "macos") => "pmset -g custom | head -25".into(),
         ("power_report", "linux") => "upower -d 2>/dev/null | head -30 || echo 'upower not present'".into(),
         _ => return None,
@@ -1910,7 +1910,7 @@ fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, histor
     let dev = device_name(agents, target);
     let platform = device_platform(agents, target);
     let system = format!(
-        "You are an IT support assistant built into HaiveControl, helping with the computer '{dev}' ({platform}). \
+        "You are an IT support assistant built into IT-AI, helping with the computer '{dev}' ({platform}). \
 Inspect the machine with the system_report and run_readonly_command tools — these READ only and change nothing. \
 Diagnose the user's problem first: run the checks you need, then explain what you found in plain, non-technical language. \
 When you've diagnosed a problem that one of the standard fixes can solve, call propose_fix — this does NOT run the fix; it shows the user an Apply button, and the fix runs only if they approve it. \
@@ -2606,7 +2606,7 @@ fn cve_lookup(url: &str) -> Resp {
         return json_resp(v);
     }
     let api = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=20", urlencode(&q));
-    let resp = http().get(&api).header("User-Agent", "HaiveControl").send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
+    let resp = http().get(&api).header("User-Agent", "IT-AI").send().ok().and_then(|r| r.json::<serde_json::Value>().ok());
     let cves: Vec<serde_json::Value> = resp
         .as_ref()
         .and_then(|v| v["vulnerabilities"].as_array())
@@ -2697,10 +2697,10 @@ fn agent_config() -> Resp {
 
 fn agent_asset(platform: &str, arch: &str) -> Option<&'static str> {
     match (platform, arch) {
-        ("windows", _) => Some("HaiveControl-windows.exe"),
-        ("macos", _) => Some("HaiveControl-macos"),
-        ("linux", "aarch64") => Some("HaiveControl-linux-arm64"),
-        ("linux", _) => Some("HaiveControl-linux"),
+        ("windows", _) => Some("it-ai-windows.exe"),
+        ("macos", _) => Some("it-ai-macos"),
+        ("linux", "aarch64") => Some("it-ai-linux-arm64"),
+        ("linux", _) => Some("it-ai-linux"),
         _ => None,
     }
 }
@@ -3378,14 +3378,14 @@ fn install_ps1(ip: &str, port: u16, mac_id: &str) -> String {
 $ErrorActionPreference = "Stop"
 $hub = "__HUB__"
 $id  = "__ID__"
-$dir = Join-Path $env:LOCALAPPDATA "airm"
-# Unique filename: a running airm.exe locks the file, so overwriting it fails and
+$dir = Join-Path $env:LOCALAPPDATA "it-ai"
+# Unique filename: a running it-ai.exe locks the file, so overwriting it fails and
 # you'd launch the stale binary. A fresh name always downloads; machine-id keeps
 # it the same device, so the old copy is superseded on its next self-update.
-$dest = Join-Path $dir ("airm-" + (Get-Random) + ".exe")
+$dest = Join-Path $dir ("it-ai-" + (Get-Random) + ".exe")
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Write-Host "Downloading airm from $hub ..."
-Invoke-WebRequest -Uri "http://$hub/bin/HaiveControl-windows.exe" -OutFile $dest
+Write-Host "Downloading it-ai from $hub ..."
+Invoke-WebRequest -Uri "http://$hub/bin/it-ai-windows.exe" -OutFile $dest
 Write-Host "Registering to hub $hub (fallback id $id) ..."
 if ($Password) { & $dest $hub --id $id $Password } else { & $dest $hub --id $id }
 "#;
@@ -3399,16 +3399,16 @@ HUB="__HUB__"
 ID="__ID__"
 PASSWORD="${1:-$HIVE_PW}"
 case "$(uname -s)" in
-  Darwin) ASSET="HaiveControl-macos" ;;
-  Linux)  case "$(uname -m)" in aarch64|arm64) ASSET="HaiveControl-linux-arm64" ;; *) ASSET="HaiveControl-linux" ;; esac ;;
+  Darwin) ASSET="it-ai-macos" ;;
+  Linux)  case "$(uname -m)" in aarch64|arm64) ASSET="it-ai-linux-arm64" ;; *) ASSET="it-ai-linux" ;; esac ;;
   *) echo "unsupported OS: $(uname -s)"; exit 1 ;;
 esac
-mkdir -p "$HOME/.airm"
-# Unique filename so a download can't be blocked by an already-running airm; the
+mkdir -p "$HOME/.it-ai"
+# Unique filename so a download can't be blocked by an already-running it-ai; the
 # machine-id keeps it the same device, so the old copy is superseded on its next
 # self-update.
-DEST="$HOME/.airm/airm-$$"
-echo "Downloading airm ($ASSET) from $HUB ..."
+DEST="$HOME/.it-ai/it-ai-$$"
+echo "Downloading it-ai ($ASSET) from $HUB ..."
 curl -fsSL "http://$HUB/bin/$ASSET" -o "$DEST"
 chmod +x "$DEST"
 echo "Registering to hub $HUB (fallback id $ID) ..."
@@ -3515,7 +3515,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
     // Two blocks: ONE Unix script that auto-detects macOS / Linux-x86_64 /
     // Linux-arm64 (covers everything from a Mac to a Radxa), and ONE Windows
     // Command-Prompt line (no PowerShell). Both download to a UNIQUE filename
-    // (airm-$$ / airm-!random!.exe) so a currently-running, file-locked airm can't
+    // (it-ai-$$ / it-ai-!random!.exe) so a currently-running, file-locked it-ai can't
     // block the download — machine-id keeps it the same device, so the old copy is
     // just superseded on its next self-update. `cmd /v:on` enables delayed
     // expansion so !f! resolves in a one-liner.
@@ -3536,7 +3536,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             // Three install tiers, chosen from the dropdown. Autostart is the DEFAULT:
             // a bare --background enroll dies on reboot/logout, which is why devices
             // used to quietly vanish from the inventory a day later.
-            let pre = format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && ");
+            let pre = format!("A=it-ai-linux; case \"$(uname -s)\" in Darwin) A=it-ai-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=it-ai-linux-arm64;; esac;; esac\nf=\"it-ai-$$\"; curl -fsSL -o \"$f\" {b}/bin/$A && chmod +x \"$f\" && ");
             // TWO lines, deliberately. The old one-liner used !f! (delayed expansion),
             // which only exists inside a `cmd /v:on /c "…"` wrapper — pasted into an
             // already-open Command Prompt it failed with «'!f!' is not recognized», and
@@ -3544,7 +3544,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             // be used on ONE line either (cmd expands it at parse time, before `set`
             // runs, giving an empty name). Two lines sidesteps both: line 2 is parsed
             // after line 1 executed, so %F% resolves — no wrapper, no `!`.
-            let win_for = |flags: &str| format!("set \"F=airm-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" {b}/bin/HaiveControl-windows.exe && \"%F%\" --relay {b}{ex}{flags}");
+            let win_for = |flags: &str| format!("set \"F=it-ai-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" {b}/bin/it-ai-windows.exe && \"%F%\" --relay {b}{ex}{flags}");
             let variant = |m: &str, shown: bool, note: &str, u: &str, w: &str| {
                 format!(
                     "<div class=\"instv\" data-m=\"{m}\" style=\"display:{}\">{note}{}{}</div>",
@@ -3570,8 +3570,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             let hub = format!("{hub_ip}:{hub_port}");
             format!(
                 "{}{}",
-                cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=HaiveControl-linux; case \"$(uname -s)\" in Darwin) A=HaiveControl-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=HaiveControl-linux-arm64;; esac;; esac\nf=\"airm-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
-                cmd_block("Windows — Command Prompt (paste both lines)", &format!("set \"F=airm-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" http://{hub}/bin/HaiveControl-windows.exe && \"%F%\" {hub} --id {mac_id}")),
+                cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=it-ai-linux; case \"$(uname -s)\" in Darwin) A=it-ai-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=it-ai-linux-arm64;; esac;; esac\nf=\"it-ai-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
+                cmd_block("Windows — Command Prompt (paste both lines)", &format!("set \"F=it-ai-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" http://{hub}/bin/it-ai-windows.exe && \"%F%\" {hub} --id {mac_id}")),
             )
         }
     };
@@ -3587,12 +3587,12 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         VERSION
     );
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>HaiveControl hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
 <div class=\"app\">\
 <button id=\"navtoggle\" class=\"navtoggle\" onclick=\"toggleNav()\" aria-label=\"menu\">☰</button>\
 <div id=\"navback\" class=\"navback\" onclick=\"toggleNav()\"></div>\
 <nav class=\"rail\">\
-<div class=\"rail-top\"><div class=\"rail-brand\">📡 <span class=\"rail-name\">Haive</span><span class=\"pill\" id=\"count\">…</span></div><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (haivectl) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div>\
+<div class=\"rail-top\"><div class=\"rail-brand\">📡 <span class=\"rail-name\">IT-AI</span><span class=\"pill\" id=\"count\">…</span></div><code class=\"hubid\" title=\"This hub's ID — a stable name for this hub instance. Agents, the CLI (itai) and the MCP use it to address this hub. Set via the MAC_ID env var; otherwise derived from the machine hostname (in a container, that's the container ID).\">{mac_id}</code></div>\
 <button class=\"railadd\" onclick=\"toggleReg()\" title=\"register a new device\">+ Add device</button>\
 <input id=\"devsearch\" class=\"railsearch\" type=\"search\" placeholder=\"Search devices…\" autocomplete=\"off\" oninput=\"onSearch(this.value)\">\
 <div class=\"navsec\">Overview</div>\
@@ -4032,13 +4032,13 @@ function ownerTxt(d){if(!d.owner)return 'unassigned (visible to all)';if(window.
 function fetchAgents(){fetch(API+'/agents').then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);updInvBadge();if(OVERVIEW_ON)renderOverview(arr);if(DASH_ON)renderDashboard();var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||DASH_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!BOOTED){BOOTED=true;showDashboard();}}).catch(function(){});}
 function renderSide(arr){document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var el=document.getElementById('devlist');if(!el)return;var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'Recent Activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+'<div class="act-rows">'+rows+'</div></div>';}
-function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# HaiveControl — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o haive-mcp '+base+'/bin/haive-mcp-macos && chmod +x haive-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add haive'+env+' -- \"$PWD/haive-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
+function copyAgentFor(btn,name){var hb=window.HB||{};var base=hb.base||location.origin;var L=[];L.push('# IT-AI — control \"'+name+'\" from your AI agent (Claude).');L.push('# 1) install the MCP once (macOS shown; -linux / -windows.exe also served):');L.push('curl -L -o it-ai-mcp '+base+'/bin/it-ai-mcp-macos && chmod +x it-ai-mcp');var env=' --env HAIVE_HUB='+base;if(hb.mtok)env+=' --env HIVE_MCP_TOKEN='+hb.mtok;if(hb.owner)env+=' --env HIVE_OWNER='+hb.owner;L.push('claude mcp add itai'+env+' -- \"$PWD/it-ai-mcp\"');L.push('');L.push('# 2) then ask your agent, e.g.:');L.push('#   take a screenshot of '+name);L.push('#   run `uname -a` on '+name);L.push('#   type \"hello\" on '+name+' then press Enter');copyText(L.join('\n'),btn);}
 function copyConn(ev,base){ev.stopPropagation();var d=DEV[base]||{};var hb=window.HB||{};var hub=hb.base||location.origin;var tok=hb.mtok||'<HIVE_MCP_TOKEN>';var own=hb.owner||'';var nm=d.name||d.hostname||d.ip||base;var oq=own?('&owner='+encodeURIComponent(own)):'';var env='--env HAIVE_HUB='+hub+' --env HIVE_MCP_TOKEN='+tok+(own?(' --env HIVE_OWNER='+own):'');var L=[];
-L.push('# HaiveControl — connect to \"'+nm+'\"   (target: '+base+')');
+L.push('# IT-AI — connect to \"'+nm+'\"   (target: '+base+')');
 L.push('');
 L.push('# 1) MCP (Claude) — one-time setup');
-L.push('curl -L -o haive-mcp '+hub+'/bin/haive-mcp-macos && chmod +x haive-mcp   # -linux / -windows.exe also served');
-L.push('claude mcp add haive '+env+' -- \"$PWD/haive-mcp\"');
+L.push('curl -L -o it-ai-mcp '+hub+'/bin/it-ai-mcp-macos && chmod +x it-ai-mcp   # -linux / -windows.exe also served');
+L.push('claude mcp add itai '+env+' -- \"$PWD/it-ai-mcp\"');
 L.push('#   then ask: \"take a screenshot of '+nm+'\", \"run whoami on '+nm+'\"');
 L.push('');
 L.push('# 2) curl straight to the agent (via the hub API)');

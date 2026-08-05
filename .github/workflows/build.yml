@@ -1,7 +1,7 @@
 name: build
 
-# Builds the HaiveHub server binary for self-hosters. The AppCrane deploy builds the
-# hub from source via the Dockerfile; the AGENT binaries (airm / haive-mcp / haivectl)
+# Builds the it-ai-hub server binary for self-hosters. The AppCrane deploy builds the
+# hub from source via the Dockerfile; the AGENT binaries (it-ai / it-ai-mcp / itai)
 # live in the public gitayg/haive-agent repo and are pulled from its releases.
 
 on:
@@ -51,13 +51,13 @@ jobs:
           cargo install --locked cargo-zigbuild
           rustup target add ${{ matrix.triple }}
 
-      - name: Build HaiveHub (Linux, glibc 2.31 floor)
+      - name: Build it-ai-hub (Linux, glibc 2.31 floor)
         if: startsWith(matrix.os, 'ubuntu')
-        run: cargo zigbuild --release -p haive-hub --target ${{ matrix.triple }}.2.31
+        run: cargo zigbuild --release -p it-ai-hub --target ${{ matrix.triple }}.2.31
 
-      - name: Build HaiveHub (macOS / Windows)
+      - name: Build it-ai-hub (macOS / Windows)
         if: ${{ !startsWith(matrix.os, 'ubuntu') }}
-        run: cargo build --release -p haive-hub
+        run: cargo build --release -p it-ai-hub
 
       - name: Collect artifact
         shell: bash
@@ -65,7 +65,7 @@ jobs:
           mkdir out
           dir="target/release"
           if [ -n "${{ matrix.triple }}" ]; then dir="target/${{ matrix.triple }}/release"; fi
-          cp "${dir}/HaiveHub${{ matrix.ext }}" "out/HaiveHub-${{ matrix.suffix }}${{ matrix.ext }}"
+          cp "${dir}/it-ai-hub${{ matrix.ext }}" "out/it-ai-hub-${{ matrix.suffix }}${{ matrix.ext }}"
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -75,7 +75,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: HaiveHub-${{ matrix.suffix }}
+          name: it-ai-hub-${{ matrix.suffix }}
           path: out/*
 
       - uses: softprops/action-gh-release@v2

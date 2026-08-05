@@ -1,18 +1,18 @@
-# AppCrane production image for HaiveHub — the reverse-tunnel hub.
+# AppCrane production image for it-ai-hub — the reverse-tunnel hub.
 # Stage 1 builds the hub from source; stage 2 is a slim runtime that also carries
 # the agent binaries the hub serves at /bin/* (one-line install + auto-update).
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 # Only the hub crate (and its deps) — no xcap/nokhwa/PTY, so no extra apt deps.
-RUN cargo build --release -p haive-hub
+RUN cargo build --release -p it-ai-hub
 
 FROM debian:bookworm-slim AS run
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
+COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # Agent binaries served at /bin/* — pulled from the PUBLIC haive-agent release (an
 # anonymous download; no token needed) so the image always ships current agents
 # (install command + auto-update both use these).
@@ -22,11 +22,11 @@ COPY --from=build /src/target/release/HaiveHub /app/HaiveHub
 # — so redeploying the hub would silently keep serving the OLD binaries (it only
 # refreshed by luck, when a hub-source change happened to invalidate the layer).
 # Bump this to the agent version you want picked up whenever you cut an agent release.
-ARG AGENT_REV=2.31.0
+ARG AGENT_REV=3.0.0
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
- && for a in HaiveControl-linux HaiveControl-linux-arm64 HaiveControl-macos HaiveControl-windows.exe \
-             haive-mcp-linux haive-mcp-linux-arm64 haive-mcp-macos haive-mcp-windows.exe; do \
+ && for a in it-ai-linux it-ai-linux-arm64 it-ai-macos it-ai-windows.exe \
+             it-ai-mcp-linux it-ai-mcp-linux-arm64 it-ai-mcp-macos it-ai-mcp-windows.exe; do \
       curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a" -o "/app/dist/$a"; \
     done
 # Published checksums, served at /bin/SHA256SUMS, so the 'crane' install source can
@@ -48,4 +48,4 @@ EXPOSE 8770
 # AppCrane requires a non-root runtime user.
 RUN useradd -m -u 1000 hive && mkdir -p /data && chown -R hive:hive /app /data
 USER hive
-CMD ["/app/HaiveHub"]
+CMD ["/app/it-ai-hub"]
