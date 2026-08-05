@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "2.33.0";
+const VERSION: &str = "2.34.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -266,6 +266,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/install.sh") => text_resp(install_sh(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
         (Method::Get, "/ca.crt") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, p) if p.starts_with("/bin/") => serve_bin(&p[5..]),
+        (Method::Get, p) if p.starts_with("/files/staged/") => serve_staged(&p[14..]),
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
@@ -291,6 +292,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/download") => proxy_download(&url),
         (Method::Get, "/x/list") => proxy_list(&url),
         (Method::Post, "/x/upload") => proxy_upload(&mut req, &url),
+        (Method::Post, "/x/stage") => stage_ep(&mut req, user.as_deref()),
+        (Method::Post, "/x/push-file") => push_file_ep(&url, user.as_deref(), hub_ip, hub_port),
+        (Method::Get, "/x/file-status") => file_status_ep(&url),
         (Method::Get, "/live") => live_page(&url),
         // MCP API (token-authed, owner-scoped) — mirrors the device actions the
         // haive-mcp server needs, routed through the hub so it works over relay.
@@ -349,6 +353,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/schedule-delete") => schedule_delete(&url, user.as_deref()),
         (Method::Get, "/m/download") => proxy_download(&url),
         (Method::Post, "/m/upload") => proxy_upload(&mut req, &url),
+        (Method::Post, "/m/stage") => stage_ep(&mut req, mowner.as_deref()),
+        (Method::Post, "/m/push-file") => push_file_ep(&url, mowner.as_deref(), hub_ip, hub_port),
+        (Method::Get, "/m/file-status") => file_status_ep(&url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
         (Method::Get, "/m/persist") => proxy_persist(&url),
@@ -1497,6 +1504,14 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
     if target.is_empty() {
         return Response::from_string("no target").with_status_code(400);
     }
+    // Ownership guard. set-owner is exempt from the preamble may_control gate so it
+    // can CLAIM an unowned device — but it must never let one user seize a device
+    // that already belongs to another. may_control returns true for unowned
+    // (o.is_empty()) and for your own, and false only when a different owner holds
+    // it — exactly the claim/transfer rule we want.
+    if !may_control(user, agents, &target) {
+        return Response::from_string("forbidden: that device belongs to another user").with_status_code(403);
+    }
     let owner = match query_param(url, "owner") {
         Some(o) if o.is_empty() => String::new(), // explicit ?owner= — an intentional unclaim
         Some(o) => canon_owner(&o),
@@ -1523,11 +1538,28 @@ fn claim_all_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
             _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
         },
     };
-    let keys: Vec<String> = agents.lock().unwrap().keys().cloned().collect();
-    for k in &keys {
+    // Only claim devices that are currently unowned or already the caller's. A
+    // shared/multi-user hub must never let "claim all" seize devices owned by
+    // someone else — without this filter one click would transfer every other
+    // user's fleet to the caller. (No SSO identity = LAN/admin = claim everything,
+    // matching may_control's None => true.)
+    let claimable: Vec<String> = {
+        let g = agents.lock().unwrap();
+        g.iter()
+            .filter(|(_, a)| {
+                let cur = a.data.get("owner").and_then(|o| o.as_str()).unwrap_or("");
+                match user {
+                    None => true,
+                    Some(u) => cur.is_empty() || cur == u,
+                }
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    for k in &claimable {
         set_owner(agents, k, &owner);
     }
-    json_resp(&serde_json::json!({"ok": true, "owner": owner, "count": keys.len()}))
+    json_resp(&serde_json::json!({"ok": true, "owner": owner, "count": claimable.len()}))
 }
 
 fn run_posture(target: &str, platform: &str) -> serde_json::Value {
@@ -3205,6 +3237,160 @@ fn proxy_upload(req: &mut Request, url: &str) -> Resp {
     }
 }
 
+// ── Stage-and-pull file push ─────────────────────────────────────────────────
+// Streaming a whole file THROUGH the relay tunnel wedges on big transfers, so
+// instead the caller STAGES the bytes on the hub and a tiny control message tells
+// the agent to PULL them over a plain HTTP GET. Owner-scoped + sha256-checksummed;
+// no base64, no exec — so it never reads as obfuscated remote execution.
+fn staged_dir() -> std::path::PathBuf {
+    let d = data_dir().join("staged");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+type StagedMeta = (String, String, u64, std::time::Instant); // owner, sha256, size, created
+fn staged_meta() -> &'static Mutex<HashMap<String, StagedMeta>> {
+    static M: std::sync::OnceLock<Mutex<HashMap<String, StagedMeta>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn drop_staged(token: &str) {
+    let _ = std::fs::remove_file(staged_dir().join(token));
+    staged_meta().lock().unwrap().remove(token);
+}
+
+fn staged_sweep() {
+    let now = std::time::Instant::now();
+    let dead: Vec<String> = {
+        let m = staged_meta().lock().unwrap();
+        m.iter()
+            .filter(|(_, v)| now.duration_since(v.3) > std::time::Duration::from_secs(3600))
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    for k in &dead {
+        drop_staged(k);
+    }
+}
+
+/// POST /x|/m/stage — the raw body is the file. Streams to disk while hashing and
+/// returns an owner-scoped, 1-hour token the caller then push-file's to a device.
+fn stage_ep(req: &mut Request, owner: Option<&str>) -> Resp {
+    use std::io::Write;
+    staged_sweep();
+    let token = format!("stg_{}", rand_token().trim_start_matches("htok_"));
+    let path = staged_dir().join(&token);
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": format!("stage: {e}")})),
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let reader = req.as_reader();
+    let mut buf = [0u8; 65536];
+    let mut size: u64 = 0;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                hasher.update(&buf[..n]);
+                if file.write_all(&buf[..n]).is_err() {
+                    drop_staged(&token);
+                    return json_resp(&serde_json::json!({"ok": false, "error": "stage write"}));
+                }
+                size += n as u64;
+            }
+            Err(_) => {
+                drop_staged(&token);
+                return json_resp(&serde_json::json!({"ok": false, "error": "stage read"}));
+            }
+        }
+    }
+    let sha = format!("{:x}", hasher.finalize());
+    staged_meta()
+        .lock()
+        .unwrap()
+        .insert(token.clone(), (owner.unwrap_or("").to_string(), sha.clone(), size, std::time::Instant::now()));
+    json_resp(&serde_json::json!({"ok": true, "token": token, "sha256": sha, "size": size}))
+}
+
+/// GET /files/staged/<token> — the agent pulls staged bytes here. The random token
+/// is the (unguessable, expiring) capability; no other auth is required.
+fn serve_staged(token: &str) -> Resp {
+    if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Response::from_string("bad token").with_status_code(400);
+    }
+    match std::fs::read(staged_dir().join(token)) {
+        Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "application/octet-stream")),
+        Err(_) => Response::from_string("not found").with_status_code(404),
+    }
+}
+
+/// POST /x|/m/push-file?target=&token=&name=[&dir=] — tell the device to pull the
+/// staged file. Ownership of the DEVICE is enforced by the preamble may_control
+/// gate (?target=); the staged blob must also belong to the same owner.
+fn push_file_ep(url: &str, owner: Option<&str>, hub_ip: &str, hub_port: u16) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    let token = query_param(url, "token").unwrap_or_default();
+    let name = query_param(url, "name").unwrap_or_default();
+    let dir = query_param(url, "dir").unwrap_or_default();
+    if target.is_empty() || token.is_empty() || name.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "need target, token, name"}));
+    }
+    let sha = match staged_meta().lock().unwrap().get(&token) {
+        Some((o, sha, _, _)) => {
+            let owns = match owner {
+                None => true,
+                Some(u) => o.is_empty() || o == u,
+            };
+            if !owns {
+                return json_resp(&serde_json::json!({"ok": false, "error": "that staged file belongs to another user"}));
+            }
+            sha.clone()
+        }
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "unknown or expired token"})),
+    };
+    let fetch_url = match std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()) {
+        Some(base) => format!("{}/files/staged/{token}", base.trim_end_matches('/')),
+        None => format!("http://{hub_ip}:{hub_port}/files/staged/{token}"),
+    };
+    let job = format!("job_{}", rand_token().trim_start_matches("htok_"));
+    let payload = serde_json::json!({"url": fetch_url, "sha256": sha, "dir": dir, "name": name, "job": job})
+        .to_string()
+        .into_bytes();
+    match dev_unary(&target, "POST", "/fetch-file", Some(("application/json".into(), payload))) {
+        Some((st, _ct, b)) if st < 300 => {
+            let mut v: serde_json::Value = serde_json::from_slice(&b).unwrap_or_else(|_| serde_json::json!({"ok": true}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("job".into(), serde_json::json!(job));
+                o.insert("token".into(), serde_json::json!(token));
+            }
+            json_resp(&v)
+        }
+        _ => json_resp(&serde_json::json!({"ok": false, "error": "device did not accept the transfer (offline?)"})),
+    }
+}
+
+/// GET /x|/m/file-status?target=&job=[&token=] — passthrough to the agent's job
+/// status; drops the staged blob once the pull completes.
+fn file_status_ep(url: &str) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    let job = query_param(url, "job").unwrap_or_default();
+    match dev_unary(&target, "GET", &format!("/file-status?job={}", urlencode(&job)), None) {
+        Some((_st, _ct, b)) => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) {
+                if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    if let Some(tok) = query_param(url, "token") {
+                        drop_staged(&tok);
+                    }
+                }
+            }
+            Response::from_data(b).with_header(hdr("Content-Type", "application/json"))
+        }
+        None => json_resp(&serde_json::json!({"ok": false, "error": "status unavailable"})),
+    }
+}
+
 fn install_ps1(ip: &str, port: u16, mac_id: &str) -> String {
     const T: &str = r#"param([Parameter(Position=0)][string]$Password = $env:HIVE_PW)
 $ErrorActionPreference = "Stop"
@@ -4194,6 +4380,44 @@ mod session_tests {
         let active_sum = log.iter().filter(|(_, a, src, ..)| a == active && src == "summary").count();
         assert_eq!(idle_sum, 1, "idle operator should have exactly one summary");
         assert_eq!(active_sum, 0, "active operator should have none");
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::{may_control, Agent, Agents};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn agents_with(key: &str, owner: Option<&str>) -> Agents {
+        let data = match owner {
+            Some(o) => serde_json::json!({ "owner": o }),
+            None => serde_json::json!({}),
+        };
+        let mut m = HashMap::new();
+        m.insert(key.to_string(), Agent { data, last: std::time::SystemTime::now() });
+        Mutex::new(m)
+    }
+
+    // The core multi-tenant invariant: one user must never reach another's device.
+    #[test]
+    fn a_user_cannot_control_another_users_device() {
+        let a = agents_with("relay:dev1", Some("alice")); // owned by alice
+        assert!(may_control(Some("alice"), &a, "relay://dev1"), "owner controls own device");
+        assert!(!may_control(Some("bob"), &a, "relay://dev1"), "bob must NOT reach alice's device");
+        assert!(may_control(None, &a, "relay://dev1"), "no SSO identity (LAN) = full access, by design");
+    }
+
+    #[test]
+    fn unowned_device_is_claimable_by_anyone() {
+        let a = agents_with("relay:dev2", None); // no owner yet
+        assert!(may_control(Some("bob"), &a, "relay://dev2"), "unclaimed devices are visible so they can be claimed");
+    }
+
+    #[test]
+    fn unknown_target_has_no_owner() {
+        let a = agents_with("relay:dev1", Some("alice"));
+        assert!(may_control(Some("bob"), &a, "relay://ghost"), "a target with no registered agent resolves to unowned");
     }
 }
 

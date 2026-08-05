@@ -369,6 +369,44 @@ tools:
   `fleet_report`.
 - A **search box** above the device list filters by name / host / OS / IP.
 
+## Push & pull files (stage-and-pull)
+
+Sending a file to a device does **not** stream the bytes through the relay tunnel (that
+wedges on large files and competes with control traffic). Instead the hub **stages** the
+file and the device **pulls** it over a plain HTTP GET, verified end-to-end with a SHA-256
+checksum. No base64, no shipping bytes over a command channel.
+
+**From an AI (MCP):** the `push_file` tool does the whole flow — stage, signal, poll to
+completion:
+
+```
+push_file(device: "Atom", local_path: "/path/tests.tar", remote_dir: "C:/temp")
+→ "pushed 4823040 bytes to C:/temp/tests.tar"
+```
+
+**From curl (or any HTTP client)** — three calls; ownership is enforced server-side on
+`?target=`, so curl cannot bypass isolation. The `/x/*` (SSO dashboard) and `/m/*`
+(token-authed MCP) paths are identical; the `/m` form:
+
+```bash
+# 1) stage the bytes on the hub → {token, sha256, size}
+TOKEN=$(curl -s -X POST --data-binary @tests.tar \
+  "$HUB/m/stage?mtok=$MTOK&owner=$OWNER" | jq -r .token)
+
+# 2) tell the device to pull it (dir optional; defaults to the agent's share/home)
+JOB=$(curl -s -X POST \
+  "$HUB/m/push-file?mtok=$MTOK&owner=$OWNER&target=$TARGET&token=$TOKEN&name=tests.tar&dir=C:/temp" \
+  | jq -r .job)
+
+# 3) poll until done → {done, success, bytes, path, error}
+curl -s "$HUB/m/file-status?mtok=$MTOK&owner=$OWNER&target=$TARGET&job=$JOB&token=$TOKEN" | jq
+```
+
+`$TARGET` is the device's hub target (e.g. `relay://<id>`). Staged blobs are owner-scoped,
+capped to a 1-hour TTL, and dropped once the pull completes. The write lands inside the
+agent's configured share/sandbox (`resolve_path`), and a failed checksum leaves nothing at
+the destination (temp-file + rename). To pull a file *off* a device, use `/x|/m/download`.
+
 ## Identity & owner scoping
 
 A device's owner is a **stable id derived from the owner's email** (`UUIDv5(namespace,
