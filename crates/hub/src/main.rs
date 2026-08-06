@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "3.0.5";
+const VERSION: &str = "3.0.6";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4168,7 +4168,7 @@ function loadPlugins(){fetch(API+'/plugins').then(function(r){return r.json();})
 function actionListHtml(){return '<div class="blabel" style="margin:2px 0 6px">Actions</div><div class="alist">'+allRows().map(function(r,i){var ctl='';if(r.opts){ctl+='<select class="scr-sel arow-opt">'+r.opts.map(function(o){return '<option value="'+attrEsc(o[1])+'">'+esc2(o[0])+'</option>';}).join('')+'</select>';}if(r.arg){ctl+='<input class="devsearch arow-arg" placeholder="'+attrEsc(r.arg)+'" autocomplete="off">';}ctl+='<button class="b bsend'+(r.danger?' danger':'')+'" title="Execute now" onclick="execRow('+i+')">'+IC_SEND+'</button>';if(r.sched){ctl+='<button class="b subtle bsend arow-sbtn" title="Send later — schedule" onclick="schedRow('+i+')">'+IC_LATER+'</button>';}var sbar=r.sched?'<div class="arow-sched" style="display:none"><select class="scr-sel sch-type" onchange="schTypeChg('+i+')"><option value="once">Once, in</option><option value="interval">Every</option><option value="daily">Daily at</option></select><input class="devsearch sch-in sch-mins" type="number" min="1" value="60"><span class="sch-unit dim2">min</span><input class="devsearch sch-in sch-hhmm" type="time" value="09:00" style="display:none"><span class="dim2">UTC</span><button class="b" onclick="doSchedRow('+i+')">Schedule</button></div>':'';return '<div class="arow" data-i="'+i+'"><div class="arow-main"><div class="arow-nm">'+esc2(r.nm)+(r.plugin?' <span class="chip cust">plugin</span>':'')+'</div><div class="arow-desc">'+esc2(r.d)+'</div></div><div class="arow-ctl">'+ctl+'</div>'+sbar+'</div>';}).join('')+'</div>';}
 function buildControls(d){var cam=d.cameras&&d.cameras.length;
 var scr='<button class="b" onclick="doLive()" title="live screen video">● Live screen</button><button class="b" onclick="doShot()" title="screenshot">Screenshot</button>';
-if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else{scr+='<span class="chip off">no camera</span>';}
+if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else if(d.cameras_present&&d.cameras_present.length){scr+=d.cameras_present.map(function(c){return '<span class="chip off" title="camera present but not capturable — turn on the shutter/kill-switch or free the device">'+esc2(c)+'</span>';}).join(' ');}else{scr+='<span class="chip off">no camera</span>';}
 var term='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
 var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
