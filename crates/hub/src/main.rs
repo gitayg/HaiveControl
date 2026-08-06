@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "3.0.4";
+const VERSION: &str = "3.0.5";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -1063,6 +1063,10 @@ fn shell_arg(s: &str) -> String {
 /// Wrap a PowerShell one-liner as `-EncodedCommand` (base64 UTF-16LE) so its
 /// quotes and pipes survive the shell layers intact. A bare `-Command "…|…"`
 /// gets mangled through cmd → agent and echoed back instead of executed.
+// No longer called: the av/services probes that used it now route to native
+// agent code via `it-ai:probe/*` sentinels. Kept as the canonical helper for any
+// future PowerShell-backed arm.
+#[allow(dead_code)]
 fn ps(script: &str) -> String {
     use base64::Engine as _;
     let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -1074,13 +1078,13 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("hardware", "windows") => "systeminfo".into(),
         ("hardware", "macos") => "system_profiler SPHardwareDataType".into(),
         ("hardware", "linux") => "lscpu; echo; free -h; echo; lsblk".into(),
-        ("av", "windows") => ps("Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMRunningMode | Format-List"),
+        ("av", "windows") => "it-ai:probe/av".into(),
         ("av", "macos") => "echo 'Gatekeeper:'; spctl --status; echo 'XProtect present:'; ls /Library/Apple/System/Library/CoreServices/XProtect.bundle >/dev/null 2>&1 && echo yes || echo no".into(),
         ("av", "linux") => "clamscan --version 2>/dev/null || echo 'no clamav installed'".into(),
-        ("encryption", "windows") => "manage-bde -status C:".into(),
+        ("encryption", "windows") => "it-ai:probe/encryption".into(),
         ("encryption", "macos") => "fdesetup status".into(),
         ("encryption", "linux") => "lsblk -o NAME,FSTYPE,MOUNTPOINT | grep -i crypt || echo 'no LUKS volumes detected'".into(),
-        ("firewall", "windows") => "netsh advfirewall show allprofiles state".into(),
+        ("firewall", "windows") => "it-ai:probe/firewall".into(),
         ("firewall", "macos") => "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate".into(),
         ("firewall", "linux") => "ufw status 2>/dev/null || echo \"ufw is $(systemctl is-active ufw 2>/dev/null || echo not-installed)\"".into(),
         ("firewall_on", "windows") => "netsh advfirewall set allprofiles state on".into(),
@@ -1091,7 +1095,7 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("firewall_off", "linux") => "sudo ufw disable".into(),
         ("processes", "windows") => "tasklist".into(),
         ("processes", _) => "ps aux 2>/dev/null | sort -rk3 | head -25".into(),
-        ("services", "windows") => ps("Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 40 Name,DisplayName | Format-Table -Auto"),
+        ("services", "windows") => "it-ai:probe/services".into(),
         ("services", "macos") => "launchctl list | head -40".into(),
         ("services", "linux") => "systemctl list-units --type=service --state=running --no-pager | head -40".into(),
         ("network", "linux") => "ip neigh".into(),
@@ -1619,7 +1623,7 @@ fn ai_tools() -> serde_json::Value {
         },
         {
             "name": "run_readonly_command",
-            "description": "Run ONE read-only shell command to inspect state — e.g. `df -h`, `systemctl status cups`, `ipconfig /all`, `tasklist`, `journalctl -u NetworkManager --no-pager -n 50`. On Windows, use a single PowerShell read pipeline for anything cmd can't do — e.g. biggest files: `powershell -Command \"Get-ChildItem C:\\Users -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 FullName,Length\"`. A pipe to a filter is allowed; chaining (`;`/`&&`), redirection (`>`), and any state-changing command (Remove-/Set-/stop/delete/install/…) are rejected — so prefer ONE efficient command over many.",
+            "description": "Run ONE read-only shell command to inspect state — e.g. `df -h`, `systemctl status cups`, `ipconfig /all`, `tasklist`, `journalctl -u NetworkManager --no-pager -n 50`. On Windows prefer plain cmd tools (`ipconfig`, `tasklist`, `systeminfo`, `dir`); reach for PowerShell only when cmd genuinely can't express the query — e.g. biggest files: `powershell -Command \"Get-ChildItem C:\\Users -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 FullName,Length\"`. A pipe to a filter is allowed; chaining (`;`/`&&`), redirection (`>`), and any state-changing command (Remove-/Set-/stop/delete/install/…) are rejected — so prefer ONE efficient command over many.",
             "input_schema": {
                 "type": "object",
                 "properties": {"command": {"type": "string"}},
@@ -1687,7 +1691,7 @@ fn fix_command(platform: &str, kind: &str, arg: &str) -> Option<(String, String)
         }
         // Windows-only for v1: %TEMP% and the Recycle Bin are per-user and safe.
         "clear_temp" if platform == "windows" => Some(("Clear your temporary files".into(), "del /q /f /s \"%TEMP%\\*\" >nul 2>&1 & echo done".into())),
-        "empty_recycle_bin" if platform == "windows" => Some(("Empty the Recycle Bin".into(), "powershell -Command \"Clear-RecycleBin -Force -ErrorAction SilentlyContinue\"".into())),
+        "empty_recycle_bin" if platform == "windows" => Some(("Empty the Recycle Bin".into(), "it-ai:probe/empty_recycle_bin".into())),
         _ => None,
     }
 }
@@ -1915,7 +1919,7 @@ Inspect the machine with the system_report and run_readonly_command tools — th
 Diagnose the user's problem first: run the checks you need, then explain what you found in plain, non-technical language. \
 When you've diagnosed a problem that one of the standard fixes can solve, call propose_fix — this does NOT run the fix; it shows the user an Apply button, and the fix runs only if they approve it. \
 Only propose a fix you're confident addresses the diagnosis; if none of the menu fixes fit, just describe the manual steps instead. Never claim you already fixed something — a fix only happens after the user clicks Apply. \
-Keep replies short and skimmable. Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows reach for a single PowerShell read pipeline rather than repeated `dir /s`. When you have enough to answer, stop and answer."
+Keep replies short and skimmable. Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows prefer plain cmd tools, using PowerShell only when cmd genuinely can't do it. When you have enough to answer, stop and answer."
     );
 
     let mut steps: Vec<serde_json::Value> = Vec::new();
