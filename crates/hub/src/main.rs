@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "3.0.3";
+const VERSION: &str = "3.0.4";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -3570,8 +3570,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
             let hub = format!("{hub_ip}:{hub_port}");
             format!(
                 "{}{}",
-                cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=it-ai-linux; case \"$(uname -s)\" in Darwin) A=it-ai-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=it-ai-linux-arm64;; esac;; esac\nf=\"it-ai-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id}")),
-                cmd_block("Windows — Command Prompt (paste both lines)", &format!("set \"F=it-ai-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" http://{hub}/bin/it-ai-windows.exe && \"%F%\" {hub} --id {mac_id}")),
+                cmd_block("Linux &amp; macOS — any architecture (one script)", &format!("A=it-ai-linux; case \"$(uname -s)\" in Darwin) A=it-ai-macos;; Linux) case \"$(uname -m)\" in aarch64|arm64) A=it-ai-linux-arm64;; esac;; esac\nf=\"it-ai-$$\"; curl -fsSL -o \"$f\" http://{hub}/bin/$A && chmod +x \"$f\" && \"./$f\" {hub} --id {mac_id} --background")),
+                cmd_block("Windows — Command Prompt (paste both lines)", &format!("set \"F=it-ai-%RANDOM%.exe\"\ncurl.exe -L -o \"%F%\" http://{hub}/bin/it-ai-windows.exe && \"%F%\" {hub} --id {mac_id} --background")),
             )
         }
     };
