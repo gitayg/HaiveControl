@@ -17,8 +17,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 mod relay;
 mod policy;
 mod mcptokens;
+mod monitor;
 
-const VERSION: &str = "3.2.0";
+const VERSION: &str = "3.3.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -334,6 +335,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
+        (Method::Get, "/x/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(user.as_deref())})),
+        (Method::Get, "/m/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(mowner.as_deref())})),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
@@ -816,7 +819,7 @@ fn mcp_auth(url: &str) -> McpAuth {
 fn mcp_is_write(path: &str, url: &str) -> bool {
     const READ: &[&str] = &[
         "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
-        "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
+        "/m/alerts", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
         "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
     ];
     if READ.contains(&path) {
@@ -3308,6 +3311,7 @@ fn start_scheduler(agents: Arc<Agents>, hub_ip: String, hub_port: u16) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
         relay::dedup_sweep(&agents);
+        monitor::tick(&agents);
         session_summary_sweep();
         auto_update_pass(&agents, &hub_ip, hub_port);
         let now = now_secs();
