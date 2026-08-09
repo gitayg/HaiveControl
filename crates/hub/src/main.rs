@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.3.0";
+const VERSION: &str = "3.4.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -337,6 +337,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(user.as_deref())})),
         (Method::Get, "/m/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(mowner.as_deref())})),
+        (Method::Get, "/x/fleet-report") => json_resp(&fleet_report(agents, user.as_deref())),
+        (Method::Get, "/m/fleet-report") => json_resp(&fleet_report(agents, mowner.as_deref())),
+        (Method::Get, "/x/inventory-history") => inventory_history_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/m/inventory-history") => inventory_history_ep(&url, agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
@@ -819,7 +823,7 @@ fn mcp_auth(url: &str) -> McpAuth {
 fn mcp_is_write(path: &str, url: &str) -> bool {
     const READ: &[&str] = &[
         "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
-        "/m/alerts", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
+        "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
         "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
     ];
     if READ.contains(&path) {
@@ -1368,6 +1372,40 @@ fn analysis_store() -> &'static AnalysisStore {
     A.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// #31 Historical asset inventory: a per-device timeline of when the installed-software
+// set changed (detected by hashing the "packages" section). In-memory ring (last 100
+// per device); queryable at /x/inventory-history.
+fn inv_history() -> &'static Mutex<HashMap<String, Vec<serde_json::Value>>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<String, Vec<serde_json::Value>>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn inv_hashes() -> &'static Mutex<HashMap<String, String>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    H.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn sha_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+/// Note a possible inventory change for `key` from its current packages section.
+fn note_inventory(key: &str, packages: &str) {
+    let h = sha_hex(packages);
+    let changed = {
+        let mut m = inv_hashes().lock().unwrap();
+        let prev = m.insert(key.to_string(), h.clone());
+        prev.is_some() && prev.as_deref() != Some(h.as_str())
+    };
+    if changed {
+        let ev = serde_json::json!({"ts": now_secs(), "section": "packages", "size": packages.len()});
+        let mut hm = inv_history().lock().unwrap();
+        let v = hm.entry(key.to_string()).or_default();
+        v.push(ev);
+        while v.len() > 100 {
+            v.remove(0);
+        }
+    }
+}
+
 /// POST /relay/analysis — merge the agent's pushed sections into the store.
 /// Replies `want_full=true` when we had no record (e.g. the hub restarted), so
 /// the agent re-sends a full snapshot instead of only deltas.
@@ -1392,7 +1430,31 @@ fn recv_analysis(req: &mut Request) -> Resp {
         }
     }
     entry.1 = std::time::SystemTime::now();
+    // #31: record an inventory-change event when the packages section moves.
+    if let Some((pkgs, _)) = entry.0.get("packages") {
+        let pkgs = pkgs.clone();
+        let k = format!("relay:{rid}");
+        drop(store);
+        note_inventory(&k, &pkgs);
+        return json_resp(&serde_json::json!({"ok": true, "want_full": !existed && !full}));
+    }
     json_resp(&serde_json::json!({"ok": true, "want_full": !existed && !full}))
+}
+
+/// GET /x/inventory-history?target=… — the software-change timeline for a device.
+fn inventory_history_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    // The store is keyed relay:<id>; accept either that or a relay://<id> target.
+    let key = if target.starts_with("relay:") && !target.starts_with("relay://") {
+        target.clone()
+    } else {
+        format!("relay:{}", target.trim_start_matches("relay://"))
+    };
+    let events = inv_history().lock().unwrap().get(&key).cloned().unwrap_or_default();
+    json_resp(&serde_json::json!({"ok": true, "device": device_name(agents, &target), "events": events}))
 }
 
 /// Compliance grade computed from the stored security sections (no relay call).
@@ -1775,6 +1837,52 @@ fn proxy_compliance_fleet(url: &str, agents: &Agents, user: Option<&str>, via_mc
     results.sort_by(|a, b| a["device"].as_str().unwrap_or("").cmp(b["device"].as_str().unwrap_or("")));
     let legend: serde_json::Value = ["encryption", "firewall", "av", "updates"].iter().map(|k| (k.to_string(), compliance_controls(k))).collect::<serde_json::Map<_, _>>().into();
     json_resp(&serde_json::json!({"ok": true, "count": results.len(), "frameworks": COMPLIANCE_FRAMEWORKS, "legend": legend, "results": results}))
+}
+
+/// #30 Reporting/exec dashboard: a fleet-health rollup for one owner (online/idle/
+/// offline counts, avg CPU load, low-RAM + unowned counts) plus recent alerts — the
+/// executive at-a-glance view, computed from the in-memory registry (no relay calls).
+fn fleet_report(agents: &Agents, owner: Option<&str>) -> serde_json::Value {
+    let (mut total, mut online, mut idle, mut offline, mut lowram, mut unowned) = (0, 0, 0, 0, 0, 0);
+    let (mut cpu_sum, mut cpu_n) = (0.0_f64, 0);
+    {
+        let map = agents.lock().unwrap();
+        for a in map.values() {
+            let d = &a.data;
+            let dev_owner = d.get("owner").and_then(|x| x.as_str());
+            if let Some(o) = owner {
+                if dev_owner != Some(o) {
+                    continue;
+                }
+            }
+            total += 1;
+            if dev_owner.is_none() {
+                unowned += 1;
+            }
+            let since = a.last.elapsed().map(|e| e.as_secs()).unwrap_or(9999);
+            if since > 120 {
+                offline += 1;
+            } else if since > 40 {
+                idle += 1;
+            } else {
+                online += 1;
+            }
+            if let Some(c) = d.get("cpu_pct").and_then(|x| x.as_f64()) {
+                cpu_sum += c;
+                cpu_n += 1;
+            }
+            if let Some(f) = d.get("free_gb").and_then(|x| x.as_f64()) {
+                if f < 1.0 {
+                    lowram += 1;
+                }
+            }
+        }
+    }
+    let avg_cpu = if cpu_n > 0 { (cpu_sum / cpu_n as f64 * 10.0).round() / 10.0 } else { 0.0 };
+    serde_json::json!({
+        "ok": true, "total": total, "online": online, "idle": idle, "offline": offline,
+        "unowned": unowned, "low_ram": lowram, "avg_cpu_pct": avg_cpu, "alerts": monitor::recent(owner),
+    })
 }
 
 /// One canned management action on one device.
@@ -3980,7 +4088,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
 <div id=\"audit-view\" style=\"display:none\"><div class=\"aud-head\">Audit log <span class=\"dim2\">— device actions on your account · last 500 events</span></div><input id=\"aud-q\" class=\"devsearch\" placeholder=\"Filter by device / action / who / via…\" autocomplete=\"off\" oninput=\"renderAudit();\"><div class=\"aud-cols\"><span>when</span><span>via</span><span>action</span><span>device</span><span>who</span><span>detail</span></div><div id=\"audit-rows\"></div></div>\
-<div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span><button class=\"b subtle ov-refresh\" onclick=\"refreshInv(this)\" title=\"refresh device list now\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic-rf\"><path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/><path d=\"M21 3v5h-5\"/><path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/><path d=\"M3 21v-5h5\"/></svg>Refresh</button></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th><th>Agent</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
+<div id=\"overview-view\" style=\"display:none\"><div class=\"aud-head\">Fleet status <span class=\"dim2\">— every device, every parameter, at a glance</span><button class=\"b subtle ov-refresh\" onclick=\"refreshInv(this)\" title=\"refresh device list now\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic-rf\"><path d=\"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8\"/><path d=\"M21 3v5h-5\"/><path d=\"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16\"/><path d=\"M3 21v-5h5\"/></svg>Refresh</button></div><div id=\"ov-summary\" class=\"ov-summary\"></div><div id=\"ov-alerts\"></div><div class=\"ov-scroll\"><table class=\"ov-tbl\"><thead><tr><th class=\"ovh\" onclick=\"ovSort('status')\">●</th><th class=\"ovh\" onclick=\"ovSort('name')\">Device</th><th class=\"ovh\" onclick=\"ovSort('os')\">OS</th><th class=\"ovh\" onclick=\"ovSort('user')\">User</th><th class=\"ov-num ovh\" onclick=\"ovSort('cpu')\">CPU</th><th class=\"ov-num ovh\" onclick=\"ovSort('ram')\">RAM free</th><th class=\"ov-num\">Cores</th><th class=\"ov-num\">Cam</th><th class=\"ov-num\">Mic</th><th>Address</th><th class=\"ovh\" onclick=\"ovSort('seen')\">Last seen</th><th>MCP</th><th>Agent</th></tr></thead><tbody id=\"ov-body\"></tbody></table></div></div>\
 <div id=\"schedules-view\" style=\"display:none\"><div class=\"aud-head\">Scheduled <span class=\"dim2\">— actions queued to run automatically (times UTC)</span></div><div id=\"sched-list\"></div></div>\
 <div id=\"map-view\" style=\"display:none\"><div class=\"aud-head\">Device map <span class=\"dim2\">— approximate location from public IP · city-level, VPN/NAT skews it</span></div><div id=\"map-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"map-svg\"></div><div id=\"map-un\" class=\"map-un\"></div></div>\
 <div id=\"settings-view\" style=\"display:none\"><div class=\"aud-head\">Settings <span class=\"dim2\">— hub administration</span></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Agent updates</div><div class=\"set-desc\">How out-of-date device agents get updated to the hub's build (<span id=\"set-ver\" class=\"dim2\"></span>). <b>Automatic</b> pushes updates to behind devices on a schedule; <b>Manual</b> updates only when you click Update on a device.</div></div><select id=\"set-au\" class=\"scr-sel\" onchange=\"saveSetting('agent_update','set-au')\"><option value=\"manual\">Manual</option><option value=\"auto\">Automatic</option></select></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Device tray icon</div><div class=\"set-desc\">Show a system-tray / menu-bar icon on the device while the agent is running (Windows & macOS). Devices pull this from the hub, so it takes effect on next agent poll.</div></div><select id=\"set-tray\" class=\"scr-sel\" onchange=\"saveSetting('tray','set-tray')\"><option value=\"on\">Show</option><option value=\"off\">Hide</option></select></div></div>\
@@ -4475,7 +4583,8 @@ var CMP_FW=['CIS','NIST 800-53','PCI-DSS','HIPAA','ISO 27001','Essential Eight']
 function showCompliance(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;COMPLIANCE_ON=true;SEL=null;highlight();hideViews();document.getElementById('compliance-view').style.display='block';setNav('compliance');var s=document.getElementById('cmp-fw');if(!s.options.length){s.innerHTML=CMP_FW.map(function(f){return '<option>'+esc2(f)+'</option>';}).join('');}renderCompliance();}
 function runCompliance(){var b=document.getElementById('cmp-body');b.innerHTML='<tr><td colspan="6" class="ov-empty">Running posture on every device…</td></tr>';fetch(API+'/x/compliance-fleet').then(function(r){return r.json();}).then(function(j){CMP_DATA=j;renderCompliance();}).catch(function(){b.innerHTML='<tr><td colspan="6" class="ov-empty">Failed to run.</td></tr>';});}
 function renderCompliance(){var fw=document.getElementById('cmp-fw').value||CMP_FW[0];var leg=(CMP_DATA&&CMP_DATA.legend)||{};document.getElementById('cmp-head').innerHTML='<tr><th>Device</th><th class="ov-num">Grade</th>'+CMP_CHECKS.map(function(c){var ctl=(leg[c[1]]&&leg[c[1]][fw])?('<div class="cmp-ctl">'+esc2(leg[c[1]][fw])+'</div>'):'';return '<th>'+esc2(c[0])+ctl+'</th>';}).join('')+'</tr>';var body=document.getElementById('cmp-body');if(!CMP_DATA){body.innerHTML='<tr><td colspan="6" class="ov-empty">Click “Run across fleet ▶”.</td></tr>';return;}var res=CMP_DATA.results||[];if(!res.length){body.innerHTML='<tr><td colspan="6" class="ov-empty">No devices.</td></tr>';return;}body.innerHTML=res.map(function(d){var by={};(d.checks||[]).forEach(function(c){by[c.kind]=c.pass;});var cells=CMP_CHECKS.map(function(c){var p=by[c[1]];return '<td class="ov-num '+(p?'cmp-pass':'cmp-fail')+'">'+(p?'✓':'✗')+'</td>';}).join('');return '<tr><td class="ov-nm">'+esc2(d.device||'?')+'</td><td class="ov-num cmp-g cmp-'+esc2(d.grade||'F')+'">'+esc2(d.grade||'?')+' <span class="dim2">'+(d.score!=null?d.score:'')+'</span></td>'+cells+'</tr>';}).join('');}
-function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('overview-view').style.display='block';setNav('overview');renderOverview(LAST);}
+function showOverview(){AUDIT_ON=false;OVERVIEW_ON=true;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('overview-view').style.display='block';setNav('overview');renderOverview(LAST);loadAlerts();}
+function loadAlerts(){var el=document.getElementById('ov-alerts');if(!el)return;fetch(API+'/x/alerts').then(function(r){return r.json();}).then(function(j){var a=(j&&j.alerts)||[];if(!a.length){el.innerHTML='';return;}el.innerHTML='<div class=\"aud-head\" style=\"margin-top:14px\">Recent alerts <span class=\"dim2\">— CPU / RAM / offline threshold events</span></div>'+a.slice(0,20).map(function(x){var t=x.ts?new Date(x.ts*1000).toISOString().slice(11,19):'';return '<div style=\"padding:4px 0;border-bottom:1px solid var(--line);font-size:12px\"><span class=\"chip off\">'+esc2(x.rule||'')+'</span> <b>'+esc2(x.device||'')+'</b> '+esc2(x.message||'')+' <span class=\"dim2\">'+t+'</span></div>';}).join('');}).catch(function(){});}
 function showScripts(){AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=true;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;SEL=null;highlight();hideViews();document.getElementById('scripts-view').style.display='block';setNav('scripts');fillScrTargets();searchScripts();document.getElementById('scr-q').focus();}
 function fillScrTargets(){var s=document.getElementById('scr-target');var cur=s.value;var h='<option value="__FLEET__">All devices (fleet)</option>';(LAST||[]).forEach(function(d){h+='<option value="'+attrEsc(baseOf(d))+'">'+esc2(d.name||d.hostname||d.ip)+'</option>';});s.innerHTML=h;if(cur)s.value=cur;}
 function searchScripts(){var q=document.getElementById('scr-q').value.trim();fetch(API+'/scripts?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(j){renderScripts((j&&j.scripts)||[],j&&j.total);}).catch(function(){document.getElementById('scr-list').innerHTML='<div class="aud-empty">Could not load the script library.</div>';});}
