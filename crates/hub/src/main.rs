@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.6.0";
+const VERSION: &str = "3.7.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -345,6 +345,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/compliance.csv") => compliance_export_ep(agents, mowner.as_deref()),
         (Method::Get, "/x/queue-action") => queue_action_ep(&url, agents, user.as_deref()),
         (Method::Get, "/m/queue-action") => queue_action_ep(&url, agents, mowner.as_deref()),
+        (Method::Get, "/x/wake") => wake_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/m/wake") => wake_ep(&url, agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
@@ -1416,6 +1418,25 @@ pub(crate) fn run_queued_actions(agent_id: &str) {
     for cmd in drain_queued_actions(&key) {
         let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
         let _ = relay::request(agent_id, "POST", "/exec", Some(("application/json".into(), payload)));
+    }
+}
+
+/// GET /x/wake?via=<peer>&mac=<MAC> — ask an ONLINE peer on the target's LAN to
+/// broadcast a Wake-on-LAN magic packet, so a sleeping device the hub can't reach
+/// directly gets woken. (#39)
+fn wake_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let via = query_param(url, "via").unwrap_or_default();
+    let mac = query_param(url, "mac").unwrap_or_default();
+    if via.is_empty() || !may_control(user, agents, &via) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no peer, or you don't own it"}));
+    }
+    if mac.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no mac"}));
+    }
+    audit(user.unwrap_or(""), "browser", "wake", &device_name(agents, &via), &mac);
+    match dev_unary(&via, "GET", &format!("/wol?mac={mac}"), None) {
+        Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "application/json")),
+        None => json_resp(&serde_json::json!({"ok": false, "error": "peer unreachable"})),
     }
 }
 
