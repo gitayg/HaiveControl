@@ -201,6 +201,9 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
             }
         });
     }
+    // #50: dispatch any canned actions queued while this device was offline.
+    let qid = agent_id.clone();
+    std::thread::spawn(move || crate::run_queued_actions(&qid));
     true
 }
 
