@@ -15,8 +15,9 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
+mod policy;
 
-const VERSION: &str = "3.0.7";
+const VERSION: &str = "3.1.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -198,6 +199,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
+        (Method::Post, "/relay/ai-run-approved") => relay_ai_run_approved_ep(&mut req, &url, agents),
         (Method::Post, "/relay/hello") => {
             // Strict enrollment: when the hub is authed (RELAY_TOKEN set), a device
             // must present a per-owner enrollment token (htok_…) so it enrolls UNDER
@@ -349,6 +351,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
         (Method::Post, "/m/ai-chat") => ai_chat_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Post, "/m/ai-apply") => ai_apply_ep(&mut req, &url, agents, mowner.as_deref()),
+        (Method::Post, "/m/ai-plan") => ai_plan_ep(&mut req, &url, agents, mowner.as_deref()),
+        (Method::Post, "/m/ai-run-approved") => ai_run_approved_ep(&mut req, &url, agents, mowner.as_deref()),
+        (Method::Post, "/m/ai-explain") => ai_explain_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/ca") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, "/m/direct") => {
@@ -367,6 +372,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/sys") => proxy_sys(&url, agents, user.as_deref(), false),
         (Method::Post, "/x/ai-chat") => ai_chat_ep(&mut req, &url, agents, user.as_deref()),
         (Method::Post, "/x/ai-apply") => ai_apply_ep(&mut req, &url, agents, user.as_deref()),
+        (Method::Post, "/x/ai-plan") => ai_plan_ep(&mut req, &url, agents, user.as_deref()),
+        (Method::Post, "/x/ai-run-approved") => ai_run_approved_ep(&mut req, &url, agents, user.as_deref()),
+        (Method::Post, "/x/ai-explain") => ai_explain_ep(&mut req, &url, agents, user.as_deref()),
         (Method::Get, "/x/analysis") => proxy_analysis(&url, agents, user.as_deref()),
         (Method::Get, "/x/fleet") => proxy_fleet(&url, agents, user.as_deref(), false),
         (Method::Get, "/scripts") => scripts_list(&url),
@@ -1605,7 +1613,33 @@ fn run_posture(target: &str, platform: &str) -> serde_json::Value {
         if pass {
             pass_n += 1;
         }
-        items.push(serde_json::json!({"check": label, "kind": k, "pass": pass, "controls": compliance_controls(k), "output": out.chars().take(240).collect::<String>()}));
+        let mut item = serde_json::json!({"check": label, "kind": k, "pass": pass, "controls": compliance_controls(k), "output": out.chars().take(240).collect::<String>()});
+        // #2 Auto-remediation: a FAILED check with an admin-mapped remediation gets a
+        // suggested fix attached; if that mapping is `auto` AND the runtime policy
+        // doesn't deny it, apply it now and record the outcome.
+        if !pass {
+            if let Some(rem) = policy::remediation_for(k) {
+                if let Some((title, command)) = fix_command(platform, &rem.kind, &rem.arg) {
+                    let mut applied = serde_json::Value::Null;
+                    if rem.auto {
+                        match policy::enforce(&rem.kind, &rem.arg) {
+                            Ok(()) => {
+                                let out = exec_output(target, &command);
+                                applied = serde_json::json!({"ran": true, "output": out.chars().take(240).collect::<String>()});
+                            }
+                            Err(e) => applied = serde_json::json!({"ran": false, "blocked_by_policy": e}),
+                        }
+                    }
+                    if let Some(o) = item.as_object_mut() {
+                        o.insert("suggested_fix".into(), serde_json::json!({"kind": rem.kind, "arg": rem.arg, "title": title, "auto": rem.auto}));
+                        if !applied.is_null() {
+                            o.insert("auto_applied".into(), applied);
+                        }
+                    }
+                }
+            }
+        }
+        items.push(item);
     }
     let score = (pass_n as f64 / checks.len() as f64 * 100.0).round() as i64;
     serde_json::json!({"score": score, "grade": grade(score), "checks": items})
@@ -1679,6 +1713,18 @@ fn ai_tools() -> serde_json::Value {
                     "explanation": {"type": "string", "description": "one sentence: what this does and why it should help"}
                 },
                 "required": ["kind", "explanation"]
+            }
+        },
+        {
+            "name": "propose_command",
+            "description": "Propose a CUSTOM state-changing command for the user to approve, when the fixed propose_fix menu doesn't cover the needed remediation. You CANNOT run it — it is shown to the user verbatim as an Apply button and runs only if they approve. Give the exact single `command` and a plain-language `explanation`. The user sees and approves the literal command text, so make it precise and minimal.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "the exact shell command to run on approval"},
+                    "explanation": {"type": "string", "description": "one sentence: what it does and why"}
+                },
+                "required": ["command", "explanation"]
             }
         }
     ])
@@ -1903,6 +1949,10 @@ fn ai_apply_run(agents: &Agents, target: &str, owner: &str, kind: &str, arg: &st
         Some(v) => v,
         None => return json_resp(&serde_json::json!({"ok": false, "error": "That fix isn't available on this device, or the name is invalid."})),
     };
+    // Runtime policy gate (#13): an AI fix is a write action too.
+    if let Err(e) = policy::enforce(kind, arg) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
     let dev = device_name(agents, target);
     audit(owner, "ai-fix", kind, &dev, &title);
     let output = exec_output(target, &command);
@@ -1932,6 +1982,132 @@ fn relay_ai_apply_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
     match parse_apply_body(req) {
         Some((kind, arg)) => ai_apply_run(agents, &target, &owner, &kind, &arg),
         None => json_resp(&serde_json::json!({"ok": false, "error": "no fix specified"})),
+    }
+}
+
+/// #1 Plan-first: risk + reversibility of an action kind, surfaced in the plan.
+fn action_risk(kind: &str) -> (&'static str, bool) {
+    match kind {
+        "flush_dns" | "clear_temp" | "empty_recycle_bin" => ("low", true),
+        "restart_service" | "kill_process" | "reboot" | "shutdown" | "logoff" | "sleep" | "update_all" => ("medium", true),
+        "firewall_off" | "usb_unlock" | "custom" => ("high", false),
+        _ => ("medium", true),
+    }
+}
+
+/// #1 Plan-first dry-run: resolve exactly what a fix/action WILL do without running
+/// it — the command, risk, reversibility, and the runtime-policy verdict — so a human
+/// approves with full knowledge. Additive; the apply path itself is unchanged.
+fn plan_for(agents: &Agents, target: &str, kind: &str, arg: &str) -> serde_json::Value {
+    let platform = device_platform(agents, target);
+    let sarg = sanitize_fix_arg(arg).unwrap_or_default();
+    let resolved = fix_command(&platform, kind, &sarg)
+        .or_else(|| os_command(&platform, kind, &sarg).map(|c| (kind.to_string(), c)));
+    let (title, command) = match resolved {
+        Some(v) => v,
+        None => return serde_json::json!({"ok": false, "error": format!("'{kind}' isn't available on {platform} (or the argument is invalid)")}),
+    };
+    let (risk, reversible) = action_risk(kind);
+    let policy_verdict = match policy::check(kind, &sarg) {
+        policy::Decision::Deny(r) => serde_json::json!({"allowed": false, "reason": r}),
+        policy::Decision::NeedApproval(r) => serde_json::json!({"allowed": true, "needs_approval": true, "reason": r}),
+        policy::Decision::Allow => serde_json::json!({"allowed": true}),
+    };
+    serde_json::json!({"ok": true, "platform": platform, "kind": kind, "arg": sarg, "title": title, "command": command, "risk": risk, "reversible": reversible, "policy": policy_verdict})
+}
+
+fn ai_plan_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    match parse_apply_body(req) {
+        Some((kind, arg)) if !kind.is_empty() => json_resp(&plan_for(agents, &target, &kind, &arg)),
+        _ => json_resp(&serde_json::json!({"ok": false, "error": "no fix/action specified"})),
+    }
+}
+
+/// #9 Approved custom command: run the EXACT command the user reviewed + approved
+/// (from a propose_command card). Policy-gated + audited. The governed WRITE path —
+/// distinct from run_readonly_command, which forbids state changes.
+fn ai_run_approved(agents: &Agents, target: &str, owner: &str, command: &str) -> Resp {
+    let command = command.trim();
+    if command.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no command"}));
+    }
+    if let Err(e) = policy::enforce("custom", command) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
+    let dev = device_name(agents, target);
+    audit(owner, "ai-approved-cmd", "custom", &dev, command);
+    let out = exec_output(target, command);
+    json_resp(&serde_json::json!({"ok": true, "device": dev, "command": command, "output": ai_clip(out, 4000)}))
+}
+
+fn ai_run_approved_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let command = v.get("command").and_then(|x| x.as_str()).unwrap_or("");
+    ai_run_approved(agents, &target, user.unwrap_or(""), command)
+}
+
+/// Relay variant: an endpoint approves a custom command ON ITSELF from the tray chat.
+fn relay_ai_run_approved_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
+    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let id = query_param(url, "id").unwrap_or_default();
+    if id.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
+    }
+    let target = format!("relay://{id}");
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let command = v.get("command").and_then(|x| x.as_str()).unwrap_or("");
+    ai_run_approved(agents, &target, &owner, command)
+}
+
+/// #3 Root-cause narrative: given a failing check + its raw output, ask the model for
+/// a short plain-language why + recommended fix.
+fn ai_explain_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    let key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs ANTHROPIC_API_KEY set on the hub."})),
+    };
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let check = v.get("check").and_then(|x| x.as_str()).unwrap_or("");
+    let output = v.get("output").and_then(|x| x.as_str()).unwrap_or("");
+    if check.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no check specified"}));
+    }
+    let platform = device_platform(agents, &target);
+    let dev = device_name(agents, &target);
+    let system = "You are an IT compliance assistant. In 2-4 short plain-language sentences, explain WHY a security/compliance check is failing on this machine and the single most likely remediation. Be concrete and non-alarming. Do not invent details unsupported by the output.";
+    let prompt = format!(
+        "Device '{dev}' ({platform}). The check '{check}' FAILED. Raw check output:\n{}\n\nExplain the likely root cause and the recommended fix.",
+        ai_clip(output.to_string(), 1500)
+    );
+    let messages = [serde_json::json!({"role": "user", "content": prompt})];
+    match ai_call(&key, system, serde_json::json!([]), &messages) {
+        Ok(val) => {
+            if let Some(err) = val.get("error") {
+                let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("LLM error");
+                return json_resp(&serde_json::json!({"ok": false, "error": msg}));
+            }
+            let text = ai_text(&val.get("content").cloned().unwrap_or_else(|| serde_json::json!([])));
+            json_resp(&serde_json::json!({"ok": true, "check": check, "narrative": text}))
+        }
+        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e})),
     }
 }
 
@@ -2005,6 +2181,26 @@ Keep replies short and skimmable. Prefer system_report for a broad look; use run
                             ack
                         }
                         None => format!("Fix '{kind}' isn't available on {platform}, or the name is invalid — pick another approach."),
+                    };
+                    results.push(serde_json::json!({"type": "tool_result", "tool_use_id": tid, "content": out}));
+                    continue;
+                }
+                // #9 propose_command: a CUSTOM command the AI drafts for human approval.
+                // Never executed here — surfaced as an Apply card (kind "custom"), run
+                // only via ai_run_approved_ep after the human approves the literal text.
+                // A policy deny is reported back so the model picks another approach.
+                if name == "propose_command" {
+                    let command = tinput.get("command").and_then(|c| c.as_str()).unwrap_or("").trim();
+                    let why = tinput.get("explanation").and_then(|e| e.as_str()).unwrap_or("");
+                    let out = if command.is_empty() {
+                        "Empty command — nothing to propose.".to_string()
+                    } else if let Err(e) = policy::enforce("custom", command) {
+                        format!("That command is blocked by hub policy ({e}) — propose a different approach.")
+                    } else {
+                        let title = format!("Run: {}", ai_clip(command.to_string(), 80));
+                        steps.push(serde_json::json!({"tool": "propose_command", "arg": command, "ok": true}));
+                        proposals.push(serde_json::json!({"kind": "custom", "command": command, "title": title, "explanation": why}));
+                        format!("Proposed to the user for approval: `{command}`. NOT executed — it runs only if they click Apply.")
                     };
                     results.push(serde_json::json!({"type": "tool_result", "tool_use_id": tid, "content": out}));
                     continue;
@@ -2127,6 +2323,10 @@ fn proxy_sys(url: &str, agents: &Agents, user: Option<&str>, via_mcp: bool) -> R
             o.insert("device".into(), serde_json::json!(dev));
         }
         return json_resp(&r);
+    }
+    // Runtime policy gate (#13) for canned device-actions (reboot, shutdown, …).
+    if let Err(e) = policy::enforce(&kind, &arg) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
     }
     let cmd = match os_command(&platform, &kind, &arg).or_else(|| plugin_command(&platform, &kind, &arg)) {
         Some(c) => c,
@@ -3137,6 +3337,11 @@ fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: b
     }
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("");
     let detach = v.get("detach").and_then(|x| x.as_bool()).unwrap_or(false);
+    // Runtime policy gate (#13): deny-listed commands/actions are refused before the
+    // agent is ever contacted.
+    if let Err(e) = policy::enforce(if detach { "launch" } else { "exec" }, cmd) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
     let action = if detach { "launch command" } else { "run command" };
     if via_mcp {
         record_mcp_access(target, action, user.unwrap_or(""), cmd);
@@ -3163,6 +3368,9 @@ fn proxy_input(req: &mut Request, agents: &Agents, user: Option<&str>) -> Resp {
     }
     let ev = v.get("ev").cloned().unwrap_or_else(|| serde_json::json!({}));
     let ev_kind = ev.get("type").and_then(|x| x.as_str()).unwrap_or("input");
+    if let Err(e) = policy::enforce("input", ev_kind) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
     record_mcp_access(target, "input", user.unwrap_or(""), ev_kind);
     audit(user.unwrap_or(""), "mcp", "input", &device_name(agents, target), ev_kind);
     match dev_unary(target, "POST", "/input", Some(("application/json".into(), ev.to_string().into_bytes()))) {
@@ -4256,7 +4464,7 @@ function aiMd(t){return esc2(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(
 function aiSend(){if(AI_BUSY||!SEL)return;var inp=document.getElementById('ai-in');var msg=(inp.value||'').trim();if(!msg)return;inp.value='';aiAppend('ai-user',esc2(msg));AI_BUSY=true;document.getElementById('ai-send').disabled=true;var think=aiAppend('ai-bot ai-think','investigating…');
 fetch(API+'/x/ai-chat?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,history:AI_HIST})}).then(function(r){return r.json();}).then(function(j){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;if(!j.ok){aiAppend('ai-bot ai-err','⚠ '+esc2(j.error||'failed'));return;}if(j.steps&&j.steps.length){aiAppend('ai-bot ai-steps',j.steps.map(function(t){return '<span class="ai-step'+(t.ok?'':' bad')+'" title="'+attrEsc(t.arg||'')+'">'+esc2(t.tool==='system_report'?('report: '+(t.arg||'')):('$ '+(t.arg||t.tool)))+'</span>';}).join(''));}aiAppend('ai-bot',aiMd(j.reply||'(no answer)'));if(j.proposals&&j.proposals.length){j.proposals.forEach(aiProposal);}AI_HIST=j.history||AI_HIST;document.getElementById('ai-in').focus();}).catch(function(e){think.remove();AI_BUSY=false;document.getElementById('ai-send').disabled=false;aiAppend('ai-bot ai-err','error: '+esc2(''+e));});}
 function aiProposal(p){var card=aiAppend('ai-bot ai-fix','');var t=document.createElement('div');t.className='aifix-t';t.innerHTML='🔧 '+esc2(p.title||'Proposed fix');var ex=document.createElement('div');ex.className='aifix-x';ex.textContent=p.explanation||'';var cmd=document.createElement('div');cmd.className='aifix-cmd';cmd.textContent=p.command||'';var row=document.createElement('div');row.className='aifix-row';var ap=document.createElement('button');ap.className='b bsend';ap.textContent='Apply';var sk=document.createElement('button');sk.className='b subtle';sk.textContent='Skip';ap.onclick=function(){aiApply(p,card,ap,sk);};sk.onclick=function(){card.classList.add('done');row.innerHTML='<span class="aifix-skip">Skipped</span>';};row.appendChild(ap);row.appendChild(sk);card.appendChild(t);card.appendChild(ex);card.appendChild(cmd);card.appendChild(row);}
-function aiApply(p,card,ap,sk){ap.disabled=true;sk.disabled=true;ap.textContent='Applying…';fetch(API+'/x/ai-apply?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:p.kind,arg:p.arg||''})}).then(function(r){return r.json();}).then(function(j){card.classList.add('done');var res=document.createElement('div');if(!j.ok){res.className='aifix-res bad';res.textContent='⚠ '+(j.error||'failed');}else{res.className='aifix-res ok';res.innerHTML='✓ Applied — '+esc2(j.title||'')+(j.output&&j.output.trim()?('<pre class="aifix-out">'+esc2(j.output)+'</pre>'):'');}ap.parentElement.replaceWith(res);}).catch(function(e){ap.disabled=false;sk.disabled=false;ap.textContent='Apply';aiAppend('ai-bot ai-err','apply error: '+esc2(''+e));});}
+function aiApply(p,card,ap,sk){ap.disabled=true;sk.disabled=true;ap.textContent='Applying…';var custom=(p.kind==='custom');var ep=custom?'/x/ai-run-approved':'/x/ai-apply';var payload=custom?{command:p.command||''}:{kind:p.kind,arg:p.arg||''};fetch(API+ep+'?target='+enc(SEL),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(function(r){return r.json();}).then(function(j){card.classList.add('done');var res=document.createElement('div');if(!j.ok){res.className='aifix-res bad';res.textContent='⚠ '+(j.error||'failed');}else{res.className='aifix-res ok';res.innerHTML='✓ Applied — '+esc2(j.title||j.command||'')+(j.output&&j.output.trim()?('<pre class="aifix-out">'+esc2(j.output)+'</pre>'):'');}ap.parentElement.replaceWith(res);}).catch(function(e){ap.disabled=false;sk.disabled=false;ap.textContent='Apply';aiAppend('ai-bot ai-err','apply error: '+esc2(''+e));});}
 function doRun(){var c=prompt('Command to run:');if(!c)return;out('$ '+c+'\n…');fetch(API+'/x/exec',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:SEL,cmd:c})}).then(function(r){return r.json();}).then(function(j){out('$ '+c+'\n'+(j.ok?(((j.stdout||'')+(j.stderr||''))||('exit '+j.code)):('[error] '+(j.error||'failed'))));}).catch(function(e){out('error: '+e);});}
 var SHSID=null,SHOFF=0,TERM=null,FIT=null;
 function ensureTerm(){if(TERM)return;TERM=new Terminal({fontSize:12,fontFamily:'ui-monospace,SFMono-Regular,Menlo,monospace',cursorBlink:true,theme:{background:'#0b0d13',foreground:'#d3d8e4'}});FIT=new FitAddon.FitAddon();TERM.loadAddon(FIT);TERM.open(document.getElementById('xterm'));TERM.onData(function(d){if(SHSID)fetch(API+'/x/shell/input?target='+enc(SEL)+'&sid='+enc(SHSID),{method:'POST',body:d});});}
