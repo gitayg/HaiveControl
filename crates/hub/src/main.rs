@@ -16,8 +16,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 mod policy;
+mod mcptokens;
 
-const VERSION: &str = "3.1.0";
+const VERSION: &str = "3.2.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -152,14 +153,27 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // MCP owner: the client's owner param, else a server-configured MCP_OWNER
     // (so a single token "is" that owner), else none (unscoped — the token is
     // the auth; owner is only a per-user filter).
-    let mowner = query_param(&url, "owner")
+    let mut mowner = query_param(&url, "owner")
         .filter(|s| !s.is_empty())
         .or_else(|| std::env::var("MCP_OWNER").ok().filter(|s| !s.is_empty()))
         .map(|o| canon_owner(&o));
     if path.starts_with("/m/") {
-        if !mcp_ok(&url) {
-            let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
-            return;
+        match mcp_auth(&url) {
+            McpAuth::Denied => {
+                let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+                return;
+            }
+            McpAuth::Legacy => {}
+            McpAuth::Scoped { owner, scope } => {
+                // A scoped token is bound to its OWN owner server-side — ignore any
+                // client-supplied ?owner= (closes the "owner is just a filter" gap).
+                mowner = Some(canon_owner(&owner));
+                // A read-only token may not invoke write actions.
+                if scope == "read" && mcp_is_write(&path, &url) {
+                    let _ = req.respond(Response::from_string("this MCP token is read-only").with_status_code(403));
+                    return;
+                }
+            }
         }
         if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
             if let Some(t) = query_param(&url, "target") {
@@ -320,6 +334,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
+        (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
+        (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
@@ -754,11 +770,97 @@ fn relay_ok(url: &str) -> bool {
 }
 
 /// MCP-client auth for the SSO-bypassed /m paths. Open when MCP_TOKEN is unset.
-fn mcp_ok(url: &str) -> bool {
-    match std::env::var("MCP_TOKEN") {
-        Ok(t) if !t.is_empty() => query_param(url, "mtok").as_deref() == Some(t.as_str()),
-        _ => true,
+/// Constant-time string equality for token checks (no early-return timing oracle).
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
     }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// #11 MCP authentication result. `Legacy` = the shared MCP_TOKEN (or an unauthed
+/// dev hub) → full access, owner from the caller. `Scoped` = a per-operator token
+/// bound server-side to an owner + scope. `Denied` = no valid credential.
+enum McpAuth {
+    Denied,
+    Legacy,
+    Scoped { owner: String, scope: String },
+}
+
+fn mcp_auth(url: &str) -> McpAuth {
+    let mtok = query_param(url, "mtok").unwrap_or_default();
+    // Legacy shared token (or unset MCP_TOKEN = open dev hub) → full access.
+    match std::env::var("MCP_TOKEN") {
+        Ok(t) if !t.is_empty() => {
+            if ct_eq_str(&mtok, &t) {
+                return McpAuth::Legacy;
+            }
+        }
+        _ => return McpAuth::Legacy,
+    }
+    // A per-operator scoped token.
+    if let Some(s) = mcptokens::resolve(&mtok) {
+        return McpAuth::Scoped { owner: s.owner, scope: s.scope };
+    }
+    McpAuth::Denied
+}
+
+/// Whether a `/m/` path is a WRITE action (a read-scoped token may not call it).
+/// Everything not on the read allowlist is treated as a write; `/m/sys` is split by
+/// its `kind` (a report/posture is a read; reboot/shutdown/etc. are writes).
+fn mcp_is_write(path: &str, url: &str) -> bool {
+    const READ: &[&str] = &[
+        "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
+        "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
+        "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
+    ];
+    if READ.contains(&path) {
+        return false;
+    }
+    if path == "/m/sys" {
+        const READ_KINDS: &[&str] = &[
+            "posture", "hardware", "av", "encryption", "firewall", "processes", "services",
+            "network", "packages", "updates", "report",
+        ];
+        let kind = query_param(url, "kind").unwrap_or_default();
+        return !READ_KINDS.contains(&kind.as_str());
+    }
+    true
+}
+
+/// GET /x/mcp-tokens — list the caller's scoped MCP tokens; POST mints one
+/// (`?scope=read|write|admin&ttl=<days>`), returning the secret ONCE.
+fn mcp_tokens_ep(req: &Request, url: &str, user: Option<&str>) -> Resp {
+    let owner = match user.filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no owner context (hub is not behind SSO)"})),
+    };
+    if req.method() == &Method::Post {
+        let scope = query_param(url, "scope").unwrap_or_else(|| "read".into());
+        let ttl: u64 = query_param(url, "ttl").and_then(|v| v.parse().ok()).unwrap_or(30);
+        let (id, secret) = mcptokens::mint(owner, &scope, ttl);
+        json_resp(&serde_json::json!({
+            "ok": true, "id": id, "token": secret, "scope": scope, "ttl_days": ttl,
+            "note": "Store this token now — it is shown only once. Use it as ?mtok=<token> on /m/ calls."
+        }))
+    } else {
+        json_resp(&serde_json::json!({"ok": true, "tokens": mcptokens::list(owner)}))
+    }
+}
+
+/// POST /x/mcp-token-revoke?id=… — revoke one of the caller's scoped tokens.
+fn mcp_token_revoke_ep(url: &str, user: Option<&str>) -> Resp {
+    let owner = match user.filter(|u| !u.is_empty()) {
+        Some(u) => u,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no owner context"})),
+    };
+    let id = query_param(url, "id").unwrap_or_default();
+    json_resp(&serde_json::json!({"ok": mcptokens::revoke(&id, owner)}))
 }
 
 // xterm.js terminal, bundled into the binary and served same-origin (no CDN).
@@ -3867,7 +3969,9 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <main class=\"stage\">\
-<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div></div>\
+<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div>\
+<div class=\"aud-head\" style=\"margin-top:16px\">MCP access tokens <span class=\"dim2\">— scoped, expiring keys for the AI/MCP API</span></div>\
+<div class=\"reg-tok dim2\">Mint a token bound to your account. <b>read</b> = inspect only; <b>write</b> = run fixes/commands; <b>admin</b> = full. Pass it as <code>?mtok=…</code> on <code>/m/</code> calls.<div style=\"margin-top:8px\">Scope <select id=\"mtk-scope\" class=\"scr-sel\"><option value=\"read\">read</option><option value=\"write\">write</option><option value=\"admin\">admin</option></select> TTL <input id=\"mtk-ttl\" class=\"devsearch\" type=\"number\" min=\"0\" value=\"30\" style=\"width:64px\"> days <button class=\"b\" onclick=\"mintMcpToken()\">Mint token</button></div><div id=\"mtk-new\"></div><div id=\"mtk-list\"></div></div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
 <div id=\"inv-toggle\" class=\"inv-bar\" style=\"display:none\"><div class=\"aud-head\" style=\"margin:0\">Inventory</div><div class=\"seg\"><button id=\"invb-table\" class=\"segb\" onclick=\"invView('table')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><rect width=\"18\" height=\"18\" x=\"3\" y=\"3\" rx=\"2\"/><path d=\"M3 9h18\"/><path d=\"M3 15h18\"/><path d=\"M12 3v18\"/></svg> Table</button><button id=\"invb-map\" class=\"segb\" onclick=\"invView('map')\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M20 10c0 4.4-5.6 8.6-7.4 9.8a1 1 0 0 1-1.2 0C9.6 18.6 4 14.4 4 10a8 8 0 0 1 16 0\"/><circle cx=\"12\" cy=\"10\" r=\"3\"/></svg> Map</button></div></div>\
 <div id=\"dashboard-view\" style=\"display:none\"></div>\
@@ -4269,7 +4373,10 @@ function enc(s){return encodeURIComponent(s);}
 function esc2(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function attrEsc(s){return esc2(s).replace(/"/g,'&quot;');}
 function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(1)+' GB';}
-function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';}}
+function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';listMcpTokens();}}
+function mintMcpToken(){var s=document.getElementById('mtk-scope').value;var t=document.getElementById('mtk-ttl').value||'0';fetch(API+'/x/mcp-tokens?scope='+enc(s)+'&ttl='+enc(t),{method:'POST'}).then(function(r){return r.json();}).then(function(j){if(!j.ok){alert(j.error||'mint failed');return;}document.getElementById('mtk-new').innerHTML='<div class=\"aifix-res ok\">New '+esc2(j.scope)+' token — copy now, shown once:<pre class=\"aifix-out\">'+esc2(j.token)+'</pre></div>';listMcpTokens();}).catch(function(e){alert('error: '+e);});}
+function listMcpTokens(){fetch(API+'/x/mcp-tokens').then(function(r){return r.json();}).then(function(j){var el=document.getElementById('mtk-list');if(!el)return;if(!j.ok){el.textContent='';return;}var ts=j.tokens||[];if(!ts.length){el.innerHTML='<div class=\"dim2\" style=\"margin-top:6px\">No tokens yet.</div>';return;}el.innerHTML='<table style=\"margin-top:8px;width:100%;font-size:12px\"><tr><th style=\"text-align:left\">id</th><th>scope</th><th>expires</th><th></th></tr>'+ts.map(function(t){var exp=t.expires_at?new Date(t.expires_at*1000).toISOString().slice(0,10):'never';return '<tr><td><code>'+esc2(t.id)+'</code></td><td style=\"text-align:center\">'+esc2(t.scope)+'</td><td style=\"text-align:center\">'+exp+'</td><td style=\"text-align:right\"><button class=\"b subtle\" onclick=\"revokeMcpToken(\\''+esc2(t.id)+'\\')\">Revoke</button></td></tr>';}).join('')+'</table>';}).catch(function(){});}
+function revokeMcpToken(id){if(!confirm('Revoke token '+id+'? Any MCP client using it stops working immediately.'))return;fetch(API+'/x/mcp-token-revoke?id='+enc(id),{method:'POST'}).then(function(r){return r.json();}).then(function(){listMcpTokens();}).catch(function(e){alert('error: '+e);});}
 function instMode(m){var v=document.querySelectorAll('.instv');for(var i=0;i<v.length;i++){v[i].style.display=(v[i].getAttribute('data-m')===m)?'block':'none';}}
 function rotateEnrollTok(){if(!confirm('Rotate your enrollment token? The old token stops working for new enrollments. Devices already enrolled are unaffected.'))return;fetch(API+'/x/enroll-token?rotate=1').then(function(r){return r.json();}).then(function(j){if(j&&j.ok){location.reload();}else{alert((j&&j.error)||'rotate failed');}}).catch(function(e){alert('error: '+e);});}
 /* ---- devices ---- */
