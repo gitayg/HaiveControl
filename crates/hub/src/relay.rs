@@ -37,11 +37,39 @@ pub struct Tunnel {
     qcv: Condvar,
     pending: Mutex<HashMap<u32, Sender<Msg>>>,
     next_id: AtomicU32,
+    /// sha256(enrollment token) of the agent that registered this tunnel. Every
+    /// subsequent poll/reply/heartbeat for this id must present the SAME token —
+    /// so a holder of merely *a* valid token (the shared RELAY_TOKEN, or another
+    /// owner's htok_) cannot poll/forge an arbitrary device's tunnel by id.
+    auth: String,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<Tunnel>>> {
     static R: OnceLock<Mutex<HashMap<String, Arc<Tunnel>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// sha256-hex of the caller's enrollment token — what we bind a tunnel to. Empty
+/// token → empty string (an unauthenticated hub where every tunnel shares "").
+pub fn auth_hash(tok: &str) -> String {
+    if tok.is_empty() {
+        return String::new();
+    }
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(tok.as_bytes()))
+}
+
+/// Constant-time string equality — avoids a timing oracle on the tunnel secret.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn upsert_agent(agents: &Agents, key: &str, agent_id: &str, data: &serde_json::Value) {
@@ -111,22 +139,38 @@ pub fn dedup_sweep(agents: &Agents) {
     }
 }
 
-/// POST /relay/hello — register (or heartbeat) a relay agent.
-pub fn hello(agents: &Agents, data: serde_json::Value) {
+/// POST /relay/hello — register (or heartbeat) a relay agent. `auth` is
+/// sha256(enrollment token) (see `auth_hash`); it binds the tunnel to its enroller.
+/// Returns false if an EXISTING tunnel is heartbeat'd with a different token — i.e.
+/// someone other than the original agent is trying to take over the id.
+pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
     let agent_id = match data.get("relay_id").and_then(|x| x.as_str()) {
         Some(s) => s.to_string(),
-        None => return,
+        None => return false,
     };
     let mut reg = registry().lock().unwrap();
-    let fresh = !reg.contains_key(&agent_id);
-    reg.entry(agent_id.clone()).or_insert_with(|| {
-        Arc::new(Tunnel {
-            queue: Mutex::new(VecDeque::new()),
-            qcv: Condvar::new(),
-            pending: Mutex::new(HashMap::new()),
-            next_id: AtomicU32::new(1),
-        })
-    });
+    let fresh = match reg.get(&agent_id) {
+        // Existing tunnel: only its original enroller (same token) may heartbeat it.
+        Some(t) => {
+            if !ct_eq(&t.auth, auth) {
+                return false;
+            }
+            false
+        }
+        None => {
+            reg.insert(
+                agent_id.clone(),
+                Arc::new(Tunnel {
+                    queue: Mutex::new(VecDeque::new()),
+                    qcv: Condvar::new(),
+                    pending: Mutex::new(HashMap::new()),
+                    next_id: AtomicU32::new(1),
+                    auth: auth.to_string(),
+                }),
+            );
+            true
+        }
+    };
     drop(reg);
     upsert_agent(agents, &format!("relay:{agent_id}"), &agent_id, &data);
     if fresh {
@@ -157,11 +201,17 @@ pub fn hello(agents: &Agents, data: serde_json::Value) {
             }
         });
     }
+    true
 }
 
 /// GET /relay/poll — block up to `timeout` for the next request; JSON or None.
-pub fn poll(agent_id: &str, timeout: Duration) -> Option<String> {
+/// `auth` must match the token the tunnel was registered with (see `hello`), so a
+/// caller can only dequeue commands destined for a device it actually enrolled.
+pub fn poll(agent_id: &str, auth: &str, timeout: Duration) -> Option<String> {
     let t = registry().lock().unwrap().get(agent_id)?.clone();
+    if !ct_eq(&t.auth, auth) {
+        return None;
+    }
     let mut q = t.queue.lock().unwrap();
     if q.is_empty() {
         let (g, _) = t.qcv.wait_timeout(q, timeout).unwrap();
@@ -172,13 +222,15 @@ pub fn poll(agent_id: &str, timeout: Duration) -> Option<String> {
 }
 
 /// POST /relay/reply — feed a streamed response body into the waiting request.
-pub fn reply_stream(agent_id: &str, req_id: u32, status: u16, ctype: String, reader: &mut dyn Read) {
+/// `auth` must match the tunnel's registering token, so a caller can't forge a
+/// response for another device's in-flight request by guessing (agent_id, req_id).
+pub fn reply_stream(agent_id: &str, auth: &str, req_id: u32, status: u16, ctype: String, reader: &mut dyn Read) {
     let tx = match registry().lock().unwrap().get(agent_id).cloned() {
-        Some(t) => match t.pending.lock().unwrap().get(&req_id).cloned() {
+        Some(t) if ct_eq(&t.auth, auth) => match t.pending.lock().unwrap().get(&req_id).cloned() {
             Some(tx) => tx,
             None => return,
         },
-        None => return,
+        _ => return,
     };
     if tx.send(Msg::Head(status, ctype)).is_err() {
         return;

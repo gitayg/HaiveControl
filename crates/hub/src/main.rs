@@ -16,7 +16,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
 
-const VERSION: &str = "3.0.6";
+const VERSION: &str = "3.0.7";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -99,16 +99,39 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // checked inside proxy_exec instead of here.
     // Empty owner = no scope (see all), never "owner equals empty string" — an
     // unset HIVE_OWNER on the MCP must not silently hide every device.
-    let user = req_header(&req, "X-AppCrane-User-Email")
-        .or_else(|| req_header(&req, "X-AppCrane-User"))
-        .filter(|s| !s.is_empty())
-        .map(|e| canon_owner(&e))
-        // Header missing (AppCrane not forwarding identity): resolve via the
-        // forwarded session cookie against /api/me. No-op once the header arrives.
-        .or_else(|| match (req_header(&req, "Cookie"), req_header(&req, "X-Forwarded-Host")) {
-            (Some(c), Some(h)) if !c.is_empty() => identity_from_cookie(&h, &c),
-            _ => None,
-        });
+    // Optional anti-spoofing: if PROXY_AUTH_SECRET is configured, only honor the
+    // AppCrane identity headers when the proxy also injects the matching secret
+    // header — so a client reaching the hub directly (bypassing the proxy) cannot
+    // forge `X-AppCrane-User-Email`. Unset (default) preserves current behavior.
+    let proxy_ok = match std::env::var("PROXY_AUTH_SECRET") {
+        Ok(s) if !s.is_empty() => req_header(&req, "X-AppCrane-Proxy-Secret").as_deref() == Some(s.as_str()),
+        _ => true,
+    };
+    let user = if !proxy_ok {
+        None
+    } else {
+        req_header(&req, "X-AppCrane-User-Email")
+            .or_else(|| req_header(&req, "X-AppCrane-User"))
+            .filter(|s| !s.is_empty())
+            .map(|e| canon_owner(&e))
+            // Header missing (AppCrane not forwarding identity): resolve via the
+            // forwarded session cookie against /api/me. No-op once the header arrives.
+            .or_else(|| match (req_header(&req, "Cookie"), req_header(&req, "X-Forwarded-Host")) {
+                (Some(c), Some(h)) if !c.is_empty() => identity_from_cookie(&h, &c),
+                _ => None,
+            })
+    };
+    // Fail CLOSED: when the hub is authed (RELAY_TOKEN set), the browser/SSO surface
+    // requires a resolved identity. /relay/* and /m/* carry their own token auth and
+    // are exempt below. Previously a request with NO identity fell through to
+    // may_control's `None => true` and got full access to every device.
+    if require_identity()
+        && user.is_none()
+        && (path == "/" || path == "/agents" || path == "/audit" || path.starts_with("/x/"))
+    {
+        let _ = req.respond(Response::from_string("authentication required").with_status_code(401));
+        return;
+    }
     // /x/set-owner is an ownership op (behind SSO) — it must work on devices the
     // caller doesn't yet own, so it's exempt from the may_control target gate.
     if path.starts_with("/x/") && path != "/x/exec" && path != "/x/set-owner" {
@@ -210,8 +233,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                         o.insert("owner".into(), serde_json::json!(owner));
                     }
                 }
-                relay::hello(agents, data);
-                Response::from_string("").with_status_code(204)
+                let ah = relay::auth_hash(&query_param(&url, "tok").unwrap_or_default());
+                if relay::hello(agents, data, &ah) {
+                    Response::from_string("").with_status_code(204)
+                } else {
+                    // The id is already bound to a different enrollment token —
+                    // someone is trying to take over another device's tunnel.
+                    Response::from_string("relay id in use by another enrollment").with_status_code(403)
+                }
             }
         }
         (Method::Get, "/whoami") => {
@@ -262,17 +291,19 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         }
         (Method::Get, "/relay/poll") => {
             let id = query_param(&url, "id").unwrap_or_default();
-            match relay::poll(&id, std::time::Duration::from_secs(25)) {
+            let ah = relay::auth_hash(&query_param(&url, "tok").unwrap_or_default());
+            match relay::poll(&id, &ah, std::time::Duration::from_secs(25)) {
                 Some(js) => Response::from_string(js).with_header(hdr("Content-Type", "application/json")),
                 None => Response::from_string("").with_status_code(204),
             }
         }
         (Method::Post, "/relay/reply") => {
             let id = query_param(&url, "id").unwrap_or_default();
+            let ah = relay::auth_hash(&query_param(&url, "tok").unwrap_or_default());
             let req_id = query_param(&url, "req").and_then(|v| v.parse().ok()).unwrap_or(0);
             let st = query_param(&url, "st").and_then(|v| v.parse().ok()).unwrap_or(200);
             let ct = query_param(&url, "ct").unwrap_or_default();
-            relay::reply_stream(&id, req_id, st, ct, req.as_reader());
+            relay::reply_stream(&id, &ah, req_id, st, ct, req.as_reader());
             Response::from_string("").with_status_code(204)
         }
         (Method::Get, "/install.ps1") => text_resp(install_ps1(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
@@ -665,6 +696,13 @@ fn action_label(path: &str) -> &'static str {
 fn auditable(path: &str) -> bool {
     let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
     matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open")
+}
+
+/// True when the hub is running authenticated (RELAY_TOKEN set) — i.e. a real
+/// multi-user deployment where an unidentified caller on the browser/SSO surface
+/// must be refused rather than granted full access.
+fn require_identity() -> bool {
+    std::env::var("RELAY_TOKEN").map(|t| !t.is_empty()).unwrap_or(false)
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -1750,7 +1788,11 @@ fn ro_stage_ok(stage: &str) -> bool {
     const RO: &[&str] = &[
         "uname","whoami","id","hostname","hostnamectl","uptime","df","free","ps","top","vmstat","iostat","nproc","arch","getconf","lscpu","lsblk","lsusb","lspci","lsof","stat","file","du","mount","dmesg","printenv","env","date","which","where","echo",
         "ip","ifconfig","ss","netstat","route","arp","ping","ping6","nslookup","dig","host","traceroute","tracert",
-        "journalctl","cat","head","tail","ls","dir","find","findstr","grep","egrep","awk","sed","sort","uniq","wc","cut","tr","column","xargs","select-string",
+        // NOTE: interpreters that can execute arbitrary programs are deliberately
+        // EXCLUDED — `awk 'BEGIN{system("…")}'`, `find -exec`, `sed e/w`, and `xargs`
+        // would let the "read-only" AI path run commands without the Apply/approval
+        // gate. They must go through the approval-gated write path instead.
+        "journalctl","cat","head","tail","ls","dir","findstr","grep","egrep","sort","uniq","wc","cut","tr","column","select-string",
         "systeminfo","tasklist","ipconfig","ver","type","driverquery","gpresult","query",
     ];
     match prog {
