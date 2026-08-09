@@ -22,12 +22,14 @@ COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # — so redeploying the hub would silently keep serving the OLD binaries (it only
 # refreshed by luck, when a hub-source change happened to invalidate the layer).
 # Bump this to the agent version you want picked up whenever you cut an agent release.
-ARG AGENT_REV=3.0.5
+ARG AGENT_REV=3.0.7
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
  && for a in it-ai-linux it-ai-linux-arm64 it-ai-macos it-ai-windows.exe \
              it-ai-mcp-linux it-ai-mcp-linux-arm64 it-ai-mcp-macos it-ai-mcp-windows.exe; do \
       curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a" -o "/app/dist/$a"; \
+      curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a.sig" -o "/app/dist/$a.sig" \
+        || echo "no signature for $a yet (agents ≥3.0.7 require it for verified self-update)"; \
     done
 # Published checksums, served at /bin/SHA256SUMS, so the 'crane' install source can
 # verify integrity too. Non-fatal if a release predates checksums.
