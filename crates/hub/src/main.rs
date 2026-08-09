@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.4.0";
+const VERSION: &str = "3.5.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -341,15 +341,17 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/fleet-report") => json_resp(&fleet_report(agents, mowner.as_deref())),
         (Method::Get, "/x/inventory-history") => inventory_history_ep(&url, agents, user.as_deref()),
         (Method::Get, "/m/inventory-history") => inventory_history_ep(&url, agents, mowner.as_deref()),
+        (Method::Get, "/x/compliance.csv") => compliance_export_ep(agents, user.as_deref()),
+        (Method::Get, "/m/compliance.csv") => compliance_export_ep(agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
-        (Method::Get, "/x/recordings") => recordings_list(),
-        (Method::Get, "/x/recording") => recording_get(&url),
-        (Method::Get, "/x/recording-delete") => recording_delete(&url),
+        (Method::Get, "/x/recordings") => recordings_list(user.as_deref()),
+        (Method::Get, "/x/recording") => recording_get(&url, user.as_deref()),
+        (Method::Get, "/x/recording-delete") => recording_delete(&url, user.as_deref()),
         (Method::Get, "/x/shell/read") => proxy_shell_read(&url),
         (Method::Post, "/x/shell/input") => proxy_shell_input(&mut req, &url),
         (Method::Post, "/x/shell/resize") => proxy_shell_resize(&url),
@@ -823,7 +825,7 @@ fn mcp_auth(url: &str) -> McpAuth {
 fn mcp_is_write(path: &str, url: &str) -> bool {
     const READ: &[&str] = &[
         "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
-        "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
+        "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/compliance.csv", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
         "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
     ];
     if READ.contains(&path) {
@@ -1473,6 +1475,52 @@ fn analysis_compliance(sections: &std::collections::BTreeMap<String, (String, st
     }
     let score = (pass_n as f64 / checks.len() as f64 * 100.0).round() as i64;
     serde_json::json!({"score": score, "grade": grade(score), "checks": items})
+}
+
+/// #24 Compliance evidence export: a CSV of every owned device's last-known
+/// compliance grade + per-control pass/fail, computed from stored analysis (no relay
+/// calls). Downloadable audit artifact; maps to CIS/NIST/PCI/HIPAA/ISO/E8 controls.
+fn compliance_export_ep(agents: &Agents, user: Option<&str>) -> Resp {
+    fn cell(comp: &serde_json::Value, kind: &str) -> &'static str {
+        comp["checks"]
+            .as_array()
+            .and_then(|a| a.iter().find(|c| c["kind"].as_str() == Some(kind)))
+            .map(|c| {
+                if c["pass"].as_bool().unwrap_or(false) {
+                    "PASS"
+                } else if c["have"].as_bool().unwrap_or(false) {
+                    "FAIL"
+                } else {
+                    "n/a"
+                }
+            })
+            .unwrap_or("n/a")
+    }
+    fn q(s: &str) -> String {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+    let mut csv = String::from("Device,Platform,Grade,Score,DiskEncryption,Firewall,Antivirus,OSUpdates\n");
+    let store = analysis_store().lock().unwrap();
+    let empty = std::collections::BTreeMap::new();
+    for (name, target, platform) in owned_targets(agents, user) {
+        let key = device_key(&target);
+        let sections = store.get(&key).map(|(s, _)| s).unwrap_or(&empty);
+        let comp = analysis_compliance(sections);
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            q(&name),
+            q(&platform),
+            comp["grade"].as_str().unwrap_or(""),
+            comp["score"].as_i64().unwrap_or(0),
+            cell(&comp, "encryption"),
+            cell(&comp, "firewall"),
+            cell(&comp, "av"),
+            cell(&comp, "updates"),
+        ));
+    }
+    Response::from_string(csv)
+        .with_header(hdr("Content-Type", "text/csv; charset=utf-8"))
+        .with_header(hdr("Content-Disposition", "attachment; filename=\"it-ai-compliance.csv\""))
 }
 
 /// GET /x|/m/analysis?target=… — the latest auto-collected analysis for a device.
@@ -3471,9 +3519,11 @@ fn rec_registry() -> &'static Mutex<HashMap<String, (std::path::PathBuf, std::ti
 fn rec_key(target: &str, sid: &str) -> String {
     format!("{target}|{sid}")
 }
-fn rec_start(target: &str, sid: &str, device: &str) {
+fn rec_start(target: &str, sid: &str, device: &str, owner: &str) {
     let path = recordings_dir().join(format!("{}-{}-{}.cast", sanitize(device), now_secs(), sanitize(sid)));
-    let header = serde_json::json!({"version": 2, "width": 120, "height": 30, "timestamp": now_secs(), "title": device});
+    // #25/H6: stamp the owner so recordings are scoped to the account that made them
+    // (a .cast can contain typed credentials — it must not be cross-tenant readable).
+    let header = serde_json::json!({"version": 2, "width": 120, "height": 30, "timestamp": now_secs(), "title": device, "owner": owner});
     if std::fs::write(&path, format!("{header}\n")).is_ok() {
         rec_registry().lock().unwrap().insert(rec_key(target, sid), (path, std::time::Instant::now()));
     }
@@ -3494,8 +3544,25 @@ fn rec_output(target: &str, sid: &str, bytes: &[u8]) {
 fn rec_stop(target: &str, sid: &str) {
     rec_registry().lock().unwrap().remove(&rec_key(target, sid));
 }
-/// GET /x/recordings — list saved shell recordings (newest first).
-fn recordings_list() -> Resp {
+/// The owner stamped in a recording's header (empty string if none/legacy).
+fn recording_owner(basename: &str) -> Option<String> {
+    let txt = std::fs::read_to_string(recordings_dir().join(basename)).ok()?;
+    let h: serde_json::Value = serde_json::from_str(txt.lines().next()?).ok()?;
+    Some(h.get("owner").and_then(|x| x.as_str()).unwrap_or("").to_string())
+}
+
+/// True if `user` may read/delete the recording — its own (owner match), or any when
+/// there is no identity context (dev/LAN). A recording with no owner stamp is only
+/// visible to the dev (None) context — never cross-tenant.
+fn may_see_recording(user: Option<&str>, rec_owner: &str) -> bool {
+    match user {
+        None => true,
+        Some(u) => !rec_owner.is_empty() && rec_owner == u,
+    }
+}
+
+/// GET /x/recordings — list the caller's saved shell recordings (newest first).
+fn recordings_list(user: Option<&str>) -> Resp {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(recordings_dir()) {
         for e in rd.flatten() {
@@ -3504,12 +3571,16 @@ fn recordings_list() -> Resp {
                 continue;
             }
             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            let (mut device, mut ts) = (String::new(), 0u64);
+            let (mut device, mut ts, mut rec_owner) = (String::new(), 0u64, String::new());
             if let Ok(txt) = std::fs::read_to_string(&p) {
                 if let Some(h) = txt.lines().next().and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {
                     device = h.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    rec_owner = h.get("owner").and_then(|x| x.as_str()).unwrap_or("").to_string();
                     ts = h.get("timestamp").and_then(|x| x.as_u64()).unwrap_or(0);
                 }
+            }
+            if !may_see_recording(user, &rec_owner) {
+                continue;
             }
             out.push(serde_json::json!({"file": e.file_name().to_string_lossy(), "device": device, "timestamp": ts, "size": size}));
         }
@@ -3526,17 +3597,23 @@ fn rec_basename(url: &str) -> Option<String> {
         None
     }
 }
-/// GET /x/recording?file= — the raw .cast for playback.
-fn recording_get(url: &str) -> Resp {
-    match rec_basename(url).and_then(|b| std::fs::read(recordings_dir().join(b)).ok()) {
+/// GET /x/recording?file= — the raw .cast for playback (owner-scoped).
+fn recording_get(url: &str, user: Option<&str>) -> Resp {
+    let base = match rec_basename(url) {
+        Some(b) if may_see_recording(user, &recording_owner(&b).unwrap_or_default()) => b,
+        _ => return Response::from_string("not found").with_status_code(404),
+    };
+    match std::fs::read(recordings_dir().join(base)).ok() {
         Some(b) => Response::from_data(b).with_header(hdr("Content-Type", "text/plain; charset=utf-8")),
         None => Response::from_string("not found").with_status_code(404),
     }
 }
-/// GET /x/recording-delete?file=
-fn recording_delete(url: &str) -> Resp {
+/// GET /x/recording-delete?file= (owner-scoped)
+fn recording_delete(url: &str, user: Option<&str>) -> Resp {
     if let Some(b) = rec_basename(url) {
-        let _ = std::fs::remove_file(recordings_dir().join(b));
+        if may_see_recording(user, &recording_owner(&b).unwrap_or_default()) {
+            let _ = std::fs::remove_file(recordings_dir().join(b));
+        }
     }
     json_resp(&serde_json::json!({"ok": true}))
 }
@@ -3598,7 +3675,7 @@ fn proxy_shell_open(url: &str, agents: &Agents) -> Resp {
     match dev_unary(&target, "POST", "/shell/open", None) {
         Some((_st, _ct, b)) => {
             if let Some(sid) = serde_json::from_slice::<serde_json::Value>(&b).ok().and_then(|v| v.get("sid").and_then(|x| x.as_str()).map(String::from)) {
-                rec_start(&target, &sid, &device_name(agents, &target));
+                rec_start(&target, &sid, &device_name(agents, &target), &device_owner(agents, &target).unwrap_or_default());
             }
             Response::from_data(b).with_header(hdr("Content-Type", "application/json"))
         }
@@ -4094,7 +4171,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div id=\"settings-view\" style=\"display:none\"><div class=\"aud-head\">Settings <span class=\"dim2\">— hub administration</span></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Agent updates</div><div class=\"set-desc\">How out-of-date device agents get updated to the hub's build (<span id=\"set-ver\" class=\"dim2\"></span>). <b>Automatic</b> pushes updates to behind devices on a schedule; <b>Manual</b> updates only when you click Update on a device.</div></div><select id=\"set-au\" class=\"scr-sel\" onchange=\"saveSetting('agent_update','set-au')\"><option value=\"manual\">Manual</option><option value=\"auto\">Automatic</option></select></div><div class=\"set-row\"><div class=\"set-main\"><div class=\"set-nm\">Device tray icon</div><div class=\"set-desc\">Show a system-tray / menu-bar icon on the device while the agent is running (Windows & macOS). Devices pull this from the hub, so it takes effect on next agent poll.</div></div><select id=\"set-tray\" class=\"scr-sel\" onchange=\"saveSetting('tray','set-tray')\"><option value=\"on\">Show</option><option value=\"off\">Hide</option></select></div></div>\
 <div id=\"cve-view\" style=\"display:none\"><div class=\"aud-head\">CVE lookup <span class=\"dim2\">— known CVEs for a product, via NVD · a lookup, not an automated scan</span></div><div class=\"fleet-bar\"><input id=\"cve-q\" class=\"devsearch\" placeholder=\"Product / keyword — e.g. openssl 3.0, Google Chrome, log4j\" autocomplete=\"off\"><button class=\"b\" onclick=\"searchCVE()\">Search</button></div><div id=\"cve-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"cve-list\"></div></div>\
 <div id=\"recordings-view\" style=\"display:none\"><div class=\"aud-head\">Recordings <span class=\"dim2\">— replay past interactive shell sessions</span></div><div id=\"rec-player\" class=\"rec-player\" style=\"display:none\"><div class=\"rec-pbar\"><span id=\"rec-title\" class=\"dim2\"></span><button class=\"b subtle\" onclick=\"stopPlay()\">Close player</button></div><div id=\"rec-term\" class=\"rec-term\"></div></div><div id=\"rec-list\"></div></div>\
-<div id=\"compliance-view\" style=\"display:none\"><div class=\"aud-head\">Compliance <span class=\"dim2\">— posture across the fleet, mapped to a framework</span></div><div class=\"fleet-bar\"><select id=\"cmp-fw\" class=\"scr-sel\" title=\"framework to show control IDs for\" onchange=\"renderCompliance()\"></select><button class=\"b\" onclick=\"runCompliance()\">Run across fleet ▶</button></div><div id=\"cmp-note\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\">Indicative control references to orient you — not certified audit evidence.</div><div class=\"ov-scroll\"><table class=\"ov-tbl cmp-tbl\"><thead id=\"cmp-head\"></thead><tbody id=\"cmp-body\"></tbody></table></div></div>\
+<div id=\"compliance-view\" style=\"display:none\"><div class=\"aud-head\">Compliance <span class=\"dim2\">— posture across the fleet, mapped to a framework</span> <button class=\"b subtle\" onclick=\"location.href=API+'/x/compliance.csv'\" title=\"download a CSV evidence report\">Export CSV</button></div><div class=\"fleet-bar\"><select id=\"cmp-fw\" class=\"scr-sel\" title=\"framework to show control IDs for\" onchange=\"renderCompliance()\"></select><button class=\"b\" onclick=\"runCompliance()\">Run across fleet ▶</button></div><div id=\"cmp-note\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\">Indicative control references to orient you — not certified audit evidence.</div><div class=\"ov-scroll\"><table class=\"ov-tbl cmp-tbl\"><thead id=\"cmp-head\"></thead><tbody id=\"cmp-body\"></tbody></table></div></div>\
 <div id=\"scripts-view\" style=\"display:none\"><div class=\"aud-head\">Script library <span class=\"dim2\">— TacticalRMM community scripts (amidaware) · runs base64-wrapped, ~65s cap</span></div><div class=\"fleet-bar\"><input id=\"scr-q\" class=\"devsearch\" placeholder=\"Search scripts… (bitlocker, cleanup, defender, choco…)\" autocomplete=\"off\"><select id=\"scr-target\" class=\"scr-sel\" title=\"where to run\"></select><button class=\"b\" onclick=\"toggleScrForm()\" title=\"add your own script\">＋ Add</button></div>\
 <div id=\"scr-form\" class=\"scr-form\" style=\"display:none\"><div class=\"scr-form-row\"><input id=\"sf-name\" class=\"devsearch\" placeholder=\"Script name\" autocomplete=\"off\"><select id=\"sf-shell\" class=\"scr-sel\" title=\"interpreter\"><option value=\"powershell\">PowerShell</option><option value=\"shell\">Shell / bash</option><option value=\"python\">Python</option><option value=\"cmd\">Batch (cmd)</option></select><select id=\"sf-plat\" class=\"scr-sel\" title=\"where it can run\"><option value=\"windows,macos,linux\">All platforms</option><option value=\"windows\">Windows</option><option value=\"macos\">macOS</option><option value=\"linux\">Linux</option></select></div><input id=\"sf-desc\" class=\"devsearch\" placeholder=\"Short description (optional)\" autocomplete=\"off\"><textarea id=\"sf-body\" class=\"sf-body\" placeholder=\"Paste the script here…\" spellcheck=\"false\"></textarea><div class=\"scr-form-row\"><button class=\"b\" onclick=\"submitScript()\">Save script</button><button class=\"b subtle\" onclick=\"toggleScrForm()\">Cancel</button><span id=\"sf-msg\" class=\"dim2\" style=\"font-size:11px\"></span></div></div>\
 <div id=\"scr-out\" class=\"scr-out\" style=\"display:none\"></div><div id=\"scr-count\" class=\"dim2\" style=\"font-size:11px;margin-bottom:8px\"></div><div id=\"scr-list\" class=\"scr-list\"></div></div>\
