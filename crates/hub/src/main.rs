@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.5.0";
+const VERSION: &str = "3.6.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -343,6 +343,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/inventory-history") => inventory_history_ep(&url, agents, mowner.as_deref()),
         (Method::Get, "/x/compliance.csv") => compliance_export_ep(agents, user.as_deref()),
         (Method::Get, "/m/compliance.csv") => compliance_export_ep(agents, mowner.as_deref()),
+        (Method::Get, "/x/queue-action") => queue_action_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/m/queue-action") => queue_action_ep(&url, agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
@@ -1374,6 +1376,71 @@ fn analysis_store() -> &'static AnalysisStore {
     A.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// #50 Offline action queue: canned actions requested for a device that's offline are
+// stored (resolved to a command) and dispatched when it next reconnects — a
+// generalization of the dissolve-on-next-connect mechanism. Persisted so the queue
+// survives a hub restart.
+fn queued_actions() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static Q: std::sync::OnceLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn queued_actions_path() -> std::path::PathBuf {
+    data_dir().join("queued_actions.json")
+}
+fn save_queued() {
+    let _ = std::fs::create_dir_all(data_dir());
+    let m = queued_actions().lock().unwrap();
+    let _ = std::fs::write(queued_actions_path(), serde_json::to_string(&*m).unwrap_or_default());
+}
+fn load_queued() {
+    if let Ok(txt) = std::fs::read_to_string(queued_actions_path()) {
+        if let Ok(m) = serde_json::from_str::<HashMap<String, Vec<String>>>(&txt) {
+            *queued_actions().lock().unwrap() = m;
+        }
+    }
+}
+fn queue_action(key: &str, cmd: &str) {
+    queued_actions().lock().unwrap().entry(key.to_string()).or_default().push(cmd.to_string());
+    save_queued();
+}
+fn drain_queued_actions(key: &str) -> Vec<String> {
+    let v = queued_actions().lock().unwrap().remove(key).unwrap_or_default();
+    if !v.is_empty() {
+        save_queued();
+    }
+    v
+}
+/// Dispatch every action queued for `agent_id` (called from /relay/hello on reconnect).
+pub(crate) fn run_queued_actions(agent_id: &str) {
+    let key = format!("relay:{agent_id}");
+    for cmd in drain_queued_actions(&key) {
+        let payload = serde_json::json!({ "cmd": cmd }).to_string().into_bytes();
+        let _ = relay::request(agent_id, "POST", "/exec", Some(("application/json".into(), payload)));
+    }
+}
+
+/// GET /x/queue-action?target=&kind=&arg= — queue a canned action to run when the
+/// device next connects (for offline devices). Policy-gated like a live action.
+fn queue_action_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    let kind = query_param(url, "kind").unwrap_or_default();
+    let arg = query_param(url, "arg").unwrap_or_default();
+    if let Err(e) = policy::enforce(&kind, &arg) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
+    let platform = device_platform(agents, &target);
+    let cmd = match os_command(&platform, &kind, &arg).or_else(|| plugin_command(&platform, &kind, &arg)) {
+        Some(c) => c,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": format!("'{kind}' not supported on {platform}")})),
+    };
+    queue_action(&device_key(&target), &cmd);
+    audit(user.unwrap_or(""), "browser", "queue", &device_name(agents, &target), &format!("{kind} {arg}"));
+    json_resp(&serde_json::json!({"ok": true, "queued": true, "note": "runs when the device next connects"}))
+}
+
 // #31 Historical asset inventory: a per-device timeline of when the installed-software
 // set changed (detected by hashing the "packages" section). In-memory ring (last 100
 // per device); queryable at /x/inventory-history.
@@ -1601,6 +1668,7 @@ fn load_state(agents: &Agents) {
     }
     load_pending();
     load_owner_tokens();
+    load_queued();
     load_owner_overrides();
 }
 
@@ -4552,7 +4620,7 @@ button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,.n
 .fbwrap button:hover{background:#2a3040}
 "#;
 
-const FB_HTML: &str = r#"<div id="fb" class="fbwrap"><div class="fbpanel"><div class="fbhead"><button onclick="fbLoad(fbParent)" title="up">&#8593;</button><span id="fbpath" class="fbpath"></span><button onclick="closeFb()">&#10005;</button></div><div id="fbbody" class="fbbody"></div><div class="fbfoot"><button id="fbupload" onclick="fbUploadHere()">Upload file here</button></div></div></div>"#;
+const FB_HTML: &str = r#"<div id="fb" class="fbwrap"><div class="fbpanel"><div class="fbhead"><button onclick="fbLoad(fbParent)" title="up">&#8593;</button><span id="fbpath" class="fbpath"></span><button onclick="closeFb()">&#10005;</button></div><div id="fbbody" class="fbbody"></div><div class="fbfoot"><button id="fbupload" onclick="fbUploadHere()">Upload file here</button> <span class="dim2">or drag &amp; drop a file onto this panel</span> <span id="fbstatus" class="dim2"></span></div></div></div>"#;
 
 const COPY_SCRIPT: &str = r#"<script>
 var API=(window.HB&&HB.base)?((''+HB.base).replace(/\/+$/,'')):'';
@@ -4781,11 +4849,12 @@ function doPersist(){if(!confirm('Make this device persistent? Installs autostar
 function doDisCancel(){out('cancelling queued dissolve…');fetch(API+'/x/dissolve-cancel?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
 /* ---- file browser ---- */
 var fbBase=null,fbMode=null,fbPath='',fbParent='';
-function openFb(b,mode){fbBase=b;fbMode=mode;document.getElementById('fb').style.display='flex';fbLoad('');}
+function openFb(b,mode){fbBase=b;fbMode=mode;var fb=document.getElementById('fb');fb.style.display='flex';if(!fb._dnd){fb._dnd=1;fb.addEventListener('dragover',function(e){e.preventDefault();fb.style.outline='2px dashed var(--accent)';});fb.addEventListener('dragleave',function(e){e.preventDefault();fb.style.outline='';});fb.addEventListener('drop',function(e){e.preventDefault();fb.style.outline='';if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0])fbUpload(e.dataTransfer.files[0]);});}fbLoad('');}
+function fbUpload(f){if(!f)return;var st=document.getElementById('fbstatus');var fd=new FormData();fd.append('file',f);fd.append('dir',fbPath);var xhr=new XMLHttpRequest();xhr.open('POST',API+'/x/upload?target='+enc(fbBase));xhr.upload.onprogress=function(e){if(st&&e.lengthComputable)st.textContent='Uploading '+f.name+' — '+Math.round(e.loaded/e.total*100)+'%';};xhr.onload=function(){var ok=false,msg='upload failed';try{var j=JSON.parse(xhr.responseText);ok=j.ok;msg=ok?('✓ '+j.saved):('[error] '+(j.error||'failed'));}catch(e){}if(st)st.textContent=msg;if(ok)fbLoad(fbPath);};xhr.onerror=function(){if(st)st.textContent='[error] upload failed';};if(st)st.textContent='Uploading '+f.name+'…';xhr.send(fd);}
 function closeFb(){document.getElementById('fb').style.display='none';}
 function fbLoad(path){fetch(API+'/x/list?target='+enc(fbBase)+'&path='+enc(path)).then(function(r){return r.json();}).then(function(d){if(!d.ok){alert('cannot list: '+(d.error||''));return;}fbPath=d.path;fbParent=d.parent||d.path;document.getElementById('fbpath').textContent=d.path;var h='';d.entries.forEach(function(e){var full=d.path+'/'+e.name;var cls=e.dir?'fbrow fbdir':(fbMode==='get'?'fbrow':'fbrow dim');var meta=e.dir?'':(' <span class="dim">'+fmtSize(e.size)+'</span>');h+='<div class="'+cls+'" data-path="'+attrEsc(full)+'" data-dir="'+(e.dir?'1':'0')+'">'+esc2(e.name)+(e.dir?'/':'')+meta+'</div>';});document.getElementById('fbbody').innerHTML=h||'<div class="dim" style="padding:8px">(empty)</div>';document.getElementById('fbupload').style.display=(fbMode==='put')?'inline-block':'none';});}
 function fbGet(full){window.open(API+'/x/download?target='+enc(fbBase)+'&path='+enc(full),'_blank');closeFb();}
-function fbUploadHere(){var i=document.createElement('input');i.type='file';i.onchange=function(){var f=i.files[0];if(!f)return;var fd=new FormData();fd.append('file',f);fd.append('dir',fbPath);fetch(API+'/x/upload?target='+enc(fbBase),{method:'POST',body:fd}).then(function(r){return r.json();}).then(function(j){alert(j.ok?('uploaded → '+j.saved):('[error] '+(j.error||'failed')));closeFb();});};i.click();}
+function fbUploadHere(){var i=document.createElement('input');i.type='file';i.onchange=function(){fbUpload(i.files[0]);};i.click();}
 /* ---- init + live poll (no full reload, so streams keep playing) ---- */
 var __dl=document.getElementById('devlist');if(__dl){__dl.addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});}
 window.addEventListener('resize',function(){fitShell();});
