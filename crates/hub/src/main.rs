@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.3";
+const VERSION: &str = "3.8.4";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -231,7 +231,15 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         }
         (Method::Get, "/agents") => json_agents(agents, user.as_deref()),
         (Method::Get, "/audit") => json_audit(user.as_deref()),
-        (Method::Get, "/api/health") => json_resp(&serde_json::json!({"status": "ok", "version": VERSION})),
+        (Method::Get, "/api/health") => json_resp(&serde_json::json!({
+            "status": "ok", "version": VERSION,
+            // Diagnostics: are the recently-added secrets actually injected into THIS
+            // container, and what owner does this (SSO-less) request resolve to?
+            "force_owner": std::env::var("HUB_FORCE_OWNER").map(|s| !s.is_empty()).unwrap_or(false),
+            "owner_alias": std::env::var("OWNER_ALIAS").map(|s| !s.is_empty()).unwrap_or(false),
+            "public_url": std::env::var("HUB_PUBLIC_URL").map(|s| !s.is_empty()).unwrap_or(false),
+            "resolved_user": user.as_deref().unwrap_or("(none)"),
+        })),
         (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
