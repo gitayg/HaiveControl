@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.0";
+const VERSION: &str = "3.8.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -1310,6 +1310,15 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("update_all", "windows") => "winget upgrade --all --silent --accept-package-agreements --accept-source-agreements".into(),
         ("update_all", "macos") => "softwareupdate -ia".into(),
         ("update_all", "linux") => "sudo apt-get update && sudo apt-get upgrade -y".into(),
+        // OS updates (distinct from app updates above): Windows uses the native
+        // Windows Update Agent API (winget does apps, not OS patches); macOS/Linux
+        // use softwareupdate / apt.
+        ("os_updates", "windows") => "it-ai:os-updates/check".into(),
+        ("os_updates", "macos") => "softwareupdate -l".into(),
+        ("os_updates", "linux") => "apt list --upgradable 2>/dev/null".into(),
+        ("os_update_all", "windows") => "it-ai:os-updates/install".into(),
+        ("os_update_all", "macos") => "softwareupdate -ia".into(),
+        ("os_update_all", "linux") => "sudo apt-get update && sudo apt-get upgrade -y".into(),
         ("power_report", "windows") => "powercfg /getactivescheme & powercfg /batteryreport /output %TEMP%\\it-ai-battery.html & echo saved to %TEMP%\\it-ai-battery.html".into(),
         ("power_report", "macos") => "pmset -g custom | head -25".into(),
         ("power_report", "linux") => "upower -d 2>/dev/null | head -30 || echo 'upower not present'".into(),
