@@ -231,18 +231,22 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         }
         (Method::Get, "/agents") => json_agents(agents, user.as_deref()),
         (Method::Get, "/audit") => json_audit(user.as_deref()),
-        (Method::Get, "/api/health") => json_resp(&serde_json::json!({
-            "status": "ok", "version": VERSION,
+        (Method::Get, "/api/health") => {
             // Diagnostics: are the recently-added secrets actually injected into THIS
-            // container, and what owner does this (SSO-less) request resolve to?
-            "force_owner": std::env::var("HUB_FORCE_OWNER").map(|s| !s.is_empty()).unwrap_or(false),
-            "owner_alias": std::env::var("OWNER_ALIAS").map(|s| !s.is_empty()).unwrap_or(false),
-            "public_url": std::env::var("HUB_PUBLIC_URL").map(|s| !s.is_empty()).unwrap_or(false),
-            "resolved_user": user.as_deref().unwrap_or("(none)"),
-            // Exactly what GET /agents would return for this resolved identity.
-            "devices_for_resolved_user": live(agents, user.as_deref()).len(),
-            "total_devices": { let g = agents.lock().unwrap(); g.len() },
-        })),
+            // container, what owner does this (SSO-less) request resolve to, and how
+            // many devices would GET /agents return for it?
+            let devices_for_resolved_user = live(agents, user.as_deref()).len();
+            let total_devices = agents.lock().unwrap().len();
+            json_resp(&serde_json::json!({
+                "status": "ok", "version": VERSION,
+                "force_owner": std::env::var("HUB_FORCE_OWNER").map(|s| !s.is_empty()).unwrap_or(false),
+                "owner_alias": std::env::var("OWNER_ALIAS").map(|s| !s.is_empty()).unwrap_or(false),
+                "public_url": std::env::var("HUB_PUBLIC_URL").map(|s| !s.is_empty()).unwrap_or(false),
+                "resolved_user": user.as_deref().unwrap_or("(none)"),
+                "devices_for_resolved_user": devices_for_resolved_user,
+                "total_devices": total_devices,
+            }))
+        }
         (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
