@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.1";
+const VERSION: &str = "3.8.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -120,8 +120,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     let user = if !proxy_ok {
         None
     } else {
+        // Only honor the email header when it's a REAL email (contains '@').
+        // AppCrane here puts an EPHEMERAL, per-request id into X-AppCrane-User-Email
+        // too, which is not an email and (as a non-@ string) canon_owner passes
+        // through verbatim — that ephemeral id then became the owner and orphaned
+        // every device. Requiring '@' skips it so we fall through to the SSO session
+        // email via /api/me (stable, = owner_id(email)) or the pinned owner.
         req_header(&req, "X-AppCrane-User-Email")
-            .filter(|s| !s.is_empty())
+            .filter(|s| s.contains('@'))
             .map(|e| canon_owner(&e))
             .or_else(|| match (req_header(&req, "Cookie"), req_header(&req, "X-Forwarded-Host")) {
                 (Some(c), Some(h)) if !c.is_empty() => identity_from_cookie(&h, &c),
