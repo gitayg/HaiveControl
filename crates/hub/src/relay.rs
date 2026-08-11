@@ -137,6 +137,46 @@ pub fn dedup_sweep(agents: &Agents) {
     for (keep_key, host) in hc {
         retire_superseded(agents, &keep_key, &host);
     }
+    dedup_hostnames(agents);
+}
+
+/// General duplicate cleanup: for any hostname with more than one row (a machine
+/// re-installed under a new relay id — common on old agents that used name-hash keys
+/// and never got an `hc-<machine-id>` row), keep the MOST-recently-seen row and retire
+/// the others that are stale (no heartbeat in 45s). A genuinely separate live machine
+/// that happens to share a hostname keeps a recent heartbeat and is never retired.
+pub fn dedup_hostnames(agents: &Agents) {
+    let retire: Vec<String> = {
+        let map = agents.lock().unwrap();
+        let mut by_host: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        for (k, a) in map.iter() {
+            if let Some(h) = a.data.get("hostname").and_then(|x| x.as_str()) {
+                if h.is_empty() {
+                    continue;
+                }
+                let age = a.last.elapsed().map(|e| e.as_secs()).unwrap_or(u64::MAX);
+                by_host.entry(h.to_string()).or_default().push((k.clone(), age));
+            }
+        }
+        let mut out = Vec::new();
+        for (_host, mut rows) in by_host {
+            if rows.len() < 2 {
+                continue;
+            }
+            rows.sort_by_key(|(_, age)| *age); // freshest first
+            for (k, age) in rows.into_iter().skip(1) {
+                if age >= 45 {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    };
+    for k in &retire {
+        agents.lock().unwrap().remove(k);
+        crate::clear_pending_dissolve(k);
+        println!("relay: retired duplicate row {k}");
+    }
 }
 
 /// POST /relay/hello — register (or heartbeat) a relay agent. `auth` is
