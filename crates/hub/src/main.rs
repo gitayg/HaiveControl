@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.2";
+const VERSION: &str = "3.8.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -117,7 +117,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // changes every load; using it as the owner orphaned every device, so it is NOT a
     // source of ownership. HUB_FORCE_OWNER, if set, is only a last-resort default when
     // no email can be resolved (single-operator safety net; leave unset for multi-user).
-    let user = if !proxy_ok {
+    // HUB_FORCE_OWNER, when set, is an ABSOLUTE override: every browser request
+    // resolves to this one owner. This is single-operator mode — correct for a
+    // personal hub where the proxy's identity is unreliable (AppCrane hands out an
+    // ephemeral id, and /api/me's email doesn't map to the owner the devices enrolled
+    // under). Leave it UNSET for true multi-user (then the email path below applies).
+    let user = if let Some(f) = std::env::var("HUB_FORCE_OWNER").ok().filter(|s| !s.is_empty()) {
+        Some(canon_owner(&f))
+    } else if !proxy_ok {
         None
     } else {
         // Only honor the email header when it's a REAL email (contains '@').
