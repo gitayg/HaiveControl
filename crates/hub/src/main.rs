@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.7.3";
+const VERSION: &str = "3.8.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -110,27 +110,24 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         Ok(s) if !s.is_empty() => req_header(&req, "X-AppCrane-Proxy-Secret").as_deref() == Some(s.as_str()),
         _ => true,
     };
-    // Single-operator mode: some proxies (AppCrane here) hand the hub a DIFFERENT,
-    // ephemeral user-id on each request instead of a stable email — so strict
-    // per-user ownership can't match the enrollment owner and the dashboard shows
-    // nothing. HUB_FORCE_OWNER pins the browser identity to one owner, so every
-    // SSO-authenticated request resolves to the account that holds the devices.
-    // (SSO still gates WHO reaches the hub; this only fixes WHICH owner they map to.)
-    let user = if let Some(forced) = std::env::var("HUB_FORCE_OWNER").ok().filter(|s| !s.is_empty()) {
-        Some(canon_owner(&forced))
-    } else if !proxy_ok {
+    // Multi-user, EMAIL-based identity. Prefer a STABLE email — the real email header,
+    // or the SSO session's email resolved via /api/me — so each user's owner is
+    // deterministic (owner_id(email)) and matches the owner their devices enrolled
+    // under. AppCrane's `X-AppCrane-User` here is an EPHEMERAL per-request id that
+    // changes every load; using it as the owner orphaned every device, so it is NOT a
+    // source of ownership. HUB_FORCE_OWNER, if set, is only a last-resort default when
+    // no email can be resolved (single-operator safety net; leave unset for multi-user).
+    let user = if !proxy_ok {
         None
     } else {
         req_header(&req, "X-AppCrane-User-Email")
-            .or_else(|| req_header(&req, "X-AppCrane-User"))
             .filter(|s| !s.is_empty())
             .map(|e| canon_owner(&e))
-            // Header missing (AppCrane not forwarding identity): resolve via the
-            // forwarded session cookie against /api/me. No-op once the header arrives.
             .or_else(|| match (req_header(&req, "Cookie"), req_header(&req, "X-Forwarded-Host")) {
                 (Some(c), Some(h)) if !c.is_empty() => identity_from_cookie(&h, &c),
                 _ => None,
             })
+            .or_else(|| std::env::var("HUB_FORCE_OWNER").ok().filter(|s| !s.is_empty()).map(|f| canon_owner(&f)))
     };
     // Strict identity is OPT-IN via PROXY_AUTH_SECRET: only when it's configured (and
     // the proxy injects it) does the browser/SSO surface fail closed on a missing
