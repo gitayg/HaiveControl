@@ -182,7 +182,11 @@ renders results **in the stage viewport**:
 - **Screenshot** / **Camera shot** — a single fresh frame.
 - **Run…** — enter a single command; stdout/stderr print to the inline console.
 - **Shell** — a full **interactive terminal** (xterm.js over a real PTY): colors,
-  `Ctrl-C`, arrows, tab-completion, `top`/`vim`, live resize.
+  `Ctrl-C`, arrows, tab-completion, `top`/`vim`, live resize. On Windows, `$`, `%`, and
+  quote characters typed here can be dropped (`cmd.exe` eats `%VAR%`; the keystroke layer
+  drops the rest) — so a PowerShell one-liner with variables or quoted strings may **echo
+  instead of run**. Wrap those with `powershell -NoProfile -EncodedCommand <base64>` —
+  see [Windows: running commands with special characters](#windows-running-commands-with-special-characters) below.
 - **Get file / Put file** — a remote **file browser** to download or upload.
 - **Update** — hot-update this agent to the hub's latest build.
 - **Dissolve** — stop the agent and remove its autostart (does not delete the binary).
@@ -296,6 +300,35 @@ curl -sk -u :SECRET https://DEVICE_IP:8765/exec \
 ```
 Returns `{"ok":true,"code":0,"stdout":"…","stderr":"…"}`. Other endpoints:
 `GET /download?path=…`, `POST /upload` (multipart `file`, optional `dir`).
+
+### Windows: running commands with special characters
+
+Special characters here means `$`, `%`, and quotes (`'` `"`).
+
+The interactive **Shell** and typed-input paths feed keystrokes through a ConPTY where
+`cmd.exe` expands/eats `%VAR%` and the keystroke layer can drop `$`, `%`, and quote
+characters — so a PowerShell one-liner with variables or quoted strings may **echo instead
+of run**. The robust fix (the same trick the **Script library** uses internally) is to hand
+PowerShell the command as a base64 blob: base64 is only `A–Z a–z 0–9 + / =`, none of the
+stripped characters, so it always survives, and `-EncodedCommand` runs it **verbatim** —
+variables, quotes, `$`/`%` all intact. `-NoProfile` also skips loading the user's profile,
+which can be slow or redefine aliases/quoting.
+
+```bash
+# build a UTF-16LE base64 of your command (macOS/Linux) — -EncodedCommand expects UTF-16LE:
+CMD='Get-Process | Where-Object { $_.CPU -gt 10 } | Select-Object Name,CPU'
+B64=$(printf '%s' "$CMD" | iconv -t UTF-16LE | base64)
+itai exec winbox "powershell -NoProfile -EncodedCommand $B64"
+```
+
+```powershell
+# or produce the blob natively in PowerShell (Unicode == UTF-16LE):
+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes('Get-ChildItem $env:TEMP *.log'))
+```
+
+This applies to any surface that types the command through — the browser Shell, `run_command`
+over MCP, and typed remote-control input. `cmd`-only commands with no `$`/`%`/quotes need no
+wrapping.
 
 ## Use it as an MCP server (drive devices from an AI)
 
