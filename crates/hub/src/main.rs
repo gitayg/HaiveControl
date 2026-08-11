@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.7.2";
+const VERSION: &str = "3.7.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -110,7 +110,15 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         Ok(s) if !s.is_empty() => req_header(&req, "X-AppCrane-Proxy-Secret").as_deref() == Some(s.as_str()),
         _ => true,
     };
-    let user = if !proxy_ok {
+    // Single-operator mode: some proxies (AppCrane here) hand the hub a DIFFERENT,
+    // ephemeral user-id on each request instead of a stable email — so strict
+    // per-user ownership can't match the enrollment owner and the dashboard shows
+    // nothing. HUB_FORCE_OWNER pins the browser identity to one owner, so every
+    // SSO-authenticated request resolves to the account that holds the devices.
+    // (SSO still gates WHO reaches the hub; this only fixes WHICH owner they map to.)
+    let user = if let Some(forced) = std::env::var("HUB_FORCE_OWNER").ok().filter(|s| !s.is_empty()) {
+        Some(canon_owner(&forced))
+    } else if !proxy_ok {
         None
     } else {
         req_header(&req, "X-AppCrane-User-Email")
