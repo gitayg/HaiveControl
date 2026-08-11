@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.7.1";
+const VERSION: &str = "3.7.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -487,14 +487,32 @@ fn owner_id(email: &str) -> String {
 pub(crate) fn canon_owner(s: &str) -> String {
     let t = s.trim();
     // An enrollment token resolves to the owner id it was issued for.
-    if let Some(owner) = resolve_owner_token(t) {
-        return owner;
-    }
-    if t.contains('@') {
+    let id = if let Some(owner) = resolve_owner_token(t) {
+        owner
+    } else if t.contains('@') {
         owner_id(t)
     } else {
         t.to_string()
+    };
+    owner_alias(&id)
+}
+
+/// Optional OWNER_ALIAS env ("from=to,from2=to2") mapping one derived owner id to
+/// another, so an AppCrane raw user-id and the email-derived UUID for the SAME person
+/// resolve to a single owner. Without it, a proxy that sends a user-id header instead
+/// of the email makes the dashboard scope to a different id than enrollment used, and
+/// the person's own devices become invisible. Unset = no-op.
+fn owner_alias(id: &str) -> String {
+    if let Ok(map) = std::env::var("OWNER_ALIAS") {
+        for pair in map.split(',') {
+            if let Some((from, to)) = pair.split_once('=') {
+                if from.trim() == id {
+                    return to.trim().to_string();
+                }
+            }
+        }
     }
+    id.to_string()
 }
 
 /// The agents-map key for a proxy target: `relay:id` or the LAN ip.
