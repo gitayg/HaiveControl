@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.5";
+const VERSION: &str = "3.8.6";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4175,7 +4175,10 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
 }
 
 fn json_agents(agents: &Agents, user: Option<&str>) -> Resp {
+    // no-store: never let a browser cache a device list fetched during a deploy
+    // rollover (which would pin an empty/stale inventory until a manual refresh).
     json_resp(&serde_json::json!({"agents": live(agents, user)}))
+        .with_header(hdr("Cache-Control", "no-store"))
 }
 
 /// Audit events, scoped to the requesting user (all when no user context).
@@ -4337,7 +4340,10 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 </div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}</body></html>",
         cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
+    // no-store: the dashboard HTML bakes in window.HB (owner, version); never serve a
+    // stale copy from a previous deploy.
     maybe_gzip(html.into_bytes(), "text/html; charset=utf-8", accepts_gzip)
+        .with_header(hdr("Cache-Control", "no-store"))
 }
 
 const CP_CSS: &str = r#"
