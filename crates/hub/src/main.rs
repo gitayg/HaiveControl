@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.7.0";
+const VERSION: &str = "3.7.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -124,11 +124,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 _ => None,
             })
     };
-    // Fail CLOSED: when the hub is authed (RELAY_TOKEN set), the browser/SSO surface
-    // requires a resolved identity. /relay/* and /m/* carry their own token auth and
-    // are exempt below. Previously a request with NO identity fell through to
-    // may_control's `None => true` and got full access to every device.
-    if require_identity()
+    // Strict identity is OPT-IN via PROXY_AUTH_SECRET: only when it's configured (and
+    // the proxy injects it) does the browser/SSO surface fail closed on a missing
+    // identity. Without it (the default), the page loads and per-user data scoping
+    // still applies — so an absent/renamed AppCrane identity header never locks the
+    // operator out of their own dashboard. (Keying this off RELAY_TOKEN 401'd the
+    // dashboard on deployments where AppCrane doesn't inject a header the hub reads.)
+    let strict_identity = std::env::var("PROXY_AUTH_SECRET").map(|s| !s.is_empty()).unwrap_or(false);
+    if strict_identity
         && user.is_none()
         && (path == "/" || path == "/agents" || path == "/audit" || path.starts_with("/x/"))
     {
@@ -733,13 +736,6 @@ fn action_label(path: &str) -> &'static str {
 fn auditable(path: &str) -> bool {
     let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
     matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open")
-}
-
-/// True when the hub is running authenticated (RELAY_TOKEN set) — i.e. a real
-/// multi-user deployment where an unidentified caller on the browser/SSO surface
-/// must be refused rather than granted full access.
-fn require_identity() -> bool {
-    std::env::var("RELAY_TOKEN").map(|t| !t.is_empty()).unwrap_or(false)
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
