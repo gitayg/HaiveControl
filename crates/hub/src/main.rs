@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.9.0";
+const VERSION: &str = "3.10.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -115,16 +115,15 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // deterministic (owner_id(email)) and matches the owner their devices enrolled
     // under. AppCrane's `X-AppCrane-User` here is an EPHEMERAL per-request id that
     // changes every load; using it as the owner orphaned every device, so it is NOT a
-    // source of ownership. HUB_FORCE_OWNER, if set, is only a last-resort default when
-    // no email can be resolved (single-operator safety net; leave unset for multi-user).
-    // HUB_FORCE_OWNER, when set, is an ABSOLUTE override: every browser request
-    // resolves to this one owner. This is single-operator mode — correct for a
-    // personal hub where the proxy's identity is unreliable (AppCrane hands out an
-    // ephemeral id, and /api/me's email doesn't map to the owner the devices enrolled
-    // under). Leave it UNSET for true multi-user (then the email path below applies).
-    let user = if let Some(f) = std::env::var("HUB_FORCE_OWNER").ok().filter(|s| !s.is_empty()) {
-        Some(canon_owner(&f))
-    } else if !proxy_ok {
+    // source of ownership.
+    // Priority: real email header (AppCrane authenticated/local-user mode injects
+    // X-AppCrane-User-Email) → SSO cookie via /api/me → HUB_FORCE_OWNER. The pin is
+    // now a FALLBACK, not an override — so once the app is out of `headless` mode and
+    // local users exist, each logged-in user resolves to their own owner (true
+    // multi-user), while a request with NO resolvable identity (relay/dev, or a
+    // still-headless deploy) still lands on the pinned single operator instead of
+    // seeing nothing. Leave HUB_FORCE_OWNER set as that safety net.
+    let user = if !proxy_ok {
         None
     } else {
         // Only honor the email header when it's a REAL email (contains '@').
