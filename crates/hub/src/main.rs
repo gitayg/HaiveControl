@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.8";
+const VERSION: &str = "3.8.9";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -367,7 +367,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
-        (Method::Get, "/x/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/x/dissolve") => proxy_dissolve(&url, agents),
         (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
@@ -473,7 +473,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/push-file") => push_file_ep(&url, mowner.as_deref(), hub_ip, hub_port),
         (Method::Get, "/m/file-status") => file_status_ep(&url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
-        (Method::Get, "/m/dissolve") => proxy_dissolve(&url),
+        (Method::Get, "/m/dissolve") => proxy_dissolve(&url, agents),
         (Method::Get, "/m/persist") => proxy_persist(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
@@ -1204,12 +1204,14 @@ fn proxy_update(url: &str, agents: &Agents, hub_ip: &str, hub_port: u16) -> Resp
     }
 }
 
-fn proxy_dissolve(url: &str) -> Resp {
+fn proxy_dissolve(url: &str, agents: &Agents) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     match dev_unary(&target, "POST", "/dissolve", None) {
         Some((_st, _ct, b)) => {
-            // Reached it now — drop any stale queued dissolve for this device.
-            clear_pending_dissolve(&device_key(&target));
+            // Dissolved now (agent stopped + autostart removed) — drop it from the
+            // inventory too, so a dissolved device disappears instead of lingering as
+            // a stale offline row. (Also clears any queued dissolve for it.)
+            forget_device(agents, &target);
             Response::from_data(b).with_header(hdr("Content-Type", "text/plain"))
         }
         // Offline / unreachable: queue it so it fires when the agent next connects,

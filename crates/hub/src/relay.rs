@@ -200,6 +200,10 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
                 crate::queue_dissolve(&format!("relay:{id}"));
             }
         });
+        // A queued dissolve is now being delivered — drop the device from inventory
+        // too (it just re-registered on this heartbeat). If the dispatch above fails
+        // it re-queues, the agent re-hellos, and this repeats until it sticks.
+        crate::forget_device(agents, &format!("relay://{agent_id}"));
     }
     // #50: dispatch any canned actions queued while this device was offline.
     let qid = agent_id.clone();
