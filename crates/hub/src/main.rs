@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.9";
+const VERSION: &str = "3.9.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4274,12 +4274,18 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
     // Behind SSO, so showing the viewer their own MCP token + owner is fine.
     let hb_base = std::env::var("HUB_PUBLIC_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("http://{hub_ip}:{hub_port}"));
     let hb_mtok = std::env::var("MCP_TOKEN").ok().filter(|s| !s.is_empty()).unwrap_or_default();
+    // The agent release the hub serves (for the device "Update →" label) is a
+    // SEPARATE version line from the hub itself — set AGENT_VERSION to the current
+    // agent release (matches the Dockerfile AGENT_REV). Falls back to the hub version
+    // only if unset (legacy behavior).
+    let hb_agent_ver = std::env::var("AGENT_VERSION").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| VERSION.to_string());
     let hb = format!(
-        "<script>window.HB={{base:\"{}\",mtok:\"{}\",owner:\"{}\",ver:\"{}\"}}</script>",
+        "<script>window.HB={{base:\"{}\",mtok:\"{}\",owner:\"{}\",ver:\"{}\",agent_ver:\"{}\"}}</script>",
         hb_base.replace('"', ""),
         hb_mtok.replace('"', ""),
         user.unwrap_or("").replace('"', ""),
-        VERSION
+        VERSION,
+        hb_agent_ver.replace('"', "")
     );
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
@@ -4871,7 +4877,7 @@ var scr='<button class="b" onclick="doLive()" title="live screen video">● Live
 if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else if(d.cameras_present&&d.cameras_present.length){scr+=d.cameras_present.map(function(c){return '<span class="chip off" title="camera present but not capturable — turn on the shutter/kill-switch or free the device">'+esc2(c)+'</span>';}).join(' ');}else{scr+='<span class="chip off">no camera</span>';}
 var term='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
-var av=d.agent_version||'',sv=(window.HB&&window.HB.ver)||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · server v'+sv):'');
+var av=d.agent_version||'',sv=(window.HB&&(window.HB.agent_ver||window.HB.ver))||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · latest agent v'+sv):'');
 var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
 var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<button class="b subtle" onclick="doClaim()" title="assign this device to your account so it lists under you">Claim</button>';
 var persistbtn=(d.install_mode&&d.install_mode!=='ephemeral')?'<span class="imchip im-'+(d.install_mode==='service'?'svc':'auto')+'" title="persistent — autostarts after reboot; kept awake on AC">'+esc2(d.install_mode)+' ✓</span>':'<button class="b subtle" onclick="doPersist()" title="make persistent: install autostart so it survives reboot, and keep the device awake while on AC power">Make persistent</button>';
