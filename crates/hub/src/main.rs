@@ -19,7 +19,7 @@ mod policy;
 mod mcptokens;
 mod monitor;
 
-const VERSION: &str = "3.8.4";
+const VERSION: &str = "3.8.5";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -239,6 +239,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             "owner_alias": std::env::var("OWNER_ALIAS").map(|s| !s.is_empty()).unwrap_or(false),
             "public_url": std::env::var("HUB_PUBLIC_URL").map(|s| !s.is_empty()).unwrap_or(false),
             "resolved_user": user.as_deref().unwrap_or("(none)"),
+            // Exactly what GET /agents would return for this resolved identity.
+            "devices_for_resolved_user": live(agents, user.as_deref()).len(),
+            "total_devices": { let g = agents.lock().unwrap(); g.len() },
         })),
         (Method::Get, "/relay/config") => agent_config(),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
