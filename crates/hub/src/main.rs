@@ -18,8 +18,9 @@ mod relay;
 mod policy;
 mod mcptokens;
 mod monitor;
+mod elevation;
 
-const VERSION: &str = "3.10.0";
+const VERSION: &str = "3.11.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -62,6 +63,7 @@ fn main() {
 
     let agents: Arc<Agents> = Arc::new(Mutex::new(HashMap::new()));
     load_state(&agents);
+    elevation::init(data_dir().join("elevation_grants.json"));
     {
         let a = agents.clone();
         std::thread::spawn(move || loop {
@@ -69,6 +71,13 @@ fn main() {
             save_state(&a);
         });
     }
+    // JIT-admin revoke sweeper: expire temporary local-admin grants on time. A
+    // persisted grant means a hub restart still revokes (past-due grants fire on
+    // the first sweep); an offline device gets its `/delete` queued for reconnect.
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(30));
+        sweep_elevation();
+    });
     start_scheduler(agents.clone(), ip.clone(), port);
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
@@ -329,6 +338,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             }))
         }
         (Method::Post, "/relay/analysis") => recv_analysis(&mut req),
+        (Method::Post, "/relay/request-elevation") => request_elevation_ep(&mut req, &url, agents),
         (Method::Post, "/relay/cert") => {
             let mut body = String::new();
             let _ = req.as_reader().read_to_string(&mut body);
@@ -380,6 +390,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/compliance.csv") => compliance_export_ep(agents, mowner.as_deref()),
         (Method::Get, "/x/queue-action") => queue_action_ep(&url, agents, user.as_deref()),
         (Method::Get, "/m/queue-action") => queue_action_ep(&url, agents, mowner.as_deref()),
+        (Method::Get, "/x/elevation-requests") => elevation_list_ep(user.as_deref()),
+        (Method::Get, "/m/elevation-requests") => elevation_list_ep(mowner.as_deref()),
+        (Method::Get, "/x/elevation-approve") => elevation_approve_ep(&url, user.as_deref()),
+        (Method::Get, "/x/elevation-deny") => elevation_deny_ep(&url, user.as_deref()),
         (Method::Get, "/x/wake") => wake_ep(&url, agents, user.as_deref()),
         (Method::Get, "/m/wake") => wake_ep(&url, agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
@@ -1351,9 +1365,45 @@ fn os_command(platform: &str, kind: &str, arg: &str) -> Option<String> {
         ("power_report", "windows") => "powercfg /getactivescheme & powercfg /batteryreport /output %TEMP%\\it-ai-battery.html & echo saved to %TEMP%\\it-ai-battery.html".into(),
         ("power_report", "macos") => "pmset -g custom | head -25".into(),
         ("power_report", "linux") => "upower -d 2>/dev/null | head -30 || echo 'upower not present'".into(),
+        // JIT admin elevation (Windows-only for v1): add/remove the interactive
+        // user to the local Administrators group. `arg` is the account name; it's
+        // quote-wrapped and metacharacter-rejected by win_user_arg so a device's
+        // reported username can't inject a second command.
+        ("grant_admin", "windows") => match win_user_arg(arg) {
+            Some(u) => format!("net localgroup Administrators {u} /add"),
+            None => return None,
+        },
+        ("revoke_admin", "windows") => match win_user_arg(arg) {
+            Some(u) => format!("net localgroup Administrators {u} /delete"),
+            None => return None,
+        },
         _ => return None,
     };
     Some(cmd)
+}
+
+/// Quote a Windows account name for `net localgroup`, rejecting shell
+/// metacharacters so a device-reported username can't smuggle a second command
+/// into the elevation call. Domain form `DOMAIN\user` is allowed (backslash ok).
+fn win_user_arg(user: &str) -> Option<String> {
+    let u = user.trim();
+    if u.is_empty() || u.len() > 104 {
+        return None;
+    }
+    if u.chars().any(|c| matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '%' | '/' | '`' | ';' | '\n' | '\r' | '\t')) {
+        return None;
+    }
+    Some(format!("\"{u}\""))
+}
+
+/// Read a string field from a device's registered record (empty → None).
+fn device_field(agents: &Agents, target: &str, field: &str) -> Option<String> {
+    agents
+        .lock()
+        .unwrap()
+        .get(&device_key(target))
+        .and_then(|a| a.data.get(field).and_then(|v| v.as_str()).map(String::from))
+        .filter(|s| !s.is_empty())
 }
 
 /// (name, proxy-target, platform) for every device owned by `user`.
@@ -1517,6 +1567,123 @@ fn queue_action_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
     queue_action(&device_key(&target), &cmd);
     audit(user.unwrap_or(""), "browser", "queue", &device_name(agents, &target), &format!("{kind} {arg}"));
     json_resp(&serde_json::json!({"ok": true, "queued": true, "note": "runs when the device next connects"}))
+}
+
+// ---- JIT admin elevation -----------------------------------------------------
+// A device user asks for temporary local admin from the tray; the request pops
+// up in the owner's dashboard; on approve the hub grants it for a bounded window
+// and auto-revokes when it expires (see sweep_elevation). Windows-only for v1.
+
+/// POST /relay/request-elevation?id=<relay_id> — the device forwarded a tray
+/// "Request Admin" submission. Body: {minutes, reason, user?}. The account to
+/// elevate defaults to the device's interactive session user.
+fn request_elevation_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
+    let rid = query_param(url, "id").unwrap_or_default();
+    if rid.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
+    }
+    let target = format!("relay://{rid}");
+    let owner = match device_owner(agents, &target) {
+        Some(o) if !o.is_empty() => o,
+        _ => return json_resp(&serde_json::json!({"ok": false, "error": "this device has no owner on the hub"})),
+    };
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let minutes = v.get("minutes").and_then(|x| x.as_u64()).unwrap_or(30).clamp(1, 480) as u32;
+    let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+    let user = v
+        .get("user")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| device_field(agents, &target, "session_user"))
+        .or_else(|| device_field(agents, &target, "user"))
+        .unwrap_or_default();
+    if user.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no interactive user is logged in on this device"}));
+    }
+    let device = device_name(agents, &target);
+    let r = elevation::submit(&owner, &device_key(&target), &target, &device, &user, minutes, &reason);
+    audit(&user, "device", "request-admin", &device, &format!("{minutes}m: {reason}"));
+    json_resp(&serde_json::json!({"ok": true, "id": r.id, "note": "sent — waiting for an administrator to approve"}))
+}
+
+/// GET /x/elevation-requests (or /m/…) — pending asks + active grants for the caller.
+fn elevation_list_ep(user: Option<&str>) -> Resp {
+    let pending: Vec<serde_json::Value> = elevation::pending_for(user)
+        .into_iter()
+        .map(|r| serde_json::json!({"id": r.id, "device": r.device, "user": r.user, "minutes": r.minutes, "reason": r.reason, "ts": r.ts}))
+        .collect();
+    let active: Vec<serde_json::Value> = elevation::active_for(user)
+        .into_iter()
+        .map(|g| serde_json::json!({"device": g.device, "user": g.user, "revoke_at": g.revoke_at, "remaining": g.revoke_at.saturating_sub(elevation::now())}))
+        .collect();
+    json_resp(&serde_json::json!({"ok": true, "pending": pending, "active": active}))
+}
+
+/// GET /x/elevation-approve?id=<reqid>&minutes=<n> — grant temp admin now,
+/// schedule the auto-revoke, and notify the device user.
+fn elevation_approve_ep(url: &str, user: Option<&str>) -> Resp {
+    let id = query_param(url, "id").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let req = match elevation::decide(id, user, "approved") {
+        Some(r) => r,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no such pending request (or not yours)"})),
+    };
+    let minutes = query_param(url, "minutes")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|m| m.clamp(1, 480) as u32)
+        .unwrap_or(req.minutes);
+    let cmd = match os_command("windows", "grant_admin", &req.user) {
+        Some(c) => c,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "invalid account name"})),
+    };
+    let out = exec_output(&req.target, &cmd);
+    elevation::add_grant(&req.owner, &req.device_key, &req.target, &req.device, &req.user, minutes);
+    if let Some(m) = os_command("windows", "message", &format!("IT-AI: you've been granted local admin for {minutes} minutes.")) {
+        let _ = exec_output(&req.target, &m);
+    }
+    audit(user.unwrap_or(""), "browser", "grant-admin", &req.device, &format!("{} for {}m", req.user, minutes));
+    json_resp(&serde_json::json!({"ok": true, "device": req.device, "user": req.user, "minutes": minutes, "output": out}))
+}
+
+/// GET /x/elevation-deny?id=<reqid> — decline the ask; notify the device user.
+fn elevation_deny_ep(url: &str, user: Option<&str>) -> Resp {
+    let id = query_param(url, "id").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let req = match elevation::decide(id, user, "denied") {
+        Some(r) => r,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "no such pending request (or not yours)"})),
+    };
+    if let Some(m) = os_command("windows", "message", "IT-AI: your request for admin rights was declined.") {
+        let _ = exec_output(&req.target, &m);
+    }
+    audit(user.unwrap_or(""), "browser", "deny-admin", &req.device, &req.user);
+    json_resp(&serde_json::json!({"ok": true, "device": req.device, "user": req.user}))
+}
+
+/// Revoke elapsed admin grants (called every 30s). Online → run `/delete` now;
+/// offline relay device → queue the `/delete` for its next connect.
+fn sweep_elevation() {
+    for g in elevation::due(elevation::now()) {
+        let cmd = match os_command("windows", "revoke_admin", &g.user) {
+            Some(c) => c,
+            None => {
+                elevation::remove_grant(&g.device_key, &g.user);
+                continue;
+            }
+        };
+        let agent_id = g.device_key.strip_prefix("relay:").unwrap_or(&g.device_key);
+        if relay::is_connected(agent_id) {
+            let _ = exec_output(&g.target, &cmd);
+            audit("system", "jit", "revoke-admin", &g.device, &format!("{} (window expired)", g.user));
+            elevation::remove_grant(&g.device_key, &g.user);
+        } else if g.device_key.starts_with("relay:") {
+            queue_action(&g.device_key, &cmd);
+            audit("system", "jit", "revoke-admin-queued", &g.device, &format!("{} (offline — runs on reconnect)", g.user));
+            elevation::remove_grant(&g.device_key, &g.user);
+        }
+        // non-relay + offline: leave the grant to retry on a later sweep.
+    }
 }
 
 // #31 Historical asset inventory: a per-device timeline of when the installed-software
@@ -4737,6 +4904,22 @@ function ownerChip(d){return d.owner?'':' <span class="own-chip unclaimed" title
 function presInfo(d){var u=d.session_user||d.user||'';if(d.logged_in===false)return {cls:'off',u:(u||'—'),title:'no user logged in'+(u?(' (agent runs as '+u+')'):''),lock:false};if(d.locked===true)return {cls:'idle',u:(u||'—'),title:'logged in, but the screen is LOCKED — nobody is at the machine (screen capture unavailable until unlocked)',lock:true};if(d.active===true)return {cls:'on',u:(u||'—'),title:'active — input in the last 5 min',lock:false};if(d.active===false)return {cls:'idle',u:(u||'—'),title:'idle'+(d.idle_secs!=null?(' '+durTxt(d.idle_secs)):''),lock:false};return {cls:'',u:(u||'—'),title:u?'logged in':'no session info',lock:false};}
 function presCell(d){var p=presInfo(d);return '<span class="pres '+p.cls+'" title="'+attrEsc(p.title)+'"></span>'+esc2(p.u)+(p.lock?' <span class="lockchip" title="screen locked">🔒</span>':'');}
 function ownerTxt(d){if(!d.owner)return 'unassigned (visible to all)';if(window.HB&&d.owner===HB.owner)return 'you';return 'another account ('+String(d.owner).slice(0,8)+'…)';}
+function elevToastBox(){var b=document.getElementById('elev-toasts');if(!b){b=document.createElement('div');b.id='elev-toasts';b.style.cssText='position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:10px;max-width:340px';document.body.appendChild(b);}return b;}
+var ELEV_SEEN={};
+function elevAct(id,url,card){card.style.opacity='0.5';var bs=card.querySelectorAll('button');for(var i=0;i<bs.length;i++)bs[i].disabled=true;fetch(url,{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){card.remove();delete ELEV_SEEN[id];pollElevation();}).catch(function(){card.style.opacity='1';for(var i=0;i<bs.length;i++)bs[i].disabled=false;});}
+function elevCard(req){var card=document.createElement('div');card.setAttribute('data-eid',req.id);card.style.cssText='background:var(--surface,#151823);border:1px solid var(--accent,#5b9dff);border-radius:12px;padding:12px 14px;box-shadow:0 6px 22px rgba(0,0,0,.45);font-size:13px;color:var(--text,#e6e9f2)';
+var t=document.createElement('div');t.style.cssText='font-weight:600;margin-bottom:4px';t.textContent='🔐 Admin request';
+var who=document.createElement('div');who.style.cssText='margin-bottom:6px';who.textContent=req.user+' on '+req.device;
+var rsn=document.createElement('div');rsn.style.cssText='color:var(--muted,#8b93a7);margin-bottom:8px;white-space:pre-wrap;word-break:break-word';rsn.textContent=req.reason?('"'+req.reason+'"'):'(no reason given)';
+var row=document.createElement('div');row.style.cssText='display:flex;gap:8px;align-items:center';
+var sel=document.createElement('select');sel.style.cssText='background:var(--surface2,#1b1f2b);color:var(--text,#e6e9f2);border:1px solid var(--line,#232838);border-radius:8px;padding:5px 8px';
+[[15,'15 min'],[30,'30 min'],[60,'1 hour'],[120,'2 hours']].forEach(function(o){var op=document.createElement('option');op.value=o[0];op.textContent=o[1];if(o[0]==req.minutes)op.selected=true;sel.appendChild(op);});
+var ap=document.createElement('button');ap.textContent='Approve';ap.style.cssText='background:var(--accent,#5b9dff);color:#fff;border:none;border-radius:8px;padding:6px 14px;cursor:pointer';
+ap.onclick=function(){elevAct(req.id,API+'/x/elevation-approve?id='+req.id+'&minutes='+sel.value,card);};
+var dn=document.createElement('button');dn.textContent='Deny';dn.style.cssText='background:transparent;color:var(--muted,#8b93a7);border:1px solid var(--line2,#2c3245);border-radius:8px;padding:6px 12px;cursor:pointer';
+dn.onclick=function(){elevAct(req.id,API+'/x/elevation-deny?id='+req.id,card);};
+row.appendChild(sel);row.appendChild(ap);row.appendChild(dn);card.appendChild(t);card.appendChild(who);card.appendChild(rsn);card.appendChild(row);return card;}
+function pollElevation(){fetch(API+'/x/elevation-requests?_ts='+Date.now(),{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(!j||!j.pending)return;var box=elevToastBox();var lv={};j.pending.forEach(function(req){lv[req.id]=1;if(!ELEV_SEEN[req.id]){ELEV_SEEN[req.id]=1;box.appendChild(elevCard(req));}});Object.keys(ELEV_SEEN).forEach(function(id){if(!lv[id]){var c=box.querySelector('[data-eid="'+id+'"]');if(c)c.remove();delete ELEV_SEEN[id];}});}).catch(function(){});}
 function fetchAgents(){fetch(API+'/agents?_ts='+Date.now(),{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){var arr=(j&&j.agents)||[];DEV={};arr.forEach(function(d){DEV[baseOf(d)]=d;});LAST=arr;renderSide(arr);updInvBadge();if(OVERVIEW_ON)renderOverview(arr);if(DASH_ON)renderDashboard();var special=AUDIT_ON||OVERVIEW_ON||SCRIPTS_ON||COMPLIANCE_ON||SCHED_ON||RECS_ON||MAP_ON||CVE_ON||SET_ON||DASH_ON||document.getElementById('fleet-view').style.display==='block';if(SEL&&DEV[SEL]){refreshHead(DEV[SEL]);}else if(SEL){SEL=null;if(!special)showEmpty();}if(!BOOTED){BOOTED=true;showDashboard();}}).catch(function(){});}
 function renderSide(arr){document.getElementById('count').textContent=arr.length+' device'+(arr.length===1?'':'s');var el=document.getElementById('devlist');if(!el)return;var fa=SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr;if(!fa.length){el.innerHTML='<li class="empty-li">'+(arr.length?'No match.':'No devices yet — register one below.')+'</li>';return;}var h='';fa.forEach(function(d){var b=baseOf(d);var sel=(b===SEL)?' sel':'';var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'" title="CPU load">'+Math.round(d.cpu_pct)+'%</span>'):'';var mcp=d.mcp_active?'<span class="mcp-live" title="an AI agent is accessing this device via MCP">🤖⇄</span>':'';var nm=d.name||d.hostname||d.ip;h+='<li class="dev-li'+sel+'" data-base="'+attrEsc(b)+'"><span class="dot '+statusOf(d)+'"></span><span class="dl-txt"><span class="dl-name">'+esc2(nm)+'</span><span class="dl-meta">'+esc2(d.os||'')+' · '+seenTxt(d.last_seen_secs)+'</span></span>'+mcp+load+'<button class="agi" title="copy AI-agent setup for this device" onclick="event.stopPropagation();copyAgentFor(this,\''+attrEsc(nm)+'\')">🤖</button></li>';});el.innerHTML=h;}
 function activityHtml(d){var log=d.mcp_log||[];if(!log.length)return '';var head='<div class="act-head'+(d.mcp_active?' live':'')+'"><span class="act-dot"></span>'+(d.mcp_active?'AI agent accessing now':'Recent Activity')+'</div>';var rows=log.map(function(e){var det=e.detail||'';var tip=det?(e.action+': '+det):e.action;return '<div class="act-row" title="'+attrEsc(tip)+'"><span class="act-act">'+esc2(e.action)+'</span><span class="act-det">'+esc2(det)+'</span><span class="act-by">'+esc2(e.owner||'—')+'</span><span class="act-ago">'+e.secs+'s ago</span></div>';}).join('');return '<div class="activity">'+head+'<div class="act-rows">'+rows+'</div></div>';}
@@ -4949,7 +5132,7 @@ function fbUploadHere(){var i=document.createElement('input');i.type='file';i.on
 var __dl=document.getElementById('devlist');if(__dl){__dl.addEventListener('click',function(e){var li=e.target.closest('.dev-li');if(li)select(li.getAttribute('data-base'));});}
 window.addEventListener('resize',function(){fitShell();});
 document.getElementById('fleet-cmd').addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();runFleet();}});
-(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}var cveq=document.getElementById('cve-q');if(cveq){cveq.onkeydown=function(e){if(e.key==='Enter')searchCVE();};}loadPlugins();fetchAgents();setInterval(function(){fetchAgents();if(AUDIT_ON)loadAudit();},5000);setInterval(function(){if(SEL&&document.getElementById('detail').style.display==='block')loadAnalysis(SEL);},30000);})();
+(function(){var fbb=document.getElementById('fbbody');if(fbb){fbb.onclick=function(e){var row=e.target.closest('.fbrow');if(!row)return;var p=row.getAttribute('data-path');if(!p)return;if(row.getAttribute('data-dir')==='1'){fbLoad(p);}else if(fbMode==='get'){fbGet(p);}};}var ovb=document.getElementById('ov-body');if(ovb){ovb.onclick=function(e){var row=e.target.closest('.ov-row');if(!row)return;var b=row.getAttribute('data-base');if(b&&DEV[b])select(b);};}var scrq=document.getElementById('scr-q');if(scrq){var scrT;scrq.oninput=function(){clearTimeout(scrT);scrT=setTimeout(searchScripts,250);};scrq.onkeydown=function(e){if(e.key==='Enter'){clearTimeout(scrT);searchScripts();}};}var cveq=document.getElementById('cve-q');if(cveq){cveq.onkeydown=function(e){if(e.key==='Enter')searchCVE();};}loadPlugins();fetchAgents();pollElevation();setInterval(function(){fetchAgents();pollElevation();if(AUDIT_ON)loadAudit();},5000);setInterval(function(){if(SEL&&document.getElementById('detail').style.display==='block')loadAnalysis(SEL);},30000);})();
 </script>"#;
 
 fn cmd_block(label: &str, cmd: &str) -> String {
