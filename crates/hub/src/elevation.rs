@@ -125,6 +125,18 @@ pub fn pending_for(owner: Option<&str>) -> Vec<Request> {
         .collect()
 }
 
+/// Look up a still-pending request (owner-checked; None = full access) WITHOUT
+/// transitioning it. Lets the caller attempt the grant first and only `decide`
+/// once it succeeds — a denied grant leaves the request pending for a retry.
+pub fn peek(id: u64, owner: Option<&str>) -> Option<Request> {
+    requests()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|x| x.id == id && x.status == "pending" && owner.map(|o| o == x.owner).unwrap_or(true))
+        .cloned()
+}
+
 /// Transition a still-pending request (owner-checked; None = full access).
 /// Returns the request as it was (fields intact) on success, else None.
 pub fn decide(id: u64, owner: Option<&str>, status: &str) -> Option<Request> {
