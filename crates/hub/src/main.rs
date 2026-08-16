@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.12.0";
+const VERSION: &str = "3.12.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4497,7 +4497,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
                 variant("persist", true, n_persist, &format!("{pre}\"./$f\" --relay {b}{ex} --persist --background"), &win_for(" --persist --background")),
                 variant("bg", false, n_bg, &format!("{pre}\"./$f\" --relay {b}{ex} --background"), &win_for(" --background")),
                 variant("ttl", false, n_ttl, &format!("{pre}\"./$f\" --relay {b}{ex} --ttl 60 --background"), &win_for(" --ttl 60 --background")),
-                variant("service", false, n_svc, &format!("{pre}sudo \"./$f\" --relay {b}{ex} --service"), &win_for(" --service")),
+                variant("service", false, n_svc, &format!("{pre}sudo \"./$f\" --relay {b}{ex} --install"), &win_for(" --install")),
             )
         }
         None => {
