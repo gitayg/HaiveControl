@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.12.1";
+const VERSION: &str = "3.13.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2351,11 +2351,11 @@ fn ai_tools() -> serde_json::Value {
         },
         {
             "name": "propose_fix",
-            "description": "Propose a corrective action for the user to approve. You CANNOT run it — it's shown to the user as an Apply button and only runs if they approve. Use this once you've diagnosed the problem and know the fix. Pick from the fixed menu; give a plain-language `explanation` of what it does and why.",
+            "description": "Propose a corrective action for the user to approve. You CANNOT run it — it's shown as an Apply button and only runs if they approve. Pick from the fixed menu. Prefer a SAFE fix (flush_dns, clear_temp, empty_recycle_bin, restart_explorer) when one could help. The rest are IMPACTFUL and need local admin — they only take effect if this agent is elevated (service mode or an approved JIT elevation); if you propose one, tell the user it needs admin and what it changes. Give a plain-language `explanation`.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["flush_dns", "restart_service", "kill_process", "clear_temp", "empty_recycle_bin"], "description": "which fix"},
+                    "kind": {"type": "string", "enum": ["flush_dns", "clear_temp", "empty_recycle_bin", "restart_explorer", "restart_service", "restart_audio", "restart_print_spooler", "renew_ip", "reset_winsock", "reset_windows_update", "sfc_scan", "dism_repair", "kill_process"], "description": "which fix. SAFE: flush_dns, clear_temp, empty_recycle_bin, restart_explorer. IMPACTFUL (need admin): restart_service, restart_audio, restart_print_spooler, renew_ip, reset_winsock, reset_windows_update, sfc_scan, dism_repair, kill_process"},
                     "arg": {"type": "string", "description": "service name (restart_service) or process/app name (kill_process); empty otherwise"},
                     "explanation": {"type": "string", "description": "one sentence: what this does and why it should help"}
                 },
@@ -2391,6 +2391,30 @@ fn sanitize_fix_arg(arg: &str) -> Option<String> {
     }
 }
 
+/// (tier, self_recovering) for a fix kind, surfaced on the Apply card so the UI
+/// can add friction to riskier fixes (item 1) and prefer reversible ones (item 2).
+/// tier: "safe" = low-risk, one-click; "impactful" = broader effect / usually
+/// needs admin. self_recovering: no data loss and the state returns on its own.
+/// Unknown kinds default to the cautious side.
+fn fix_meta(kind: &str) -> (&'static str, bool) {
+    match kind {
+        "flush_dns" => ("safe", true),
+        "restart_explorer" => ("safe", true),
+        "clear_temp" => ("safe", false),
+        "empty_recycle_bin" => ("safe", false),
+        "restart_service" => ("impactful", true),
+        "restart_audio" => ("impactful", true),
+        "renew_ip" => ("impactful", true),
+        "reset_windows_update" => ("impactful", true),
+        "sfc_scan" => ("impactful", true),
+        "dism_repair" => ("impactful", true),
+        "restart_print_spooler" => ("impactful", false),
+        "reset_winsock" => ("impactful", false),
+        "kill_process" => ("impactful", false),
+        _ => ("impactful", false),
+    }
+}
+
 /// The curated write-fix menu: (kind, platform) → (human title, exact command).
 /// The hub owns the command; the model only picks a kind + arg. Returns None if
 /// the fix isn't available on this platform or the arg is bad — the single gate
@@ -2423,6 +2447,43 @@ fn fix_command(platform: &str, kind: &str, arg: &str) -> Option<(String, String)
         // Windows-only for v1: %TEMP% and the Recycle Bin are per-user and safe.
         "clear_temp" if platform == "windows" => Some(("Clear your temporary files".into(), "del /q /f /s \"%TEMP%\\*\" >nul 2>&1 & echo done".into())),
         "empty_recycle_bin" if platform == "windows" => Some(("Empty the Recycle Bin".into(), "it-ai:probe/empty_recycle_bin".into())),
+        // Safe, self-recovering, least-scope: just restarts the user's shell.
+        "restart_explorer" if platform == "windows" => Some((
+            "Restart Windows Explorer (taskbar & desktop)".into(),
+            "taskkill /f /im explorer.exe & start explorer.exe".into(),
+        )),
+        // Impactful Windows fixes: broader effect and they need local admin — they
+        // only take effect when the agent is elevated (service mode / an approved
+        // JIT elevation); otherwise they no-op with "Access is denied". See fix_meta
+        // for the safe/impactful tier surfaced to the user.
+        "restart_audio" if platform == "windows" => Some((
+            "Restart the Windows audio service".into(),
+            "net stop audiosrv & net start audiosrv".into(),
+        )),
+        "restart_print_spooler" if platform == "windows" => Some((
+            "Restart the print spooler and clear the stuck print queue".into(),
+            "net stop spooler & del /q /f \"%systemroot%\\System32\\spool\\PRINTERS\\*\" 2>nul & net start spooler".into(),
+        )),
+        "renew_ip" if platform == "windows" => Some((
+            "Release and renew the network (IP) address".into(),
+            "ipconfig /release & ipconfig /renew".into(),
+        )),
+        "reset_winsock" if platform == "windows" => Some((
+            "Reset the Windows network stack (Winsock) — needs a reboot to finish".into(),
+            "netsh winsock reset".into(),
+        )),
+        "reset_windows_update" if platform == "windows" => Some((
+            "Reset Windows Update (stop services, rename the update cache, restart)".into(),
+            "net stop wuauserv & net stop bits & ren \"%systemroot%\\SoftwareDistribution\" SoftwareDistribution.old & net start bits & net start wuauserv".into(),
+        )),
+        "sfc_scan" if platform == "windows" => Some((
+            "Repair Windows system files with System File Checker (can take several minutes)".into(),
+            "sfc /scannow".into(),
+        )),
+        "dism_repair" if platform == "windows" => Some((
+            "Repair the Windows system image with DISM (can take several minutes)".into(),
+            "DISM /Online /Cleanup-Image /RestoreHealth".into(),
+        )),
         _ => None,
     }
 }
@@ -2779,12 +2840,10 @@ fn ai_chat_run(agents: &Agents, target: &str, owner: &str, message: &str, histor
     let dev = device_name(agents, target);
     let platform = device_platform(agents, target);
     let system = format!(
-        "You are an IT support assistant built into IT-AI, helping with the computer '{dev}' ({platform}). \
-Inspect the machine with the system_report and run_readonly_command tools — these READ only and change nothing. \
-Diagnose the user's problem first: run the checks you need, then explain what you found in plain, non-technical language. \
-When you've diagnosed a problem that one of the standard fixes can solve, call propose_fix — this does NOT run the fix; it shows the user an Apply button, and the fix runs only if they approve it. \
-Only propose a fix you're confident addresses the diagnosis; if none of the menu fixes fit, just describe the manual steps instead. Never claim you already fixed something — a fix only happens after the user clicks Apply. \
-Keep replies short and skimmable. Prefer system_report for a broad look; use run_readonly_command for targeted checks. Favour ONE efficient command over many — on Windows prefer plain cmd tools, using PowerShell only when cmd genuinely can't do it. When you have enough to answer, stop and answer."
+        "You are an IT support assistant built into IT-AI, helping with the computer '{dev}' ({platform}). Work like a methodical IT technician. \
+FIRST triage: decide which area the problem is in — network, disk/storage, performance, Windows updates, printing, audio, login/permissions, or a specific app — and inspect THAT area with the system_report and run_readonly_command tools (these READ only and change nothing). Run the checks you need, then cite the specific evidence you found (the exact error, number, or service state) and explain it in plain, non-technical language. \
+When a standard fix addresses the diagnosis, call propose_fix — this does NOT run it; it shows the user an Apply button, and the fix runs only if they approve. Prefer a SAFE, self-recovering, least-scope fix (flush_dns, clear_temp, restart_explorer) over an IMPACTFUL one; reach for an impactful fix (network/Winsock reset, Windows Update reset, sfc/DISM, print spooler, service restart) only when the safe options don't fit — and tell the user it needs admin rights and only works if this agent is elevated. If nothing in the menu fits, use propose_command with the exact minimal command, or just describe the manual steps. \
+Only propose a fix you're confident addresses the diagnosis. Never claim you already fixed something — a fix only happens after the user clicks Apply. Keep replies short and skimmable. Favour ONE efficient command over many — on Windows prefer plain cmd tools, using PowerShell only when cmd genuinely can't do it. When you have enough to answer, stop and answer."
     );
 
     let mut steps: Vec<serde_json::Value> = Vec::new();
@@ -2823,8 +2882,9 @@ Keep replies short and skimmable. Prefer system_report for a broad look; use run
                     let out = match fix_command(&platform, kind, farg) {
                         Some((title, command)) => {
                             let ack = format!("Proposed to the user for approval: {title}. NOT executed — it runs only if they click Apply.");
+                            let (tier, reversible) = fix_meta(kind);
                             steps.push(serde_json::json!({"tool": "propose_fix", "arg": title.clone(), "ok": true}));
-                            proposals.push(serde_json::json!({"kind": kind, "arg": farg, "title": title, "command": command, "explanation": why}));
+                            proposals.push(serde_json::json!({"kind": kind, "arg": farg, "title": title, "command": command, "explanation": why, "tier": tier, "reversible": reversible}));
                             ack
                         }
                         None => format!("Fix '{kind}' isn't available on {platform}, or the name is invalid — pick another approach."),
