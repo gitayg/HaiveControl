@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.11.0";
+const VERSION: &str = "3.12.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -393,6 +393,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/elevation-requests") => elevation_list_ep(user.as_deref()),
         (Method::Get, "/m/elevation-requests") => elevation_list_ep(mowner.as_deref()),
         (Method::Get, "/x/elevation-approve") => elevation_approve_ep(&url, user.as_deref()),
+        (Method::Get, "/x/elevation-grant") => elevation_grant_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/m/elevation-grant") => elevation_grant_ep(&url, agents, mowner.as_deref()),
         (Method::Get, "/x/elevation-deny") => elevation_deny_ep(&url, user.as_deref()),
         (Method::Get, "/x/wake") => wake_ep(&url, agents, user.as_deref()),
         (Method::Get, "/m/wake") => wake_ep(&url, agents, mowner.as_deref()),
@@ -1622,11 +1624,33 @@ fn elevation_list_ep(user: Option<&str>) -> Resp {
     json_resp(&serde_json::json!({"ok": true, "pending": pending, "active": active}))
 }
 
+/// True when a `net localgroup` grant/revoke failed because the agent itself is
+/// not elevated (Medium integrity) — Windows returns "System error 5: Access is
+/// denied." The grant silently does nothing, so we must NOT record it as granted.
+/// Classify a `net localgroup … /add|/delete` result. None = the change took
+/// effect; Some(reason) = a user-facing failure — the change did NOT happen, so
+/// callers must not record a grant. Catches both the not-elevated case (Access
+/// is denied) and the didn't-run case (device offline → "(device unreachable)"
+/// or empty output), so an unreachable device never falsely reports success.
+fn elevation_failure(out: &str) -> Option<String> {
+    let l = out.trim().to_lowercase();
+    if l.contains("access is denied") || l.contains("system error 5") {
+        Some("the agent is not running elevated — install it as a Service (SYSTEM) for admin elevation to work".into())
+    } else if l.is_empty() || l.contains("unreachable") {
+        Some("the device is unreachable — it must be online to change admin rights".into())
+    } else {
+        None
+    }
+}
+
 /// GET /x/elevation-approve?id=<reqid>&minutes=<n> — grant temp admin now,
 /// schedule the auto-revoke, and notify the device user.
 fn elevation_approve_ep(url: &str, user: Option<&str>) -> Resp {
     let id = query_param(url, "id").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    let req = match elevation::decide(id, user, "approved") {
+    // Peek (don't transition yet): if the grant is denied because the agent
+    // isn't elevated, the request must stay pending so it can be retried once
+    // the box runs the agent as a Service (SYSTEM).
+    let req = match elevation::peek(id, user) {
         Some(r) => r,
         None => return json_resp(&serde_json::json!({"ok": false, "error": "no such pending request (or not yours)"})),
     };
@@ -1639,12 +1663,55 @@ fn elevation_approve_ep(url: &str, user: Option<&str>) -> Resp {
         None => return json_resp(&serde_json::json!({"ok": false, "error": "invalid account name"})),
     };
     let out = exec_output(&req.target, &cmd);
+    if let Some(reason) = elevation_failure(&out) {
+        return json_resp(&serde_json::json!({"ok": false, "error": format!("{reason} ({})", req.device), "device": req.device, "user": req.user, "output": out}));
+    }
+    let _ = elevation::decide(id, user, "approved");
     elevation::add_grant(&req.owner, &req.device_key, &req.target, &req.device, &req.user, minutes);
     if let Some(m) = os_command("windows", "message", &format!("IT-AI: you've been granted local admin for {minutes} minutes.")) {
         let _ = exec_output(&req.target, &m);
     }
     audit(user.unwrap_or(""), "browser", "grant-admin", &req.device, &format!("{} for {}m", req.user, minutes));
     json_resp(&serde_json::json!({"ok": true, "device": req.device, "user": req.user, "minutes": minutes, "output": out}))
+}
+
+/// GET /x/elevation-grant?target=&user=&minutes= — an administrator grants an
+/// account temporary local admin on a device directly (no device-side request
+/// first). Owner-scoped. Same denial handling as the approve path.
+fn elevation_grant_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+    let target = query_param(url, "target").unwrap_or_default();
+    if target.is_empty() || !may_control(user, agents, &target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no target, or you don't own this device"}));
+    }
+    let device = device_name(agents, &target);
+    let account = query_param(url, "user")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| device_field(agents, &target, "session_user"))
+        .or_else(|| device_field(agents, &target, "user"))
+        .unwrap_or_default();
+    if account.is_empty() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "no account to elevate (and no interactive user is logged in on this device)"}));
+    }
+    let minutes = query_param(url, "minutes")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|m| m.clamp(1, 480) as u32)
+        .unwrap_or(60);
+    let cmd = match os_command("windows", "grant_admin", &account) {
+        Some(c) => c,
+        None => return json_resp(&serde_json::json!({"ok": false, "error": "invalid account name"})),
+    };
+    let out = exec_output(&target, &cmd);
+    if let Some(reason) = elevation_failure(&out) {
+        return json_resp(&serde_json::json!({"ok": false, "error": format!("{reason} ({device})"), "device": device, "user": account, "output": out}));
+    }
+    let owner = device_owner(agents, &target).unwrap_or_else(|| user.unwrap_or("").to_string());
+    elevation::add_grant(&owner, &device_key(&target), &target, &device, &account, minutes);
+    if let Some(m) = os_command("windows", "message", &format!("IT-AI: you've been granted local admin for {minutes} minutes.")) {
+        let _ = exec_output(&target, &m);
+    }
+    audit(user.unwrap_or(""), "browser", "grant-admin", &device, &format!("{account} for {minutes}m (admin-initiated)"));
+    json_resp(&serde_json::json!({"ok": true, "device": device, "user": account, "minutes": minutes, "output": out}))
 }
 
 /// GET /x/elevation-deny?id=<reqid> — decline the ask; notify the device user.
@@ -1674,8 +1741,14 @@ fn sweep_elevation() {
         };
         let agent_id = g.device_key.strip_prefix("relay:").unwrap_or(&g.device_key);
         if relay::is_connected(agent_id) {
-            let _ = exec_output(&g.target, &cmd);
-            audit("system", "jit", "revoke-admin", &g.device, &format!("{} (window expired)", g.user));
+            let out = exec_output(&g.target, &cmd);
+            if let Some(reason) = elevation_failure(&out) {
+                // Revoke didn't take effect (agent not elevated, or a blip), but
+                // there's nothing to loop on — drop the record and flag it.
+                audit("system", "jit", "revoke-admin-failed", &g.device, &format!("{} — revoke FAILED: {}", g.user, reason));
+            } else {
+                audit("system", "jit", "revoke-admin", &g.device, &format!("{} (window expired)", g.user));
+            }
             elevation::remove_grant(&g.device_key, &g.user);
         } else if g.device_key.starts_with("relay:") {
             queue_action(&g.device_key, &cmd);
@@ -5063,7 +5136,8 @@ var av=d.agent_version||'',sv=(window.HB&&(window.HB.agent_ver||window.HB.ver))|
 var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
 var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<button class="b subtle" onclick="doClaim()" title="assign this device to your account so it lists under you">Claim</button>';
 var persistbtn=(d.install_mode&&d.install_mode!=='ephemeral')?'<span class="imchip im-'+(d.install_mode==='service'?'svc':'auto')+'" title="persistent — autostarts after reboot; kept awake on AC">'+esc2(d.install_mode)+' ✓</span>':'<button class="b subtle" onclick="doPersist()" title="make persistent: install autostart so it survives reboot, and keep the device awake while on AC power">Make persistent</button>';
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
+var grantbtn=((d.os||'').toLowerCase().indexOf('win')>=0)?'<button class="b subtle" onclick="doGrantAdmin()" title="grant an account temporary local admin on this device for a bounded window (auto-revokes)">Grant temp admin…</button>':'';
+var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+grantbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var ai='<button class="b" onclick="aiOpen()" title="ask an AI to diagnose this device using read-only checks">🤖 Ask AI</button>';
 var groups='<div class="controls">'+g('AI assistant',ai)+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
@@ -5115,6 +5189,7 @@ function doGet(){openFb(SEL,'get');}
 function doPut(){openFb(SEL,'put');}
 function doUpd(){if(!confirm('Update the agent on this device to the latest build?'))return;out('updating…');fetch(API+'/x/update?target='+enc(SEL)).then(function(r){return r.text();}).then(out).catch(function(e){out('error: '+e);});}
 function doForget(){if(!confirm('Forget this device? It is removed from the inventory. If its agent is still running it reappears on its next check-in.'))return;fetch(API+'/x/forget?target='+enc(SEL)).then(function(){SEL=null;showInventory();fetchAgents();}).catch(function(e){alert('error: '+e);});}
+function doGrantAdmin(){var d=DEV[SEL]||{};var du=d.session_user||d.user||'';var u=prompt('Grant temporary local admin to which account?',du);if(u===null)return;u=u.trim();if(!u)return;var mm=prompt('For how many minutes? (1-480)','60');if(mm===null)return;var mins=parseInt(mm,10);if(!(mins>=1&&mins<=480)){alert('Minutes must be between 1 and 480.');return;}fetch(API+'/x/elevation-grant?target='+enc(SEL)+'&user='+enc(u)+'&minutes='+mins,{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){alert(j.ok?('Granted local admin to '+j.user+' on '+j.device+' for '+j.minutes+' minutes (auto-revokes).'):('Could not grant: '+(j.error||'failed')));}).catch(function(e){alert('error: '+e);});}
 function okJson(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||('HTTP '+r.status));});return r.json();}
 function doClaim(){out('claiming…');fetch(API+'/x/set-owner?target='+enc(SEL)).then(okJson).then(function(j){out('claimed — this device is now owned by '+(j.owner||'you')+'.');fetchAgents();}).catch(function(e){out('claim failed: '+(e.message||e));});}
 function doDis(){if(!confirm('Dissolve the agent on this device? It stops the agent and removes its autostart. If the device is offline, the dissolve is queued and runs on its next connect.'))return;out('dissolving…');fetch(API+'/x/dissolve?target='+enc(SEL)).then(function(r){return r.text();}).then(function(t){out(t);fetchAgents();}).catch(function(e){out('error: '+e);});}
