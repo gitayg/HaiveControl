@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.0";
+const VERSION: &str = "3.13.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -5222,7 +5222,15 @@ function openTab(){var v=document.getElementById('view');var s=v.getAttribute('s
 /* Relay devices can't carry an endless MJPEG body through the unary tunnel, so 'live'
    is a fast frame-poll (each shot is a unary request). Direct/LAN devices keep true MJPEG. */
 function startPoll(mk){stopLive();var v=document.getElementById('view');v.onload=null;v.onerror=null;var t=SEL,tok=++LIVETOK;vpBusy('Starting live view…');pollFrame(t,tok,mk);}
-function pollFrame(t,tok,mk){if(tok!==LIVETOK||SEL!==t)return;var v=document.getElementById('view');var img=new Image();img.onload=function(){if(tok!==LIVETOK||SEL!==t)return;v.src=img.src;vpShow();LIVE=setTimeout(function(){pollFrame(t,tok,mk);},120);};img.onerror=function(){if(tok!==LIVETOK||SEL!==t)return;vpBusy('Live view unreachable — retrying…');LIVE=setTimeout(function(){pollFrame(t,tok,mk);},1000);};img.src=mk(t);}
+var FRAMEERR={};
+function pollFrame(t,tok,mk){if(tok!==LIVETOK||SEL!==t)return;var v=document.getElementById('view');var img=new Image();img.onload=function(){if(tok!==LIVETOK||SEL!==t)return;FRAMEERR[t]='';v.src=img.src;vpShow();LIVE=setTimeout(function(){pollFrame(t,tok,mk);},120);};
+// An <img> swallows the response body, so a failed frame used to show a generic
+// "unreachable" no matter WHY. Fetch the body once per failure streak and show the
+// agent's actual reason (e.g. lid closed / no display attached) instead.
+img.onerror=function(){if(tok!==LIVETOK||SEL!==t)return;
+if(!FRAMEERR[t]){FRAMEERR[t]='…';fetch(mk(t),{cache:'no-store'}).then(function(r){return r.text();}).then(function(txt){var m=(txt||'').trim();FRAMEERR[t]=(m&&m.length<400)?m:'';if(tok===LIVETOK&&SEL===t)vpBusy(FRAMEERR[t]||'Live view unreachable — retrying…');}).catch(function(){FRAMEERR[t]='';});}
+vpBusy((FRAMEERR[t]&&FRAMEERR[t]!=='…')?FRAMEERR[t]:'Live view unreachable — retrying…');
+LIVE=setTimeout(function(){pollFrame(t,tok,mk);},1000);};img.src=mk(t);}
 function doLive(){var d=DEV[SEL]||{};if(d.scheme!=='relay'){setView(API+'/x/stream?target='+enc(SEL));return;}startPoll(function(t){return API+'/x/frame?target='+enc(t)+'&_t='+Date.now();});}
 function doCamLive(){var d=DEV[SEL]||{};if(d.scheme!=='relay'){setView(API+'/x/camstream?target='+enc(SEL)+'&index='+camI());return;}var ix=camI();startPoll(function(t){return API+'/x/camera?target='+enc(t)+'&index='+ix+'&_t='+Date.now();});}
 function doShot(){setView(API+'/x/frame?target='+enc(SEL)+'&_t='+Date.now());}
