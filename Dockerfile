@@ -42,6 +42,13 @@ RUN curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" -o /app/dist/le
  && curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" -o /app/dist/leaflet.css \
  || echo "leaflet download skipped — map will use the graticule fallback"
 ENV HUB_DIST=/app/dist
+# The dashboard's "latest agent" label + Update button read AGENT_VERSION. Derive
+# it from AGENT_REV so ONE bump keeps the served binary and the label in sync —
+# the two used to be separate (an AGENT_VERSION AppCrane secret) and drifted apart
+# (label stuck at an old version while /bin served a newer one). NOTE: an
+# AGENT_VERSION *secret*, if set, overrides this at runtime — remove that secret
+# so this build-time value (from AGENT_REV) becomes the single source of truth.
+ENV AGENT_VERSION=${AGENT_REV}
 # Persistent, writable data dir (custom scripts, schedules, recordings, plugins).
 # Point at the AppCrane persistent volume so it survives redeploys.
 ENV HUB_DATA=/data
