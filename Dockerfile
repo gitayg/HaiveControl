@@ -22,7 +22,7 @@ COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # — so redeploying the hub would silently keep serving the OLD binaries (it only
 # refreshed by luck, when a hub-source change happened to invalidate the layer).
 # Bump this to the agent version you want picked up whenever you cut an agent release.
-ARG AGENT_REV=3.3.0
+ARG AGENT_REV=3.3.1
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
  && for a in it-ai-linux it-ai-linux-arm64 it-ai-macos it-ai-windows.exe \
