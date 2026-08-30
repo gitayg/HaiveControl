@@ -12,6 +12,9 @@ name: sign-release
 #
 # Secrets required in THIS repo (NOT the public one):
 #   HAIVE_AGENT_RELEASE_TOKEN  PAT with contents:write on gitayg/haive-agent (upload assets)
+#   UPDATE_SIGNING_KEY         the SAME ed25519 key the public build signs with — signing
+#                              rewrites the binaries, so their update signatures MUST be
+#                              regenerated here or agents will reject the update
 #   macOS:  MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID
 #   Windows (pick one): SIGNPATH_ORGANIZATION_ID + SIGNPATH_API_TOKEN  (preferred; needs the
 #                       SignPath GitHub App on THIS repo + a project + 'release-signing' policy)
@@ -86,14 +89,14 @@ jobs:
       - name: Upload for SignPath
         id: signpath-upload
         if: env.SIGNPATH_ORGANIZATION_ID != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-windows-exe
           path: out/*-windows.exe
           if-no-files-found: error
       - name: Sign (SignPath Foundation)
         if: env.SIGNPATH_ORGANIZATION_ID != ''
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -106,7 +109,7 @@ jobs:
       # Azure Trusted Signing (fallback): signs the .exe files in place.
       - name: Sign (Azure Trusted Signing)
         if: env.AZURE_CLIENT_ID != '' && env.SIGNPATH_ORGANIZATION_ID == ''
-        uses: azure/trusted-signing-action@v0.5.9
+        uses: azure/trusted-signing-action@bb15ca63eb5548cc306f4f335c5617bb414abcad # v0.5.9
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -130,11 +133,37 @@ jobs:
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Recompute SHA256SUMS over the final assets
+      - name: Download the final asset set
         run: |
           mkdir dl
           gh release download "$TAG" --repo "$PUB" --dir dl \
             --pattern 'it-ai-*' --pattern 'it-ai-mcp-*' --pattern 'itai-*'
+
+      # Authenticode / Developer-ID signing REWRITES the binary, which invalidates
+      # the ed25519 detached signature the public build produced over the UNSIGNED
+      # bytes. Agents verify that signature against their embedded pubkey before
+      # self-replacing, so publishing signed binaries with stale .sig files would
+      # make every agent REJECT the update and silently freeze the fleet. Re-sign
+      # the FINAL bytes here — before the checksums are taken over them.
+      - name: Re-sign final binaries (ed25519, for verified self-update)
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::UPDATE_SIGNING_KEY is not set in THIS repo. Signing rewrites the binaries, so their ed25519 signatures must be regenerated here — without this key the published binaries would fail every agent's update check. Add the same key the public build uses."
+            exit 1
+          fi
+          printf '%s' "$UPDATE_SIGNING_KEY" > key.pem
+          for f in dl/*; do
+            case "$f" in *.sig|*SHA256SUMS) continue;; esac
+            openssl pkeyutl -sign -inkey key.pem -rawin -in "$f" -out "$f.sig"
+          done
+          rm -f key.pem
+          gh release upload "$TAG" --repo "$PUB" --clobber dl/*.sig
+          echo "re-signed $(ls dl/*.sig | wc -l) binaries"
+
+      - name: Recompute SHA256SUMS over the final assets
+        run: |
           : > SHA256SUMS
           for f in dl/*; do
             printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> SHA256SUMS
