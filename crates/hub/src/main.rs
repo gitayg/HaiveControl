@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.3";
+const VERSION: &str = "3.13.4";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4998,6 +4998,7 @@ body.navopen .navback{display:block}
 .set-desc{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.5}
 .set-row .scr-sel{flex:none;height:34px}
 .b{background:var(--surface2);border:1px solid var(--line2);color:#d7dbe6;border-radius:7px;padding:6px 11px;cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap;transition:background .15s,border-color .15s,color .15s}
+.b:disabled{opacity:.55;cursor:default}
 button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,.navb:focus-visible,.dev-li:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
 .b:hover{background:#252b3a;border-color:#3a4258;color:#fff}
@@ -5205,12 +5206,12 @@ var scr='<button class="b" onclick="doLive()" title="live screen video">● Live
 if(cam){scr+=camSelect(d)+'<button class="b" onclick="doCamSnap()" title="camera snapshot">Camera shot</button><button class="b" onclick="doCamLive()" title="live camera video">● Cam live</button>';}else if(d.cameras_present&&d.cameras_present.length){scr+=d.cameras_present.map(function(c){return '<span class="chip off" title="camera present but not capturable — turn on the shutter/kill-switch or free the device">'+esc2(c)+'</span>';}).join(' ');}else{scr+='<span class="chip off">no camera</span>';}
 var term='<button class="b" onclick="doShell()" title="open an interactive shell">Shell</button>';
 var files='<button class="b" onclick="doGet()" title="download a file">Get file</button><button class="b" onclick="doPut()" title="upload a file">Put file</button>';
-var av=d.agent_version||'',sv=(window.HB&&(window.HB.agent_ver||window.HB.ver))||'';var updlbl=(av&&sv&&av===sv)?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · latest agent v'+sv):'');
+var av=d.agent_version||'',sv=(window.HB&&(window.HB.agent_ver||window.HB.ver))||'';var updcur=(av&&sv&&av===sv);var updlbl=updcur?('Update ✓ '+sv):(sv?('Update → '+sv):'Update');var updtt=(av?('agent v'+av):'agent version unknown')+(sv?(' · latest agent v'+sv):'');
 var dbtn=d.dissolve_pending?'<span class="chip off" title="dissolve queued — runs when the device next connects">⏳ dissolve queued</span><button class="b subtle" onclick="doDisCancel()" title="cancel the queued dissolve">Cancel</button>':'<button class="b danger" onclick="doDis()" title="dissolve agent (stop + remove autostart)">Dissolve</button>';
 var owned=(d.owner&&window.HB&&d.owner===HB.owner);var claimbtn=owned?'':'<button class="b subtle" onclick="doClaim()" title="assign this device to your account so it lists under you">Claim</button>';
 var persistbtn=(d.install_mode&&d.install_mode!=='ephemeral')?'<span class="imchip im-'+(d.install_mode==='service'?'svc':'auto')+'" title="persistent — autostarts after reboot; kept awake on AC">'+esc2(d.install_mode)+' ✓</span>':'<button class="b subtle" onclick="doPersist()" title="make persistent: install autostart so it survives reboot, and keep the device awake while on AC power">Make persistent</button>';
 var grantbtn=((d.os||'').toLowerCase().indexOf('win')>=0)?'<button class="b subtle" onclick="doGrantAdmin()" title="grant an account temporary local admin on this device for a bounded window (auto-revokes)">Grant temp admin…</button>':'';
-var agent='<button class="b subtle" onclick="doUpd()" title="'+attrEsc(updtt)+'">'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+grantbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
+var agent='<button class="b subtle"'+(updcur?(' disabled title="'+attrEsc(updtt)+' — already current"'):(' onclick="doUpd()" title="'+attrEsc(updtt)+'"'))+'>'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+grantbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var ai='<button class="b" onclick="aiOpen()" title="ask an AI to diagnose this device using read-only checks">🤖 Ask AI</button>';
 var groups='<div class="controls">'+g('AI assistant',ai)+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
