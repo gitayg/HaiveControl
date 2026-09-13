@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.1";
+const VERSION: &str = "3.13.2";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -224,6 +224,12 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         proxy_stream(req, &url, &path);
         return;
     }
+    // Staged files stream from disk for the same reason: a `Resp` Cursor holds the
+    // whole body in memory, which OOM-killed the hub on a 300 MB pull.
+    if method == Method::Get && path.starts_with("/files/staged/") {
+        serve_staged(req, &path[14..]);
+        return;
+    }
     // Agents can't pass the PaaS SSO (headless), so /relay is SSO-bypassed — which
     // means the hub must authenticate them itself. If RELAY_TOKEN is set, every
     // /relay call must carry ?tok=<token>. Unset = open (trusted LAN / dev).
@@ -372,7 +378,6 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/install.sh") => text_resp(install_sh(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
         (Method::Get, "/ca.crt") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
         (Method::Get, p) if p.starts_with("/bin/") => serve_bin(&p[5..]),
-        (Method::Get, p) if p.starts_with("/files/staged/") => serve_staged(&p[14..]),
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
@@ -4289,13 +4294,21 @@ fn stage_ep(req: &mut Request, owner: Option<&str>) -> Resp {
 
 /// GET /files/staged/<token> — the agent pulls staged bytes here. The random token
 /// is the (unguessable, expiring) capability; no other auth is required.
-fn serve_staged(token: &str) -> Resp {
+fn serve_staged(req: Request, token: &str) {
     if token.is_empty() || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Response::from_string("bad token").with_status_code(400);
+        let _ = req.respond(Response::from_string("bad token").with_status_code(400));
+        return;
     }
-    match std::fs::read(staged_dir().join(token)) {
-        Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "application/octet-stream")),
-        Err(_) => Response::from_string("not found").with_status_code(404),
+    let file = std::fs::File::open(staged_dir().join(token));
+    let len = file.as_ref().ok().and_then(|f| f.metadata().ok()).map(|m| m.len() as usize);
+    match (file, len) {
+        (Ok(f), Some(n)) => {
+            let resp = Response::new(StatusCode(200), vec![hdr("Content-Type", "application/octet-stream")], f, Some(n), None);
+            let _ = req.respond(resp);
+        }
+        _ => {
+            let _ = req.respond(Response::from_string("not found").with_status_code(404));
+        }
     }
 }
 

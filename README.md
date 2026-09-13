@@ -440,6 +440,14 @@ capped to a 1-hour TTL, and dropped once the pull completes. The write lands ins
 agent's configured share/sandbox (`resolve_path`), and a failed checksum leaves nothing at
 the destination (temp-file + rename). To pull a file *off* a device, use `/x|/m/download`.
 
+**Size.** Both halves stream: staging writes to disk in 64 KB chunks, and the device's pull
+(`GET /files/staged/<token>`) is served straight from disk with a `Content-Length`, so hub
+memory stays flat regardless of file size. Before 3.13.2 the pull loaded the whole file into
+memory — in a 512 MB container a 300 MB push OOM-killed the hub (taking every device offline).
+Verified in Docker at a 512 MB cap: 100 / 300 / 600 MB pulls all return byte-identical with no
+OOM. The plain `upload_file` path still buffers the whole body (hub and agent) — prefer
+`push_file` for anything large.
+
 ## Identity & owner scoping
 
 A device's owner is a **stable id derived from the owner's email** (`UUIDv5(namespace,
