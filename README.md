@@ -445,8 +445,10 @@ the destination (temp-file + rename). To pull a file *off* a device, use `/x|/m/
 memory stays flat regardless of file size. Before 3.13.2 the pull loaded the whole file into
 memory — in a 512 MB container a 300 MB push OOM-killed the hub (taking every device offline).
 Verified in Docker at a 512 MB cap: 100 / 300 / 600 MB pulls all return byte-identical with no
-OOM. The plain `upload_file` path still buffers the whole body (hub and agent) — prefer
-`push_file` for anything large.
+OOM. The plain `upload_file` path still buffers the whole body (hub and agent), and the
+relay ships it as a single message, so it **cannot** stream — it is capped at **100 MB**
+(3.13.5) and rejects anything larger with a pointer to `push_file`. Use `push_file` /
+stage-and-pull for anything large; it is the only path that handles multi-GB files.
 
 ## Identity & owner scoping
 

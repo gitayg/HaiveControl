@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.4";
+const VERSION: &str = "3.13.5";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4204,11 +4204,35 @@ fn proxy_list(url: &str) -> Resp {
     }
 }
 
+// Plain /upload buffers the entire body in RAM here AND again on the agent (which
+// also copies it a second time to parse the multipart), and the relay ships it as
+// one message — so a large file OOM-kills the 512 MB hub and takes every device
+// offline with it. Cap it and send big transfers down the streaming stage-and-pull
+// path (/m/stage → /fetch-file, i.e. push_file), which writes to disk in 64 KB
+// chunks end-to-end and handles multi-GB files with flat memory.
+const MAX_DIRECT_UPLOAD: u64 = 100 * 1024 * 1024;
+
 fn proxy_upload(req: &mut Request, url: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     let ct = req.headers().iter().find(|h| h.field.equiv("Content-Type")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
     let mut body = Vec::new();
-    let _ = req.as_reader().read_to_end(&mut body);
+    // take(cap+1): read at most one byte past the cap, so an oversize body is
+    // rejected without ever buffering the whole thing. Fully-qualified Read::take
+    // because as_reader() yields `&mut dyn Read` (a trait object) and take() needs
+    // a Sized self — the reference is Sized, the bare `dyn Read` is not.
+    let mut limited = std::io::Read::take(req.as_reader(), MAX_DIRECT_UPLOAD + 1);
+    // Fully-qualified again: Take<_> is a concrete type, so read_to_end needs the
+    // Read trait in scope — and it isn't imported file-wide (the other as_reader()
+    // calls work only because they resolve through the `dyn Read` trait object).
+    if std::io::Read::read_to_end(&mut limited, &mut body).is_err() {
+        return json_resp(&serde_json::json!({"ok": false, "error": "upload read failed"}));
+    }
+    if body.len() as u64 > MAX_DIRECT_UPLOAD {
+        return json_resp(&serde_json::json!({
+            "ok": false,
+            "error": "file too large for direct upload (100 MB max) — use push_file (stage-and-pull), which streams to disk and supports multi-GB files"
+        }));
+    }
     match dev_unary(&target, "POST", "/upload", Some((ct, body))) {
         Some((_st, _ct, b)) => Response::from_data(b).with_header(hdr("Content-Type", "application/json")),
         None => json_resp(&serde_json::json!({"ok": false, "error": "upload failed"})),
