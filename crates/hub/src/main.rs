@@ -20,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.5";
+const VERSION: &str = "3.13.6";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -4215,6 +4215,22 @@ const MAX_DIRECT_UPLOAD: u64 = 100 * 1024 * 1024;
 fn proxy_upload(req: &mut Request, url: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     let ct = req.headers().iter().find(|h| h.field.equiv("Content-Type")).map(|h| h.value.as_str().to_string()).unwrap_or_default();
+    // Reject an oversize upload from its Content-Length BEFORE reading a single byte,
+    // so an oversize attempt allocates NOTHING. (The earlier cap still read up to
+    // ~100 MB into RAM before rejecting — repeated large attempts on a 512 MB hub
+    // were themselves a source of memory pressure.) The take() path below remains as
+    // the fallback for a chunked body that sends no Content-Length.
+    let declared = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Length"))
+        .and_then(|h| h.value.as_str().parse::<u64>().ok());
+    if declared.map(|n| n > MAX_DIRECT_UPLOAD).unwrap_or(false) {
+        return json_resp(&serde_json::json!({
+            "ok": false,
+            "error": "file too large for direct upload (100 MB max) — use push_file (stage-and-pull), which streams to disk and supports multi-GB files"
+        }));
+    }
     let mut body = Vec::new();
     // take(cap+1): read at most one byte past the cap, so an oversize body is
     // rejected without ever buffering the whole thing. Fully-qualified Read::take
