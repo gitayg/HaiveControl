@@ -13,11 +13,12 @@
 //! controller. "Anyone" includes a second local account, a sidecar, a backup and
 //! a volume snapshot.
 //!
-//! So secrets are created 0600 inside a 0700 directory, and — just as important
-//! — a secret that is found with wider permissions is REFUSED rather than
-//! quietly tightened or quietly used. Tightening would hide that the key was
-//! readable for however long it sat there; using it anyway would make the
-//! permissions decorative.
+//! So secrets are created 0600 inside a 0700 directory. A secret FOUND with
+//! wider permissions is tightened and reported at top volume, never quietly
+//! used: the loud report is the point, because tightening alone would hide that
+//! the key was readable for however long it sat there. It is only refused when
+//! it cannot be tightened — see `read_secret`, which explains why an outage is
+//! the wrong answer on the upgrade that fixes the problem.
 
 use std::io;
 use std::path::Path;
@@ -51,17 +52,45 @@ pub fn read_secret(path: &Path) -> io::Result<Option<String>> {
         // 0o600 are both fine, and an owner-execute bit exposes nothing.
         let mode = meta.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} is mode {:04o} — readable beyond its owner, so it is refused rather than used. \
-                     Run: chmod 600 {} && chmod 700 {}",
-                    path.display(),
-                    mode,
-                    path.display(),
-                    path.parent().unwrap_or(Path::new(".")).display(),
-                ),
-            ));
+            // UPGRADE PATH. Every hub that ran before this module existed has a
+            // 0644 key sitting in a 0755 data dir, because `std::fs::write` made
+            // it that way. Refusing outright would take those hubs down on the
+            // upgrade that fixes the problem — and refusing does not un-expose a
+            // key that has already been readable for months, it just adds an
+            // outage to the exposure. So if we own the file we tighten it and say
+            // so loudly; the operator still gets an auditable record and a reason
+            // to rotate. If we CANNOT tighten it, something is wrong that we are
+            // not entitled to paper over, and it is refused.
+            match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {
+                    eprintln!(
+                        "SECURITY: {} was mode {:04o} — readable beyond its owner — and has been \
+                         tightened to 0600. It was exposed for as long as it sat there, so treat \
+                         it as compromised and rotate it when you can.",
+                        path.display(),
+                        mode,
+                    );
+                    // The dir it lives in is just as much of a leak, and a hub
+                    // upgrading from before this module has a 0755 one.
+                    if let Some(dir) = path.parent() {
+                        let _ = ensure_private_dir(dir);
+                    }
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{} is mode {:04o} — readable beyond its owner — and could not be \
+                             tightened ({e}), so it is refused rather than used. \
+                             Run: chmod 600 {} && chmod 700 {}",
+                            path.display(),
+                            mode,
+                            path.display(),
+                            path.parent().unwrap_or(Path::new(".")).display(),
+                        ),
+                    ));
+                }
+            }
         }
     }
     let _ = meta;

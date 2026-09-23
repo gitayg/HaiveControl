@@ -20,11 +20,11 @@ fn ca() -> &'static (String, KeyPair) {
         let (cp, kp) = ca_paths();
         // `ca.key` signs the leaf certs agents serve on the LAN, so a reader can
         // impersonate any agent to a controller. It is loaded through
-        // `secretfile`, which refuses a key that is readable beyond its owner
-        // instead of using it anyway. NOTE: a hub that has been running since
-        // before this change has a 0644 `ca.key` on disk and will refuse it — the
-        // operator must `chmod 600 data/ca.key && chmod 700 data` on upgrade.
-        // `ca.crt` is public and is left alone.
+        // `secretfile`, which never uses a key that is readable beyond its owner
+        // without saying so: a hub upgrading from before that module has a 0644
+        // `ca.key` in a 0755 dir, which is tightened on load and reported as a
+        // SECURITY line telling the operator to rotate. `ca.crt` is public and is
+        // left alone.
         let stored_key = crate::secretfile::read_secret(&kp)
             .unwrap_or_else(|e| panic!("CA key unusable: {e}"));
         if let (Ok(cert_pem), Some(key_pem)) = (std::fs::read_to_string(&cp), stored_key) {

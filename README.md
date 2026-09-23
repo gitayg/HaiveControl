@@ -186,8 +186,10 @@ So the audit record is written before the command runs, on the LAN path exactly 
 
 The hub's private keys — the CA key that signs agent leaf certs, and the capability signing key —
 are written `0600` inside a `0700` data directory, created that way at `open(2)` time so they are
-never briefly world-readable. A key found with any group or other permission bit is **refused**
-rather than silently used or silently tightened; the hub tells you to `chmod 600` it. Either key is
+never briefly world-readable. A key found with any group or other permission bit is **tightened and
+reported** as a `SECURITY:` line telling you to rotate it — a hub upgrading from an older version has
+a `0644 ca.key`, and refusing to start would add an outage to an exposure that already happened
+without undoing it. It is refused outright only when it cannot be tightened. Either key is
 the whole security boundary of the feature it serves: whoever can read `cap.key` can mint
 capabilities, and whoever can read `ca.key` can impersonate any agent to a controller.
 
