@@ -20,3 +20,8 @@ uuid = { version = "1", features = ["v5"] }
 flate2 = "1"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 sha2 = "0.10"
+# Capability tokens (capability.rs): ed25519 over a compact JSON payload, and
+# raw OS entropy for the signing seed + per-token nonce. Deliberately a separate
+# algorithm/key from the rcgen CA (ECDSA P-256), which the agent cannot verify.
+ed25519-dalek = "2"
+getrandom = "0.2"

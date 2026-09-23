@@ -165,6 +165,32 @@ Because the cert is self-signed, the first time you connect the browser shows a
 
 Set `SCREEN_TLS=0` to fall back to plain HTTP if you'd rather not deal with the cert.
 
+## LAN-direct and capability tokens
+
+When a controller (the `itai` CLI or the MCP server) shares a network with an agent, it talks to the
+agent **directly over the LAN** instead of routing every byte through the hub. The hub stays the
+control plane; only the data path shortcuts. Any failure to reach the agent directly falls back to
+the relay, so behaviour off-LAN is unchanged.
+
+Reaching an agent directly must not become a way around the hub's policy, so a direct call carries a
+**capability** the hub issues:
+
+- `POST /m/capability` — the controller asks for one per call. The hub runs `may_control`,
+  `policy::enforce`, `record_mcp_access` and `audit()` **first**, in that order, and only then mints
+  a 60-second ed25519 token bound to the target device, the operation, and a SHA-256 of the
+  arguments. A denial is returned as a denial; there is nothing to fall back to.
+- `GET /m/cap-key` — the agent fetches the hub's capability **public** key and verifies every direct
+  privileged request against it. If it cannot fetch that key it **fails closed**.
+
+So the audit record is written before the command runs, on the LAN path exactly as on the relay path.
+
+The hub's private keys — the CA key that signs agent leaf certs, and the capability signing key —
+are written `0600` inside a `0700` data directory, created that way at `open(2)` time so they are
+never briefly world-readable. A key found with any group or other permission bit is **refused**
+rather than silently used or silently tightened; the hub tells you to `chmod 600` it. Either key is
+the whole security boundary of the feature it serves: whoever can read `cap.key` can mint
+capabilities, and whoever can read `ca.key` can impersonate any agent to a controller.
+
 ## Using it — the hub dashboard
 
 The dashboard is a single-page console: a **device sidebar** on the left, a **stage** on

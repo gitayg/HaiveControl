@@ -15,12 +15,14 @@ use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod relay;
+mod capability;
+mod secretfile;
 mod policy;
 mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.13.7";
+const VERSION: &str = "3.14.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -205,7 +207,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 }
             }
         }
-        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/capability" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
             if let Some(t) = query_param(&url, "target") {
                 if !may_control(mowner.as_deref(), agents, &t) {
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
@@ -262,6 +264,12 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
             }))
         }
         (Method::Get, "/relay/config") => agent_config(),
+        // The agent needs the capability public key to verify LAN-direct requests,
+        // and it cannot authenticate to /m/* (it holds an enrollment token, not an
+        // MCP token). So the same key is also served on the relay channel, which
+        // `relay_ok` has already authenticated above. Public key only — the
+        // private half never leaves `capability::signing_key`.
+        (Method::Get, "/relay/cap-key") => text_resp(capability::public_key_hex(), "text/plain; charset=utf-8"),
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-run-approved") => relay_ai_run_approved_ep(&mut req, &url, agents),
@@ -441,6 +449,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/ai-explain") => ai_explain_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Get, "/m/analysis") => proxy_analysis(&url, agents, mowner.as_deref()),
         (Method::Get, "/m/ca") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
+        (Method::Get, "/m/cap-key") => text_resp(capability::public_key_hex(), "text/plain; charset=utf-8"),
+        (Method::Post, "/m/capability") => capability_ep(&mut req, agents, mowner.as_deref(), true),
         (Method::Get, "/m/direct") => {
             let t = query_param(&url, "target").unwrap_or_default();
             let rid = t.strip_prefix("relay://").unwrap_or(&t).trim_end_matches('/').to_string();
@@ -896,7 +906,7 @@ fn mcp_auth(url: &str) -> McpAuth {
 fn mcp_is_write(path: &str, url: &str) -> bool {
     const READ: &[&str] = &[
         "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
-        "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/compliance.csv", "/m/ca", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
+        "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/compliance.csv", "/m/ca", "/m/cap-key", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
         "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
     ];
     if READ.contains(&path) {
@@ -4067,6 +4077,66 @@ fn recording_delete(url: &str, user: Option<&str>) -> Resp {
         }
     }
     json_resp(&serde_json::json!({"ok": true}))
+}
+
+/// POST /m/capability — mint a short-lived, hub-signed permission slip for ONE
+/// operation on ONE device, so a controller that reaches the agent directly over
+/// the LAN still passes through the controls a proxied call would have hit.
+///
+/// The order below is the point of the endpoint and must not be rearranged: the
+/// token is the LAST thing that happens, after authorization, the deny-list, the
+/// per-device access record and the audit entry. An operator who is refused here
+/// gets the same `{"ok":false,"error":…}` the proxies return, and the controller
+/// is required to surface that rather than retry over the relay.
+///
+/// What this does NOT do is talk to the device. The hub is not in the data path
+/// for a direct call, so `audit` records the *grant*, not the completion — a
+/// controller that mints a capability and then drops the request leaves an audit
+/// entry for something that never ran. That is the same shape as the existing
+/// proxies (they audit before `dev_unary` too) and it is the conservative
+/// direction: an over-recorded grant, never an unrecorded execution.
+fn capability_ep(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("");
+    let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("");
+    let arg = v.get("arg").and_then(|x| x.as_str()).unwrap_or("");
+    if !capability::is_known_op(op) {
+        return json_resp(&serde_json::json!({"ok": false, "error": format!("unknown capability op '{op}'")}));
+    }
+    if !may_control(user, agents, target) {
+        return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}));
+    }
+    if let Err(e) = policy::enforce(capability::policy_kind(op), arg) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}));
+    }
+    let action = capability_action(op);
+    if via_mcp {
+        record_mcp_access(target, action, user.unwrap_or(""), arg);
+    }
+    audit(user.unwrap_or(""), if via_mcp { "mcp" } else { "browser" }, action, &device_name(agents, target), arg);
+    // The token names the device by its relay id, which is what the agent knows
+    // itself as — `relay://hc-…` and a bare `hc-…` are the same device here.
+    let rid = target.strip_prefix("relay://").unwrap_or(target).trim_end_matches('/');
+    let (cap, exp) = capability::mint(rid, op, arg);
+    json_resp(&serde_json::json!({"ok": true, "cap": cap, "exp": exp}))
+}
+
+/// The audit/access-log label for a capability grant. Deliberately distinct from
+/// the proxy labels ("run command", "input", …) so the log distinguishes a call
+/// the hub relayed from one it only authorized.
+fn capability_action(op: &str) -> &'static str {
+    match op {
+        "exec" => "grant: run command",
+        "launch" => "grant: launch command",
+        "input" => "grant: input",
+        "frame" => "grant: screenshot",
+        "camera" => "grant: camera",
+        "download" => "grant: download",
+        "upload" => "grant: upload",
+        _ => "grant: shell",
+    }
 }
 
 fn proxy_exec(req: &mut Request, agents: &Agents, user: Option<&str>, via_mcp: bool) -> Resp {

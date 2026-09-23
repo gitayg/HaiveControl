@@ -18,7 +18,16 @@ fn ca() -> &'static (String, KeyPair) {
     static CA: OnceLock<(String, KeyPair)> = OnceLock::new();
     CA.get_or_init(|| {
         let (cp, kp) = ca_paths();
-        if let (Ok(cert_pem), Ok(key_pem)) = (std::fs::read_to_string(&cp), std::fs::read_to_string(&kp)) {
+        // `ca.key` signs the leaf certs agents serve on the LAN, so a reader can
+        // impersonate any agent to a controller. It is loaded through
+        // `secretfile`, which refuses a key that is readable beyond its owner
+        // instead of using it anyway. NOTE: a hub that has been running since
+        // before this change has a 0644 `ca.key` on disk and will refuse it — the
+        // operator must `chmod 600 data/ca.key && chmod 700 data` on upgrade.
+        // `ca.crt` is public and is left alone.
+        let stored_key = crate::secretfile::read_secret(&kp)
+            .unwrap_or_else(|e| panic!("CA key unusable: {e}"));
+        if let (Ok(cert_pem), Some(key_pem)) = (std::fs::read_to_string(&cp), stored_key) {
             if let Ok(key) = KeyPair::from_pem(&key_pem) {
                 return (cert_pem, key);
             }
@@ -31,9 +40,14 @@ fn ca() -> &'static (String, KeyPair) {
         let key = KeyPair::generate().expect("ca key");
         let cert = params.self_signed(&key).expect("ca self-signed");
         let cert_pem = cert.pem();
-        let _ = std::fs::create_dir_all(data_dir());
+        crate::secretfile::ensure_private_dir(&data_dir())
+            .unwrap_or_else(|e| panic!("cannot create {}: {e}", data_dir().display()));
         let _ = std::fs::write(&cp, &cert_pem);
-        let _ = std::fs::write(&kp, key.serialize_pem());
+        // Fatal, not best-effort: a CA key that failed to persist is regenerated
+        // on the next restart, which silently invalidates every leaf already
+        // issued and every controller that pinned the old CA.
+        crate::secretfile::write_new_secret(&kp, &key.serialize_pem())
+            .unwrap_or_else(|e| panic!("cannot persist {}: {e}", kp.display()));
         (cert_pem, key)
     })
 }
