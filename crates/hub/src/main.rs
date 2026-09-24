@@ -22,7 +22,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.14.2";
+const VERSION: &str = "3.14.3";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -2080,12 +2080,20 @@ fn owner_tokens() -> &'static Mutex<HashMap<String, String>> {
 }
 fn owner_tokens_path() -> std::path::PathBuf { data_dir().join("owner_tokens.json") }
 fn save_owner_tokens() {
-    let _ = std::fs::create_dir_all(data_dir());
+    // These map an enrollment token to the owner it claims devices for, so the
+    // file is as sensitive as the keys next to it: whoever reads a token can
+    // enroll devices as that owner. It went out 0644 for the same reason ca.key
+    // did — plain `std::fs::write` — so it goes through `secretfile` now.
+    let _ = secretfile::ensure_private_dir(&data_dir());
     let m = owner_tokens().lock().unwrap();
-    let _ = std::fs::write(owner_tokens_path(), serde_json::to_string(&*m).unwrap_or_default());
+    let _ = secretfile::write_secret(&owner_tokens_path(), &serde_json::to_string(&*m).unwrap_or_default());
 }
 fn load_owner_tokens() {
-    if let Ok(txt) = std::fs::read_to_string(owner_tokens_path()) {
+    // Reading through `secretfile` is what retro-tightens the 0644 file an older
+    // hub left behind, and logs that it was exposed. Unlike the signing keys a
+    // missing or unreadable token map is not fatal — it just means no tokens are
+    // loaded — so the error is swallowed here as it always was.
+    if let Ok(Some(txt)) = secretfile::read_secret(&owner_tokens_path()) {
         if let Ok(m) = serde_json::from_str::<HashMap<String, String>>(&txt) {
             *owner_tokens().lock().unwrap() = m;
         }

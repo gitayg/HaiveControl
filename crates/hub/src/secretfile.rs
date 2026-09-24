@@ -63,7 +63,12 @@ pub fn read_secret(path: &Path) -> io::Result<Option<String>> {
             // not entitled to paper over, and it is refused.
             match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
                 Ok(()) => {
-                    eprintln!(
+                    // println!, not eprintln!: the hub logs entirely on stdout
+                    // (it contains no other eprintln!), and the container log
+                    // view does not surface stderr — a warning nobody can read
+                    // would make tightening-instead-of-refusing indefensible,
+                    // because the audit record IS the justification.
+                    println!(
                         "SECURITY: {} was mode {:04o} — readable beyond its owner — and has been \
                          tightened to 0600. It was exposed for as long as it sat there, so treat \
                          it as compromised and rotate it when you can.",
@@ -118,4 +123,33 @@ pub fn write_new_secret(path: &Path, contents: &str) -> io::Result<()> {
     let mut f = opts.open(path)?;
     f.write_all(contents.as_bytes())?;
     f.sync_all()
+}
+
+/// Write a secret that is REWRITTEN over its lifetime — a token map gains and
+/// loses entries — so unlike `write_new_secret` an existing file is expected and
+/// truncating it is correct.
+///
+/// `.mode()` only applies when open(2) actually creates the file, so a file that
+/// already exists keeps whatever mode it had. That is precisely the case that
+/// matters here: anything written before this module existed is sitting at 0644.
+/// Hence the explicit `set_permissions` after the write rather than trusting the
+/// open flags to have done it.
+pub fn write_secret(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }

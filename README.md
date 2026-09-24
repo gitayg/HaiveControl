@@ -184,8 +184,9 @@ Reaching an agent directly must not become a way around the hub's policy, so a d
 
 So the audit record is written before the command runs, on the LAN path exactly as on the relay path.
 
-The hub's private keys — the CA key that signs agent leaf certs, and the capability signing key —
-are written `0600` inside a `0700` data directory, created that way at `open(2)` time so they are
+The hub's secrets on disk — the CA key that signs agent leaf certs, the capability signing key, and
+the owner enrollment tokens in `owner_tokens.json` (whoever reads one can enroll devices as that
+owner) — are written `0600` inside a `0700` data directory, created that way at `open(2)` time so they are
 never briefly world-readable. A key found with any group or other permission bit is **tightened and
 reported** as a `SECURITY:` line telling you to rotate it — a hub upgrading from an older version has
 a `0644 ca.key`, and refusing to start would add an outage to an exposure that already happened
