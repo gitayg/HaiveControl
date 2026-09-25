@@ -1,6 +1,4 @@
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The IT-AI Authors.
-// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // it-ai-hub — runs on the Mac. Advertises a Mac ID over Bonjour, collects agent
 // registrations, and serves a dashboard + JSON list of registered devices.
@@ -22,7 +20,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.14.3";
+const VERSION: &str = "3.14.4";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting

@@ -1,6 +1,4 @@
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The IT-AI Authors.
-// SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Owner-only persistence for the hub's private keys.
 //!

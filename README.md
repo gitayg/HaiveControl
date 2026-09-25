@@ -4,7 +4,11 @@
 built-in **MCP interface** — so an AI (Claude, etc.) can see the screen, run commands,
 and move files across a whole fleet of devices from one place.
 
-![license: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)
+![license: Elastic-2.0](https://img.shields.io/badge/license-Elastic--2.0-blue)
+
+> **Source-available under the Elastic License 2.0** — free to self-host for your own organization; see [LICENSE](LICENSE). The IT-AI **agent**
+> (the endpoint agent, MCP server and `itai` CLI) is a separate, **MIT-licensed** project:
+> [gitayg/haive-agent](https://github.com/gitayg/haive-agent).
 
 A tiny single-file tool for **your own machines** (Windows, macOS, Linux). One binary
 runs on each target: it streams the full screen, accepts mouse + keyboard control, runs
@@ -647,11 +651,12 @@ point the shortcut at a small `.bat` that does `set SCREEN_PW=… & it-ai.exe`.
 
 ## License
 
-IT-AI is free software licensed under the **GNU Affero General Public License
-v3.0 or later** (AGPL-3.0-or-later) — see [LICENSE](LICENSE). In short: you may use,
-modify, and redistribute it, but if you run a modified version as a network service,
-you must offer that service's users the corresponding source. It comes with **no
-warranty**.
+The hub is licensed under the **Elastic License 2.0** (`Elastic-2.0`) — see [LICENSE](LICENSE).
+Free to run for your own organization; offering it as a hosted or managed service to
+others needs a commercial licence. It comes with **no warranty**.
+
+The endpoint agent, MCP server and `itai` CLI are a separate project under the **MIT**
+license: [gitayg/haive-agent](https://github.com/gitayg/haive-agent).
 
 ## Intended use
 

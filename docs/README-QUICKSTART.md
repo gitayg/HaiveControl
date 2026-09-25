@@ -4,7 +4,7 @@ Stand up a hub, enroll one device, ask the AI to diagnose it, and approve your f
 fix — all in under five minutes, on your own infrastructure. No cloud account, no
 inbound firewall holes.
 
-IT-AI is a self-hosted, open-source (AGPL-3.0) IT-management tool: a single lightweight
+IT-AI is a self-hosted IT-management tool (hub under the Elastic License 2.0, agent MIT): a single lightweight
 Rust endpoint agent, a reverse-tunnel hub, and a 30-tool MCP server that lets an AI
 inspect machines autonomously and fix them only with your approval.
 

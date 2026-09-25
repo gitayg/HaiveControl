@@ -58,4 +58,5 @@ EXPOSE 8770
 # AppCrane requires a non-root runtime user.
 RUN useradd -m -u 1000 hive && mkdir -p /data && chown -R hive:hive /app /data
 USER hive
+LABEL org.opencontainers.image.licenses="Elastic-2.0"
 CMD ["/app/it-ai-hub"]

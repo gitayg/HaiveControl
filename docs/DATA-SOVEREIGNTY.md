@@ -73,10 +73,12 @@ Self-hosting doesn't make you invulnerable — it changes *who* your fate depend
 - **No vendor credential in your trust path.** No vendor-held key, session, or support
   backdoor can be stolen to reach your machines. The trust anchors are secrets *you*
   generate and hold.
-- **Open source is auditable.** IT-AI is AGPL-3.0. You (or your security team) can read
-  exactly what the agent and hub do — no opaque cloud service to take on faith. The AGPL
-  also keeps the self-hostable form open: a modified network deployment must offer its
-  source to its users.
+- **The code on your endpoints is auditable.** The agent, MCP server and CLI are open source
+  under MIT. You (or your security team) can read exactly what runs on every machine you
+  manage — no opaque binary to take on faith, and every release carries signed build
+  provenance. The hub is licensed under the Elastic License 2.0 and runs on infrastructure
+  you control; its source is not public, so the part you can audit line by line is the part
+  that holds privileges on your endpoints.
 
 ---
 

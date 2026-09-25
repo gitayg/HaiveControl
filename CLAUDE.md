@@ -32,3 +32,20 @@ Devices are real people's machines, though — act carefully on them (see below)
   for elevation tests and don't kill, grant, or revoke on them without need.
 - **Release order:** release `haive-agent` (tag → CI) before deploying the hub; the hub
   Dockerfile pulls agents from the public release and `AGENT_REV` must be bumped to bust the cache.
+- **Every agent release is two bumps:** `ARG AGENT_REV` in the Dockerfile AND the AppCrane
+  `AGENT_VERSION` secret. The secret overrides the Dockerfile's `ENV` at runtime, so bumping only
+  `AGENT_REV` makes the dashboard advertise the old version and offer agents a downgrade. Never
+  set the secret to an empty string — that falls through to the hub's own `VERSION`.
+
+## Licensing
+
+The hub is **Elastic License 2.0** (`Elastic-2.0`), source private — the same model as the
+MoorAI server (`RAISEME-server`), whose `LICENSE` this repo's is a verbatim copy of. Free to
+self-host for your own organization; offering it to third parties as a hosted service needs a
+commercial licence. The agent repo (`haive-agent`) is **MIT**. Itay Glick is the sole copyright
+holder, which is what makes commercial exceptions possible — so no second copyright line, and
+new contributors sign a CLA.
+
+Source files carry **no per-file license header**, matching MoorAI's server. Don't add
+`SPDX-License-Identifier` lines, and never reintroduce `AGPL-3.0-or-later` or
+"The IT-AI Authors": both shipped here until 3.14.4 and contradicted the actual licence.

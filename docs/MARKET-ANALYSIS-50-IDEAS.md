@@ -90,10 +90,10 @@ Tagged by effort **[S]mall / [M]edium / [L]arge** and priority **★** (do-first
 ### F. Open-source GTM, packaging & ecosystem
 
 41. **★[S] Single-binary, minutes-to-deploy install.** Lean hard into your existing single-Rust-agent + self-contained-hub strength: one-command install script, embedded DB, <5-min setup. This is *the* strongest OSS adoption lever (Headscale/GoatCounter/OpenObserve all sell on it).
-42. **★[S] Deliberate license choice + clarity.** You're AGPL — good defensive moat for a self-hostable SaaS-alternative. Make it explicit and consider an Apache-licensed *agent/SDK* to maximize embedding while AGPL protects the hub. Procurement filters on license.
+42. **★[S] Deliberate license choice + clarity.** *Done (2026-09): agent MIT, hub Elastic-2.0 — AGPL was dropped because it does not stop a rival hosting the unmodified hub as a service; ELv2 does.* Original note: You're AGPL — good defensive moat for a self-hostable SaaS-alternative. Make it explicit and consider an Apache-licensed *agent/SDK* to maximize embedding while AGPL protects the hub. Procurement filters on license.
 43. **[M] Public tool/plugin registry.** Formalize the plugin manifest system into a shareable community registry (like TacticalRMM's community-scripts you already query) — network effects + ecosystem lock-in.
 44. **[S] Killer docs + one-glance architecture page.** GitHub stars are the OSS trust proxy; frictionless quickstart + a clear "how the reverse tunnel keeps you safe" page convert. Data-sovereignty is the headline given the SaaS-RMM breach wave.
-45. **[M] Managed/hosted upsell tier.** Offer an optional hosted control plane for those who don't want to self-host — AGPL protects you from resellers while you monetize convenience.
+45. **[M] Managed/hosted upsell tier.** Offer an optional hosted control plane for those who don't want to self-host — AGPL protects you from resellers while you monetize convenience. *(Now: the hub's Elastic License 2.0 is what forbids resellers hosting it as a service; AGPL never did.)*
 46. **[S] Benchmarks vs incumbents.** Publish agent footprint (CPU/RAM/binary size) vs bloated legacy agents; "our agent won't get quarantined by Defender" (cf. the May 2026 Datto `cagservice.exe` false-positive incident) is a concrete, timely message.
 
 ### G. Performance, reliability & agent footprint
