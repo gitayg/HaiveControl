@@ -36,6 +36,14 @@ Devices are real people's machines, though — act carefully on them (see below)
   `AGENT_VERSION` secret. The secret overrides the Dockerfile's `ENV` at runtime, so bumping only
   `AGENT_REV` makes the dashboard advertise the old version and offer agents a downgrade. Never
   set the secret to an empty string — that falls through to the hub's own `VERSION`.
+- **The AppCrane log view shows stdout only.** Anything the hub must be seen saying goes through
+  `println!`, never `eprintln!` (a stderr-only SECURITY warning once reached nobody). A restart
+  loop shows up as repeated `IT-AI hub <ver>` banners; since 3.14.5 `crashlog.rs` puts the reason
+  in front of them: a `PANIC in thread … at file:line` line means a code bug, while `mem:` lines
+  (cgroup usage vs. the 512 MB limit, plus the cgroup `oom_kill` counter, also printed at startup)
+  climbing toward the limit with no PANIC line mean the memory limit killed it. Worker-thread
+  panics do NOT restart the hub (default unwind), so a restart needs a main-thread panic or an
+  outside kill. Don't infer "no stack trace, so OOM" — before 3.14.5 a panic was invisible too.
 
 ## Licensing
 

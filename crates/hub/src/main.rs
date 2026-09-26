@@ -12,6 +12,7 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod crashlog;
 mod relay;
 mod capability;
 mod secretfile;
@@ -20,7 +21,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.14.4";
+const VERSION: &str = "3.14.5";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -45,6 +46,9 @@ struct Agent {
 struct Args {}
 
 fn main() {
+    // First, so a panic anywhere after this — including during startup — is
+    // reported on stdout, where the AppCrane log view can see it.
+    crashlog::install();
     Args::parse();
     // PORT is what PaaS platforms (AppCrane) inject; HUB_PORT is the local name.
     let port: u16 = std::env::var("PORT")
