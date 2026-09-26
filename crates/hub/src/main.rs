@@ -21,7 +21,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.14.6";
+const VERSION: &str = "3.14.7";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -3714,12 +3714,30 @@ fn update_cooldown() -> &'static Mutex<HashMap<String, Instant>> {
     static C: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// The agent version this hub serves at /bin — AGENT_VERSION (set from the
+/// Dockerfile's AGENT_REV, or the AppCrane secret that overrides it). The agent is
+/// a SEPARATE version line from the hub (agent 3.5.x, hub 3.14.x); falling back to
+/// the hub's VERSION is only right for a hub built before the two split.
+fn served_agent_version() -> String {
+    std::env::var("AGENT_VERSION").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| VERSION.to_string())
+}
+/// Whether a device reporting `reported` should be pushed the served build.
+///
+/// This used to compare against the hub's own VERSION. Once the agent and hub
+/// version lines diverged that was never equal, so with agent_update=auto every
+/// agent was "stale" forever: the hub pushed /update every 5 min, the agent
+/// reinstalled the identical binary and re-exec'd, and each push was a ~10 MB
+/// download through /bin.
+fn needs_update(reported: &str, served: &str) -> bool {
+    reported != served
+}
 /// When agent_update=auto, push updates to devices whose reported agent version
-/// is behind the hub's served build (5-min per-device cooldown).
+/// differs from the served agent build (5-min per-device cooldown).
 fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
     if setting_str("agent_update", "manual") != "auto" {
         return;
     }
+    let served = served_agent_version();
     let stale: Vec<(String, String, String)> = {
         let guard = agents.lock().unwrap();
         guard
@@ -3727,7 +3745,7 @@ fn auto_update_pass(agents: &Agents, hub_ip: &str, hub_port: u16) {
             .filter_map(|a| {
                 let d = &a.data;
                 let ver = d.get("agent_version").and_then(|x| x.as_str())?;
-                if ver == VERSION {
+                if !needs_update(ver, &served) {
                     return None;
                 }
                 let platform = d.get("platform").and_then(|x| x.as_str())?.to_string();
@@ -4724,7 +4742,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
     // SEPARATE version line from the hub itself — set AGENT_VERSION to the current
     // agent release (matches the Dockerfile AGENT_REV). Falls back to the hub version
     // only if unset (legacy behavior).
-    let hb_agent_ver = std::env::var("AGENT_VERSION").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| VERSION.to_string());
+    let hb_agent_ver = served_agent_version();
     let hb = format!(
         "<script>window.HB={{base:\"{}\",mtok:\"{}\",owner:\"{}\",ver:\"{}\",agent_ver:\"{}\"}}</script>",
         hb_base.replace('"', ""),
@@ -5698,5 +5716,30 @@ mod ai_history_tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "user");
         assert_eq!(out[0]["content"], "real question");
+    }
+}
+
+#[cfg(test)]
+mod auto_update_tests {
+    use super::{needs_update, VERSION};
+
+    /// The Sept 2026 loop: fleet on agent 3.5.1, hub serving 3.5.1, hub itself
+    /// 3.14.x. An up-to-date agent must be left alone, whatever the hub's own
+    /// version is.
+    #[test]
+    fn current_agent_is_left_alone() {
+        assert!(!needs_update("3.5.1", "3.5.1"));
+        assert_ne!(VERSION, "3.5.1", "the hub and agent version lines are separate");
+    }
+
+    #[test]
+    fn older_agent_is_updated() {
+        assert!(needs_update("3.5.0", "3.5.1"));
+    }
+
+    /// Rollback: moving AGENT_REV back must pull newer agents back to it.
+    #[test]
+    fn newer_agent_is_rolled_back() {
+        assert!(needs_update("3.5.2", "3.5.1"));
     }
 }

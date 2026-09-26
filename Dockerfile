@@ -20,13 +20,12 @@ COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # AGENT_REV PINS the agent release served at /bin — every URL below is
 # releases/download/v${AGENT_REV}, never `latest`. It used to fetch `latest` and
 # use AGENT_REV only as a cache-buster, so the version served was whatever was
-# newest at build time while AGENT_VERSION (below) advertised AGENT_REV. When those
-# disagreed (serving 3.5.1, advertising 3.5.0) every agent saw a mismatch, pulled
-# the binary, reinstalled the identical file and re-exec'd — every 5-7 minutes,
-# forever — and the resulting download stream OOM-killed the hub about hourly.
-# Pinning makes the served binary and the advertised version the same number by
-# construction. A bad AGENT_REV now fails the BUILD (curl -f) instead of shipping
-# a hub that serves the wrong agent.
+# newest at build time, not what AGENT_VERSION (below) says is served. That match
+# is load-bearing: hub auto-update pushes any agent whose version differs from
+# AGENT_VERSION, so if the served binary were a different version, every agent
+# would install it, report that version, and be pushed again — forever. Pinning
+# makes the two the same number by construction, and a bad AGENT_REV fails the
+# BUILD (curl -f + exit 1) instead of shipping a hub that serves the wrong agent.
 ARG AGENT_REV=3.5.1
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \

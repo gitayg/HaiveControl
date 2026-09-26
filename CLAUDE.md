@@ -37,11 +37,18 @@ Devices are real people's machines, though — act carefully on them (see below)
 - **The served agent and the advertised agent MUST be the same version.** Two knobs set them:
   `ARG AGENT_REV` (what `/bin` serves) and the AppCrane `AGENT_VERSION` secret (what the hub tells
   agents is current; it overrides the Dockerfile's `ENV AGENT_VERSION` at runtime). Bump both, to
-  the same value, every agent release. If they differ, every agent sees a mismatch, downloads the
-  binary, reinstalls the identical file and re-execs — every 5-7 minutes, forever. That loop
-  OOM-killed the hub hourly in Sept 2026 (served 3.5.1, advertised 3.5.0). Never set the secret to
-  an empty string — that falls through to the hub's own `VERSION`. Deleting the secret in the
-  AppCrane dashboard would leave AGENT_REV as the single source.
+  the same value, every agent release. With `agent_update: auto` (in /data/settings.json) the hub
+  pushes /update to every agent whose version differs from AGENT_VERSION (`needs_update`), and the
+  agent reinstalls whatever it downloads — so if the served binary's version differs from
+  AGENT_VERSION, every agent loops: install, report the served version, get pushed again, every
+  ~5 minutes. Never set the secret to an empty string — that falls through to the hub's own
+  `VERSION`. Deleting the secret in the AppCrane dashboard would leave AGENT_REV as the single source.
+- **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
+  compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
+  with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed
+  3.14.7; test `auto_update_tests`). (2) `serve_bin` read each ~10 MB binary whole into memory, so
+  that download stream — plus every agent's own 120 s poll, which downloads the full binary each
+  time — grew the hub until the 512 MB limit killed it (fixed 3.14.6, streamed; 908 MB → 8 MB peak).
 - **The AppCrane log view shows stdout only.** Anything the hub must be seen saying goes through
   `println!`, never `eprintln!` (a stderr-only SECURITY warning once reached nobody). A restart
   loop shows up as repeated `IT-AI hub <ver>` banners; since 3.14.5 `crashlog.rs` puts the reason
