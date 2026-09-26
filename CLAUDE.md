@@ -30,12 +30,18 @@ Devices are real people's machines, though — act carefully on them (see below)
 - **Test devices:** the Windows test box is DESKTOP-JOL2MB8 ("the Atom Computer"). Other
   devices (lvo, felix.gomez, trinh, Baruch, kiosk) are in active use — use throwaway accounts
   for elevation tests and don't kill, grant, or revoke on them without need.
-- **Release order:** release `haive-agent` (tag → CI) before deploying the hub; the hub
-  Dockerfile pulls agents from the public release and `AGENT_REV` must be bumped to bust the cache.
-- **Every agent release is two bumps:** `ARG AGENT_REV` in the Dockerfile AND the AppCrane
-  `AGENT_VERSION` secret. The secret overrides the Dockerfile's `ENV` at runtime, so bumping only
-  `AGENT_REV` makes the dashboard advertise the old version and offer agents a downgrade. Never
-  set the secret to an empty string — that falls through to the hub's own `VERSION`.
+- **Release order:** release `haive-agent` (tag → CI) before deploying the hub. Since 3.14.6 the
+  Dockerfile downloads agents from `releases/download/v${AGENT_REV}` — `AGENT_REV` PINS the served
+  release, and a tag that doesn't exist fails the build. (Before 3.14.6 it fetched `latest` and
+  AGENT_REV only busted the cache, so the served version was whatever was newest at build time.)
+- **The served agent and the advertised agent MUST be the same version.** Two knobs set them:
+  `ARG AGENT_REV` (what `/bin` serves) and the AppCrane `AGENT_VERSION` secret (what the hub tells
+  agents is current; it overrides the Dockerfile's `ENV AGENT_VERSION` at runtime). Bump both, to
+  the same value, every agent release. If they differ, every agent sees a mismatch, downloads the
+  binary, reinstalls the identical file and re-execs — every 5-7 minutes, forever. That loop
+  OOM-killed the hub hourly in Sept 2026 (served 3.5.1, advertised 3.5.0). Never set the secret to
+  an empty string — that falls through to the hub's own `VERSION`. Deleting the secret in the
+  AppCrane dashboard would leave AGENT_REV as the single source.
 - **The AppCrane log view shows stdout only.** Anything the hub must be seen saying goes through
   `println!`, never `eprintln!` (a stderr-only SECURITY warning once reached nobody). A restart
   loop shows up as repeated `IT-AI hub <ver>` banners; since 3.14.5 `crashlog.rs` puts the reason

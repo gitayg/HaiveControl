@@ -21,7 +21,7 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 
-const VERSION: &str = "3.14.5";
+const VERSION: &str = "3.14.6";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -234,6 +234,13 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         serve_staged(req, &path[14..]);
         return;
     }
+    // Agent binaries too. Every self-update pulls one (~10 MB), and holding each in
+    // a Cursor meant a fleet stuck re-downloading grew the hub ~10 MB a pull until
+    // the 512 MB limit killed it — roughly hourly, taking every tunnel with it.
+    if method == Method::Get && path.starts_with("/bin/") {
+        serve_bin(req, &path[5..]);
+        return;
+    }
     // Agents can't pass the PaaS SSO (headless), so /relay is SSO-bypassed — which
     // means the hub must authenticate them itself. If RELAY_TOKEN is set, every
     // /relay call must carry ?tok=<token>. Unset = open (trusted LAN / dev).
@@ -387,7 +394,6 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/install.ps1") => text_resp(install_ps1(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
         (Method::Get, "/install.sh") => text_resp(install_sh(hub_ip, hub_port, mac_id), "text/plain; charset=utf-8"),
         (Method::Get, "/ca.crt") => text_resp(ca::ca_cert_pem(), "application/x-pem-file"),
-        (Method::Get, p) if p.starts_with("/bin/") => serve_bin(&p[5..]),
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
@@ -964,25 +970,33 @@ fn asset(bytes: &'static [u8], ct: &str, gz: bool) -> Resp {
     maybe_gzip(bytes.to_vec(), ct, gz).with_header(hdr("Cache-Control", "max-age=86400"))
 }
 
-fn serve_bin(name: &str) -> Resp {
+/// GET /bin/<name> — streamed from disk, never read whole into memory (see the
+/// dispatch comment for the incident that made this matter).
+fn serve_bin(req: Request, name: &str) {
     if name.is_empty() || name.contains('/') || name.contains("..") {
-        return Response::from_string("bad name").with_status_code(400);
+        let _ = req.respond(Response::from_string("bad name").with_status_code(400));
+        return;
     }
     let dir = std::env::var("HUB_DIST").unwrap_or_else(|_| "dist".to_string());
-    match std::fs::read(std::path::Path::new(&dir).join(name)) {
-        Ok(bytes) => {
-            let ct = if name.ends_with(".js") {
-                "text/javascript; charset=utf-8"
-            } else if name.ends_with(".css") {
-                "text/css; charset=utf-8"
-            } else if name.ends_with(".svg") {
-                "image/svg+xml"
-            } else {
-                "application/octet-stream"
-            };
-            Response::from_data(bytes).with_header(hdr("Content-Type", ct))
+    let ct = if name.ends_with(".js") {
+        "text/javascript; charset=utf-8"
+    } else if name.ends_with(".css") {
+        "text/css; charset=utf-8"
+    } else if name.ends_with(".svg") {
+        "image/svg+xml"
+    } else {
+        "application/octet-stream"
+    };
+    let file = std::fs::File::open(std::path::Path::new(&dir).join(name));
+    let len = file.as_ref().ok().and_then(|f| f.metadata().ok()).map(|m| m.len() as usize);
+    match (file, len) {
+        (Ok(f), Some(n)) => {
+            let resp = Response::new(StatusCode(200), vec![hdr("Content-Type", ct)], f, Some(n), None);
+            let _ = req.respond(resp);
         }
-        Err(_) => Response::from_string("not found").with_status_code(404),
+        _ => {
+            let _ = req.respond(Response::from_string("not found").with_status_code(404));
+        }
     }
 }
 

@@ -17,25 +17,30 @@ COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # anonymous download; no token needed) so the image always ships current agents
 # (install command + auto-update both use these).
 #
-# AGENT_REV exists ONLY to bust this layer's Docker cache. The RUN below fetches
-# `releases/latest`, but its cache key doesn't change when a new agent is released
-# — so redeploying the hub would silently keep serving the OLD binaries (it only
-# refreshed by luck, when a hub-source change happened to invalidate the layer).
-# Bump this to the agent version you want picked up whenever you cut an agent release.
-ARG AGENT_REV=3.5.0
+# AGENT_REV PINS the agent release served at /bin — every URL below is
+# releases/download/v${AGENT_REV}, never `latest`. It used to fetch `latest` and
+# use AGENT_REV only as a cache-buster, so the version served was whatever was
+# newest at build time while AGENT_VERSION (below) advertised AGENT_REV. When those
+# disagreed (serving 3.5.1, advertising 3.5.0) every agent saw a mismatch, pulled
+# the binary, reinstalled the identical file and re-exec'd — every 5-7 minutes,
+# forever — and the resulting download stream OOM-killed the hub about hourly.
+# Pinning makes the served binary and the advertised version the same number by
+# construction. A bad AGENT_REV now fails the BUILD (curl -f) instead of shipping
+# a hub that serves the wrong agent.
+ARG AGENT_REV=3.5.1
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
  && for a in it-ai-linux it-ai-linux-arm64 it-ai-macos it-ai-windows.exe \
              it-ai-linux.deb it-ai-linux-arm64.deb \
              it-ai-mcp-linux it-ai-mcp-linux-arm64 it-ai-mcp-macos it-ai-mcp-windows.exe; do \
-      curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a" -o "/app/dist/$a"; \
-      curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/$a.sig" -o "/app/dist/$a.sig" \
+      curl -fsSL "https://github.com/gitayg/haive-agent/releases/download/v${AGENT_REV}/$a" -o "/app/dist/$a" || exit 1; \
+      curl -fsSL "https://github.com/gitayg/haive-agent/releases/download/v${AGENT_REV}/$a.sig" -o "/app/dist/$a.sig" \
         || echo "no signature for $a yet (agents ≥3.0.7 require it for verified self-update)"; \
     done
 # Published checksums, served at /bin/SHA256SUMS, so the 'crane' install source can
 # verify integrity too. Non-fatal if a release predates checksums.
-RUN curl -fsSL "https://github.com/gitayg/haive-agent/releases/latest/download/SHA256SUMS" \
-      -o /app/dist/SHA256SUMS || echo "no SHA256SUMS in latest release yet"
+RUN curl -fsSL "https://github.com/gitayg/haive-agent/releases/download/v${AGENT_REV}/SHA256SUMS" \
+      -o /app/dist/SHA256SUMS || echo "no SHA256SUMS in v${AGENT_REV}"
 # Leaflet for the device map's real basemap (served at /bin/leaflet.*). Non-fatal:
 # if the fetch fails the map falls back to the offline graticule.
 RUN curl -fsSL "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" -o /app/dist/leaflet.js \
