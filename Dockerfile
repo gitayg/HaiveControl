@@ -26,7 +26,7 @@ COPY --from=build /src/target/release/it-ai-hub /app/it-ai-hub
 # would install it, report that version, and be pushed again — forever. Pinning
 # makes the two the same number by construction, and a bad AGENT_REV fails the
 # BUILD (curl -f + exit 1) instead of shipping a hub that serves the wrong agent.
-ARG AGENT_REV=3.5.1
+ARG AGENT_REV=3.5.2
 RUN echo "agent rev: $AGENT_REV" \
  && mkdir -p /app/dist \
  && for a in it-ai-linux it-ai-linux-arm64 it-ai-macos it-ai-windows.exe \
