@@ -20,8 +20,9 @@ mod policy;
 mod mcptokens;
 mod monitor;
 mod elevation;
+mod jobs;
 
-const VERSION: &str = "3.14.8";
+const VERSION: &str = "3.15.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -170,14 +171,14 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     }
     // /x/set-owner is an ownership op (behind SSO) — it must work on devices the
     // caller doesn't yet own, so it's exempt from the may_control target gate.
-    if path.starts_with("/x/") && path != "/x/exec" && path != "/x/set-owner" {
+    if path.starts_with("/x/") && path != "/x/exec" && path != "/x/job/start" && path != "/x/set-owner" {
         if let Some(t) = query_param(&url, "target") {
             if !may_control(user.as_deref(), agents, &t) {
                 let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                 return;
             }
             if auditable(&path) {
-                audit(user.as_deref().unwrap_or(""), "browser", action_label(&path), &device_name(agents, &t), "");
+                audit(user.as_deref().unwrap_or(""), "browser", action_label(&path), &device_name(agents, &t), &jobs::audit_detail(&path, &url));
             }
         }
     }
@@ -209,15 +210,15 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 }
             }
         }
-        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/input" | "/m/capability" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
+        if !matches!(path.as_str(), "/m/agents" | "/m/exec" | "/m/job/start" | "/m/input" | "/m/capability" | "/m/sys" | "/m/script" | "/m/script-fleet" | "/m/set-owner") {
             if let Some(t) = query_param(&url, "target") {
                 if !may_control(mowner.as_deref(), agents, &t) {
                     let _ = req.respond(Response::from_string("forbidden").with_status_code(403));
                     return;
                 }
-                record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""), "");
+                record_mcp_access(&t, mcp_action(&path), mowner.as_deref().unwrap_or(""), &jobs::audit_detail(&path, &url));
                 if auditable(&path) {
-                    audit(mowner.as_deref().unwrap_or(""), "mcp", action_label(&path), &device_name(agents, &t), "");
+                    audit(mowner.as_deref().unwrap_or(""), "mcp", action_label(&path), &device_name(agents, &t), &jobs::audit_detail(&path, &url));
                 }
             }
         }
@@ -424,6 +425,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
+        (Method::Post, "/x/job/start") => jobs::start(&mut req, &url, agents, user.as_deref(), false),
+        (Method::Get, "/x/job/logs") => jobs::logs(&url),
+        (Method::Post, "/x/job/stop") => jobs::stop(&url),
+        (Method::Get, "/x/job/list") => jobs::list(&url),
         (Method::Post, "/x/shell/open") => proxy_shell_open(&url, agents),
         (Method::Get, "/x/recordings") => recordings_list(user.as_deref()),
         (Method::Get, "/x/recording") => recording_get(&url, user.as_deref()),
@@ -449,6 +454,10 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/camera") => proxy_camera(&url),
         (Method::Post, "/m/exec") => proxy_exec(&mut req, agents, mowner.as_deref(), true),
         (Method::Post, "/m/input") => proxy_input(&mut req, agents, mowner.as_deref()),
+        (Method::Post, "/m/job/start") => jobs::start(&mut req, &url, agents, mowner.as_deref(), true),
+        (Method::Get, "/m/job/logs") => jobs::logs(&url),
+        (Method::Post, "/m/job/stop") => jobs::stop(&url),
+        (Method::Get, "/m/job/list") => jobs::list(&url),
         (Method::Get, "/m/sys") => proxy_sys(&url, agents, mowner.as_deref(), true),
         (Method::Post, "/m/ai-chat") => ai_chat_ep(&mut req, &url, agents, mowner.as_deref()),
         (Method::Post, "/m/ai-apply") => ai_apply_ep(&mut req, &url, agents, mowner.as_deref()),
@@ -629,6 +638,8 @@ fn mcp_action(path: &str) -> &'static str {
         "/m/dissolve" => "dissolve",
         "/m/exec" => "run command",
         "/m/input" => "input",
+        "/m/job/start" => jobs::START_LABEL,
+        "/m/job/stop" => jobs::STOP_LABEL,
         _ => "access",
     }
 }
@@ -817,6 +828,8 @@ fn action_label(path: &str) -> &'static str {
         "/update" => "update agent",
         "/dissolve" => "dissolve agent",
         "/shell/open" => "open shell",
+        "/job/start" => jobs::START_LABEL,
+        "/job/stop" => jobs::STOP_LABEL,
         _ => "access",
     }
 }
@@ -824,7 +837,7 @@ fn action_label(path: &str) -> &'static str {
 /// Whether a device-action path is worth an audit entry (skips noisy polls).
 fn auditable(path: &str) -> bool {
     let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
-    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open")
+    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open" | "/job/start" | "/job/stop")
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -915,7 +928,7 @@ fn mcp_is_write(path: &str, url: &str) -> bool {
     const READ: &[&str] = &[
         "/m/agents", "/m/actions", "/m/ai-chat", "/m/ai-plan", "/m/ai-explain", "/m/analysis",
         "/m/alerts", "/m/fleet-report", "/m/inventory-history", "/m/compliance.csv", "/m/ca", "/m/cap-key", "/m/camera", "/m/compliance-fleet", "/m/cve", "/m/direct", "/m/download",
-        "/m/file-status", "/m/frame", "/m/geo", "/m/plugins", "/m/scripts",
+        "/m/file-status", "/m/frame", "/m/geo", "/m/job/list", "/m/job/logs", "/m/plugins", "/m/scripts",
     ];
     if READ.contains(&path) {
         return false;
@@ -4752,7 +4765,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         hb_agent_ver.replace('"', "")
     );
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}</style></head>\n<body>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}{jobs_css}</style></head>\n<body>\
 <div class=\"app\">\
 <button id=\"navtoggle\" class=\"navtoggle\" onclick=\"toggleNav()\" aria-label=\"menu\">☰</button>\
 <div id=\"navback\" class=\"navback\" onclick=\"toggleNav()\"></div>\
@@ -4803,14 +4816,15 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div id=\"d-activity\"></div>\
 <div id=\"d-analysis\" class=\"an-panel\"></div>\
 <div id=\"d-controls\"></div>\
+<div id=\"d-jobs\" class=\"an-panel\"></div>\
 <div id=\"ai-panel\" style=\"display:none\"><div class=\"ai-head\"><span>🤖 AI assistant <span class=\"dim2\">— read-only diagnostics</span></span><button class=\"b subtle\" onclick=\"aiClose()\">Close</button></div><div id=\"ai-log\" class=\"ai-log\"></div><div class=\"ai-input\"><input id=\"ai-in\" placeholder=\"Describe the problem — e.g. 'my wifi keeps dropping'\" onkeydown=\"if(event.key==='Enter')aiSend()\"><button class=\"b\" id=\"ai-send\" onclick=\"aiSend()\">Send</button></div></div>\
 <div class=\"viewport\" id=\"viewport\"><div class=\"vp-hint\" id=\"vp-hint\">Press <b>Live screen</b>, <b>Screenshot</b>, or a <b>Camera</b> action — it renders here.</div><img id=\"view\" alt=\"\" style=\"display:none\"><div class=\"vp-tools\" id=\"vp-tools\" style=\"display:none\"><button class=\"b\" onclick=\"stopView()\">Stop</button><button class=\"b\" onclick=\"openTab()\">Open in tab&nbsp;↗</button></div></div>\
 <div class=\"term\" id=\"terminal\" style=\"display:none\"><div class=\"term-head\"><span>interactive shell</span><button class=\"b\" onclick=\"closeShell()\">Close shell</button></div><div id=\"xterm\" class=\"xterm-host\"></div></div>\
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}</body></html>",
-        cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
+</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}{jobs_js}</body></html>",
+        cp_css = CP_CSS, jobs_css = jobs::JOBS_CSS, script = COPY_SCRIPT, jobs_js = jobs::JOBS_JS, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
     // no-store: the dashboard HTML bakes in window.HB (owner, version); never serve a
     // stale copy from a previous deploy.
@@ -5323,7 +5337,7 @@ function renderAudit(){var q=(document.getElementById('aud-q')||{}).value;q=(q||
 function fmtSummary(t){var devs='',cmds='',head=t;var di=t.indexOf(' Devices: ');if(di>=0){devs=t.slice(di+10).replace(/\.\s*$/,'');head=t.slice(0,di);}var ci=head.indexOf(' Commands: ');if(ci>=0){cmds=head.slice(ci+11).replace(/\.\s*$/,'');head=head.slice(0,ci);}var h='<span class="aud-sum-head">'+esc2(head)+'</span>';if(cmds){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Commands</span>'+cmds.split(', ').map(function(c){return '<code class="aud-cmd">'+esc2(c)+'</code>';}).join('')+'</span>';}if(devs){h+='<span class="aud-sum-row"><span class="aud-sum-lbl">Devices</span><span class="aud-sum-dev">'+esc2(devs)+'</span></span>';}return h;}
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
-function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);AI_HIST=[];var __aip=document.getElementById('ai-panel');if(__aip)__aip.style.display='none';document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
+function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);AI_HIST=[];var __aip=document.getElementById('ai-panel');if(__aip)__aip.style.display='none';document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));jobsOpen(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
 function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':((relay&&d.connected===false)?' <span class="recon-pill">RECONNECTING</span>':''));var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
 var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
 var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];

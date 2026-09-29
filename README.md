@@ -246,6 +246,13 @@ min**, **every N min**, or **daily at HH:MM (UTC)**; queued runs fire server-sid
 the **⏰ Scheduled** view (with next-run + cancel). GUI apps / long tasks use **Launch an app (no
 wait)** so they can't block the channel.
 
+**Background jobs.** Each device's detail pane has a **Background jobs** panel for commands that
+outlive `/exec`'s ~65 s cap (dev servers, builds): a command box plus an optional working
+directory and **Start job**, the device's jobs newest first (running / exit code), **Logs** and,
+for a running job, **Stop** (confirmed first; it ends the whole process tree). The log view polls
+`/x/job/logs` from the returned offset while the job runs and stops at end of output. See
+[Background jobs](#background-jobs).
+
 **Session recording.** Every interactive **Shell** session is auto-recorded (asciinema `.cast`)
 and replayable in **🎬 Recordings** through the bundled terminal, original timing preserved.
 
@@ -322,6 +329,9 @@ itai list                          # list registered devices
 itai exec mymac "ipconfig /all"    # run a command, print output
 itai get  mymac C:\logs\app.log    # download a file
 itai put  mymac ./patch.zip C:\tmp # upload a file
+itai job start mymac --cwd /srv/app -- npm run dev  # background job; prints its id
+itai job logs  mymac <id> --follow                # stream its output until it exits
+itai job stop  mymac <id>                         # also: itai job list mymac
 ```
 Global flags come **before** the subcommand: `--hub` (default `http://localhost:8770`),
 `--password` (if the agent set one), `--cafile` (agent `cert.pem` to verify TLS).
@@ -377,6 +387,8 @@ Claude Desktop, etc.) can operate a device by name. Tools exposed:
 - `download_file(device, remote_path, save_as?)` / `upload_file(device, local_path, remote_dir?)`
 - `update_agent(device)` — hot-update the agent to the hub's latest build
 - `dissolve_agent(device)` — stop the agent and remove its autostart
+- `job_start(device, command, cwd?)` / `job_logs(device, id, offset?)` / `job_stop(device, id)` /
+  `job_list(device)` — [background jobs](#background-jobs) past `run_command`'s ~65 s limit
 
 Live video (screen and camera) streams as MJPEG in the browser dashboard; it isn't an
 MCP tool because a stream isn't a single tool response — use `screenshot` /
@@ -482,6 +494,43 @@ OOM. The plain `upload_file` path still buffers the whole body (hub and agent), 
 relay ships it as a single message, so it **cannot** stream — it is capped at **100 MB**
 (3.13.5) and rejects anything larger with a pointer to `push_file`. Use `push_file` /
 stage-and-pull for anything large; it is the only path that handles multi-GB files.
+
+## Background jobs
+
+A job is a long-running command on a device that outlives the agent's ~65 s `/exec` cap. The
+agent owns the process and its log; the hub authorizes, audits and relays. The wire contract is
+`docs/JOBS-API.md`; the agent side and the `itai job` / MCP `job_*` clients are in `haive-agent`
+(agent 3.6.0+).
+
+| Hub route (`/m` = MCP token, `/x` = dashboard) | Forwards to | Checks, in order |
+|---|---|---|
+| `POST /m/job/start?target=` · `POST /x/job/start?target=` (body `{"cmd","cwd"?}`) | `POST /jobs/start` | `may_control` → `policy::enforce("launch", cmd)` → `record_mcp_access` (`/m` only) → `audit(…, "start job", device, cmd)` → forward |
+| `GET /m/job/logs?target=&id=&offset=&max=` · `/x/job/logs` | `GET /jobs/logs` | the generic `/m` or `/x` preamble (`may_control` on `target`), then id/offset/max validation |
+| `POST /m/job/stop?target=&id=` · `/x/job/stop` | `POST /jobs/stop` | preamble, which also audits `stop job` with the job id; then id validation |
+| `GET /m/job/list?target=` · `/x/job/list` | `GET /jobs/list` | preamble |
+
+- **`job/start` skips the generic preamble** and runs its own checks, the same way `/exec`
+  does: the deny-list needs the command text, and that is only in the body. A job is gated as a
+  `launch` (like a detached exec), so starting a job is never a way around the deny-list or the
+  audit log.
+- **Read-only tokens:** `job/logs` and `job/list` are read actions; `job/start` and `job/stop` are
+  writes, so a scoped MCP token with `scope=read` gets 403 `this MCP token is read-only` before
+  any job check runs.
+- **Relay-only:** jobs do not use the LAN-direct capability path. The CLI and MCP call
+  `/m/job/*` on the hub, and the hub forwards the request to the device.
+- **The hub validates the id, offset and max** before forwarding: an id must be `[a-z0-9]`, at
+  most 64 chars, and `offset`/`max` must be unsigned integers when present. Anything else gets
+  400 (`bad job id, offset or max` / `bad job id`), so a caller cannot add query parameters to the
+  agent path. The hub does not cap `max`; the agent does (1 MiB).
+- **The agent's reply goes back verbatim, with its HTTP status** (400 invalid id, 403 exec
+  disabled, 404 unknown job). Refusals from the jobs code use the `/exec` shape
+  `{"ok":false,"error":"…"}`: `forbidden` and deny-list refusals on `job/start` (HTTP 200, as on
+  `/exec`), the 400s above, and `device unreachable`. The shared preamble's refusals (401
+  `unauthorized`, 403 `forbidden`, 403 read-only) stay plain text.
+- **An old agent gets a clear error.** An agent without jobs answers `/jobs/*` with a plain-text
+  404; the hub turns that into `{"ok":false,"error":"the agent does not support jobs — update
+  it"}` (still 404). Any other non-JSON agent reply becomes `agent returned <status>: <text>`, so
+  clients always get JSON.
 
 ## Identity & owner scoping
 

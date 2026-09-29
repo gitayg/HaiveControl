@@ -43,6 +43,28 @@ Devices are real people's machines, though — act carefully on them (see below)
   AGENT_VERSION, every agent loops: install, report the served version, get pushed again, every
   ~5 minutes. Never set the secret to an empty string — that falls through to the hub's own
   `VERSION`. Deleting the secret in the AppCrane dashboard would leave AGENT_REV as the single source.
+- **An agent-side feature works in the fleet only after BOTH an agent release AND the hub's
+  `AGENT_REV` bump.** Shipping the hub routes is not enough: fleet agents run what `/bin` serves,
+  and `/bin` serves `v${AGENT_REV}`. Background jobs (hub 3.15.0) need agent 3.6.0, but the
+  `Dockerfile` pins `ARG AGENT_REV=3.5.2`, and it stays there until the agent 3.6.0 release is
+  published (the build fails on a tag that doesn't exist). Until then fleet agents are 3.5.x,
+  which answer `/jobs/*` with a plain 404 that the hub reports as `the agent does not support
+  jobs — update it`. Bump `AGENT_VERSION` with it (rule above).
+- **Background jobs (`crates/hub/src/jobs.rs`, contract in `docs/JOBS-API.md`).** Routes
+  `/m/job/{start,logs,stop,list}` and the same under `/x/` for the dashboard's per-device Jobs
+  panel (`JOBS_CSS`/`JOBS_JS` in the same file). Decisions to keep:
+  - `job/start` is exempt from the generic `/m` and `/x` preambles, like `/exec`, and runs its
+    own `may_control` → `policy::enforce("launch", cmd)` → `record_mcp_access` (MCP only) →
+    `audit("start job", cmd)` → forward. The deny-list needs the command text, which only the
+    body has.
+  - `job/start` and `job/stop` are writes: of the job routes, only `/m/job/logs` and
+    `/m/job/list` belong in `mcp_is_write`'s READ list, so a read-only token gets 403 on start/stop.
+  - The hub validates `id` (`[a-z0-9]`, ≤ 64) and `offset`/`max` (u64) before building the
+    agent path, so a caller cannot inject query parameters into it. `max` is capped by the agent.
+  - The agent's JSON and HTTP status are passed through unchanged; a non-JSON reply becomes
+    `{"ok":false}`, and a plain 404 (an agent from before jobs) becomes `the agent does not
+    support jobs — update it`.
+  - Relay-only: the controllers call `/m/job/*`, not the LAN-direct capability path.
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed
