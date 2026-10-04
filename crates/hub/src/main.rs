@@ -20,6 +20,8 @@ mod policy;
 mod mcptokens;
 mod monitor;
 mod elevation;
+mod vpn;
+mod vpnrelay;
 
 const VERSION: &str = "3.14.8";
 
@@ -83,6 +85,8 @@ fn main() {
         sweep_elevation();
     });
     start_scheduler(agents.clone(), ip.clone(), port);
+    // VPN exit relay (UDP) + pass sweeper. No-op unless VPN_RELAY_ENDPOINT is set.
+    vpn::start();
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
     // (/relay/hello, /relay/poll, /relay/reply — see relay.rs), so it works
@@ -399,6 +403,16 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url, agents),
         (Method::Get, "/x/persist") => proxy_persist(&url),
+        (Method::Get, "/x/vpn/status") => vpn_resp(vpn::status_ep(&query_param(&url, "target").unwrap_or_default())),
+        (Method::Post, "/x/vpn/enable") => vpn_resp(vpn::enable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
+        (Method::Post, "/x/vpn/disable") => vpn_resp(vpn::disable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
+        (Method::Post, "/x/vpn/pass") => vpn_resp(vpn::issue_ep(
+            &query_param(&url, "target").unwrap_or_default(),
+            &query_param(&url, "name").unwrap_or_default(),
+            query_param(&url, "hours").and_then(|h| h.parse().ok()).unwrap_or(0),
+            user.as_deref().unwrap_or(""),
+        )),
+        (Method::Post, "/x/vpn/revoke") => vpn_resp(vpn::revoke_ep(&query_param(&url, "target").unwrap_or_default(), &query_param(&url, "id").unwrap_or_default())),
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(user.as_deref())})),
@@ -817,6 +831,10 @@ fn action_label(path: &str) -> &'static str {
         "/update" => "update agent",
         "/dissolve" => "dissolve agent",
         "/shell/open" => "open shell",
+        "/vpn/enable" => "enable VPN exit",
+        "/vpn/disable" => "disable VPN exit",
+        "/vpn/pass" => "issue VPN pass",
+        "/vpn/revoke" => "revoke VPN pass",
         _ => "access",
     }
 }
@@ -824,7 +842,7 @@ fn action_label(path: &str) -> &'static str {
 /// Whether a device-action path is worth an audit entry (skips noisy polls).
 fn auditable(path: &str) -> bool {
     let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
-    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open")
+    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open" | "/vpn/enable" | "/vpn/disable" | "/vpn/pass" | "/vpn/revoke")
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -4809,8 +4827,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}</body></html>",
-        cp_css = CP_CSS, script = COPY_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
+</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}{vpn}</body></html>",
+        cp_css = CP_CSS, script = COPY_SCRIPT, vpn = VPN_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
     // no-store: the dashboard HTML bakes in window.HB (owner, version); never serve a
     // stale copy from a previous deploy.
@@ -5178,6 +5196,37 @@ button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,.n
 
 const FB_HTML: &str = r#"<div id="fb" class="fbwrap"><div class="fbpanel"><div class="fbhead"><button onclick="fbLoad(fbParent)" title="up">&#8593;</button><span id="fbpath" class="fbpath"></span><button onclick="closeFb()">&#10005;</button></div><div id="fbbody" class="fbbody"></div><div class="fbfoot"><button id="fbupload" onclick="fbUploadHere()">Upload file here</button> <span class="dim2">or drag &amp; drop a file onto this panel</span> <span id="fbstatus" class="dim2"></span></div></div></div>"#;
 
+/// The VPN exit panel (vpn.rs): enable/disable the exit on a Linux relay device,
+/// issue passes as a WireGuard QR/.conf, revoke them. Uses the dashboard's
+/// API/SEL/enc/esc2 globals and the .fbwrap modal styling.
+const VPN_SCRIPT: &str = r#"<script>
+var VPN_T=null,VPN_CFG=null,VPN_FILE='';
+function vpnEl(){var w=document.getElementById('vpnw');if(w)return w;w=document.createElement('div');w.id='vpnw';w.className='fbwrap';w.onclick=function(e){if(e.target===w)vpnClose();};
+w.innerHTML='<div class="fbpanel" style="width:min(640px,94vw);max-height:90vh;overflow:auto;padding:16px"><div style="display:flex;justify-content:space-between;align-items:center"><b>VPN exit</b><button onclick="vpnClose()">Close</button></div><div id="vpnbody" style="margin-top:10px;font-size:13px">Loading…</div></div>';document.body.appendChild(w);return w;}
+function vpnOpen(){if(!SEL)return;VPN_T=SEL;vpnEl().style.display='flex';vpnLoad();}
+function vpnClose(){var w=document.getElementById('vpnw');if(w)w.style.display='none';VPN_CFG=null;}
+function vpnAgo(s){if(!s)return '—';var d=Math.round(Date.now()/1000-s);if(d<0){var m=Math.round(-d/60);return m<60?'in '+m+'m':'in '+Math.round(m/60)+'h';}if(d<60)return d+'s ago';if(d<3600)return Math.round(d/60)+'m ago';if(d<86400)return Math.round(d/3600)+'h ago';return Math.round(d/86400)+'d ago';}
+function vpnPost(path,q){return fetch(API+'/x/vpn/'+path+'?target='+enc(VPN_T)+(q||''),{method:'POST'}).then(function(r){return r.json().then(function(j){if(!r.ok||!j.ok)throw new Error(j.error||('HTTP '+r.status));return j;});});}
+function vpnLoad(){return fetch(API+'/x/vpn/status?target='+enc(VPN_T),{cache:'no-store'}).then(function(r){return r.json();}).then(vpnRender).catch(function(e){document.getElementById('vpnbody').textContent='error: '+e;});}
+function vpnRender(j){var b=document.getElementById('vpnbody');if(!j.ok){b.textContent=j.error||'error';return;}
+var h='';if(!j.configured){h+='<p>The hub\'s VPN relay is not configured. Set <code>VPN_RELAY_ENDPOINT</code> and publish <code>VPN_UDP_PORT</code> over UDP (AppCrane: ingress dual, data_plane_protocol udp).</p>';b.innerHTML=h;return;}
+var a=j.agent||{};
+if(!j.enabled){h+='<p>Let phones and PCs browse with this device\'s public IP. The device dials out to the hub relay ('+esc2(j.endpoint||'')+'), so no port forwarding is needed. Requires the agent installed as a service (root).</p>';
+if(j.agentReachable&&a.supported===false)h+='<p class="dim2">This device is not Linux.</p>';else h+='<button class="b" onclick="vpnEnable()">Enable VPN exit</button>';b.innerHTML=h+'<div id="vpnmsg" style="margin-top:8px"></div>';return;}
+var ok=j.relayConnected;h+='<div><span class="dot '+(ok?'on':'off')+'" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:'+(ok?'#3c3':'#c33')+';margin-right:6px"></span><b>'+(ok?'Exit online':'Exit offline')+'</b> <span class="dim2">· relay '+esc2(j.endpoint)+' · '+j.clients+' client(s)'+(j.pendingSync?' · changes pending until the device reconnects':'')+(a.error?' · '+esc2(a.error):'')+'</span></div>';
+h+='<div style="margin:12px 0;display:flex;gap:6px;flex-wrap:wrap"><input id="vpnname" maxlength="40" placeholder="Pass name, e.g. iPhone" style="flex:1 1 160px;padding:6px;border-radius:7px;border:1px solid var(--line2);background:var(--surface2);color:inherit"><select id="vpnttl" style="padding:6px;border-radius:7px;background:var(--surface2);color:inherit;border:1px solid var(--line2)">'+(j.ttlChoices||[]).map(function(x){return '<option value="'+x+'"'+(x===8?' selected':'')+'>'+(x<24?x+' hours':(x/24)+(x===24?' day':' days'))+'</option>';}).join('')+'</select><button class="b" onclick="vpnIssue()">Create pass</button></div><div id="vpnmsg"></div><div id="vpnnew"></div>';
+h+='<table style="width:100%;border-collapse:collapse;margin-top:10px"><tr class="dim2"><td>Name</td><td>Status</td><td>Last used</td><td></td></tr>'+(j.passes||[]).map(function(p){return '<tr style="border-top:1px solid var(--line)"><td>'+esc2(p.name)+'<div class="dim2">'+esc2(p.address)+'</div></td><td>'+(p.status==='active'?'active<div class="dim2">ends '+vpnAgo(p.expiresAt)+'</div>':esc2(p.status))+'</td><td>'+vpnAgo(p.lastHandshake)+'</td><td>'+(p.status==='active'?'<button onclick="vpnRevoke(\''+esc2(p.id)+'\')">Revoke</button>':'')+'</td></tr>';}).join('')+'</table>';
+h+='<div style="margin-top:14px"><button class="b subtle" onclick="vpnDisable()">Disable VPN exit</button></div>';b.innerHTML=h;}
+function vpnMsg(t){var m=document.getElementById('vpnmsg');if(m)m.textContent=t;}
+function vpnEnable(){vpnMsg('enabling… (first time installs WireGuard on the device)');vpnPost('enable').then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
+function vpnDisable(){if(!confirm('Disable the VPN exit? All passes on this device are revoked.'))return;vpnPost('disable').then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
+function vpnRevoke(id){if(!confirm('Revoke this pass? It disconnects within seconds.'))return;vpnPost('revoke','&id='+enc(id)).then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
+function vpnIssue(){vpnMsg('creating…');vpnPost('pass','&name='+enc(document.getElementById('vpnname').value)+'&hours='+enc(document.getElementById('vpnttl').value)).then(function(j){VPN_CFG=j.config;VPN_FILE=j.filename;vpnLoad().then(function(){vpnMsg(j.warning||'');var n=document.getElementById('vpnnew');if(!n)return;
+n.innerHTML='<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:8px"><div style="background:#fff;padding:6px;border-radius:8px;width:240px">'+j.qrSvg.replace(/<\?xml[^>]*>/,'')+'</div><div style="flex:1 1 220px"><p><b>Shown once</b> — the private key is not stored anywhere.</p><ol style="padding-left:18px"><li><b>iPhone/Android:</b> free open-source <b>WireGuard</b> app → + → Create from QR code.</li><li><b>PC/Mac:</b> WireGuard → Import tunnel from file → the .conf below.</li><li>Turn it on; ifconfig.me shows this device\'s IP.</li></ol><button class="b" onclick="vpnDl()">Download .conf</button> <button class="b subtle" onclick="vpnHide()">Done</button></div></div>';var svg=n.querySelector('svg');if(svg){svg.style.width='100%';svg.style.height='auto';}});}).catch(function(e){vpnMsg('failed: '+e.message);});}
+function vpnDl(){if(!VPN_CFG)return;var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([VPN_CFG],{type:'text/plain'}));a.download=VPN_FILE||'itai.conf';a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
+function vpnHide(){VPN_CFG=null;var n=document.getElementById('vpnnew');if(n)n.innerHTML='';}
+</script>"#;
+
 const COPY_SCRIPT: &str = r#"<script>
 var API=(window.HB&&HB.base)?((''+HB.base).replace(/\/+$/,'')):'';
 function cp(b){var pre=b.parentElement.querySelector('pre');var t=pre.innerText;var o=b.innerHTML;var ok=function(){b.textContent='✓';setTimeout(function(){b.innerHTML=o;},1200);};if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(ok,function(){fb(t,ok);});}else{fb(t,ok);}}
@@ -5366,7 +5415,8 @@ var grantbtn=((d.os||'').toLowerCase().indexOf('win')>=0)?'<button class="b subt
 var agent='<button class="b subtle"'+(updcur?(' disabled title="'+attrEsc(updtt)+' — already current"'):(' onclick="doUpd()" title="'+attrEsc(updtt)+'"'))+'>'+updlbl+'</button>'+persistbtn+dbtn+claimbtn+grantbtn+'<button class="b subtle" onclick="doForget()" title="remove this device from the inventory (does not touch the agent)">Forget</button>';
 function g(l,b){return '<div class="bgroup"><span class="blabel">'+l+'</span><div class="brow">'+b+'</div></div>';}
 var ai='<button class="b" onclick="aiOpen()" title="ask an AI to diagnose this device using read-only checks">🤖 Ask AI</button>';
-var groups='<div class="controls">'+g('AI assistant',ai)+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+'</div>';
+var vpn=(((d.os||d.platform||'').toLowerCase().indexOf('linux')>=0)&&String(SEL||'').indexOf('relay://')===0)?g('VPN exit','<button class="b" onclick="vpnOpen()" title="browse from your phone or PC with this device\'s public IP (WireGuard)">VPN exit…</button>'):'';
+var groups='<div class="controls">'+g('AI assistant',ai)+g('Screen &amp; camera',scr)+g('Terminal',term)+g('Files',files)+g('Agent',agent)+vpn+'</div>';
 return groups+actionListHtml();}
 function rowOf(i){return document.querySelector('.arow[data-i="'+i+'"]');}
 function rowKind(r,row){return r.opts?row.querySelector('.arow-opt').value:r.kind;}
@@ -5500,6 +5550,11 @@ fn hdr(k: &str, v: &str) -> Header {
 
 fn json_resp(v: &serde_json::Value) -> Resp {
     Response::from_string(v.to_string()).with_header(hdr("Content-Type", "application/json"))
+}
+
+/// A vpn.rs result as a no-store JSON response (it can carry a private key).
+fn vpn_resp((v, code): (serde_json::Value, u16)) -> Resp {
+    json_resp(&v).with_status_code(code).with_header(hdr("Cache-Control", "no-store"))
 }
 
 #[cfg(test)]

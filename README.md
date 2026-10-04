@@ -599,6 +599,41 @@ SSO) is the API. An email or a raw owner id still works as `--owner`, for backwa
 > enrollment token narrows this: the value on the device is now an opaque, rotatable
 > credential rather than the derivable email/uuid.
 
+## VPN exit (browse with a device's IP)
+
+A Linux device (e.g. a Jetson Orin) can be turned into a **VPN exit**: phones and PCs
+browse with that device's public IP, using the free, open-source **WireGuard** app
+(iOS, Android, Windows, macOS). The device can sit behind CGNAT: it dials **out** to a
+UDP relay inside the hub, so there is no port forwarding anywhere.
+
+```
+WireGuard app ──UDP──▶ hub relay (VPN_RELAY_ENDPOINT) ◀──UDP, outbound── agent on the device ──NAT──▶ internet
+```
+
+The relay only moves WireGuard ciphertext. It routes new clients by WireGuard's own
+`mac1` field and drops anything that is not a valid handshake for an enabled device. It
+also delivers device traffic only to clients that recently spoke to that device, so it
+can't be used to reflect traffic.
+
+**Hub setup (AppCrane):**
+1. Env: `VPN_RELAY_ENDPOINT=crane.glick.run:<public udp port>` (what clients and devices
+   connect to). Optional: `VPN_UDP_PORT` (container port, default `51820`) and `VPN_DNS`.
+2. Publish that port over UDP. This needs an AppCrane version with UDP data planes.
+   `appcrane_set_app_ingress slug=haivecontrol ingress_type=dual data_plane_port=51820
+   data_plane_protocol=udp` (platform admin). Then restart the app and open the public
+   UDP port in the host firewall (`DOCKER-USER`).
+
+**Device:** the agent must run as the root service (`--install`), agent ≥ the release
+carrying `/vpn/*`. In the dashboard, open the device → **VPN exit…** → **Enable**. The
+first time, this installs `wireguard-tools`. On kernels without the WireGuard module
+(some Jetson L4T builds) the agent uses `wireguard-go` if it is installed.
+
+**Passes:** **Create pass** issues a WireGuard config (QR + `.conf`) that lasts 1 h to
+7 days. The private key is shown once and never stored. **Revoke** cuts a pass off
+within seconds. Expiry is also enforced on the device, so a pass ends on time even if the
+hub is down. Pass holders cannot reach the device itself, its LAN, or each other.
+Enable, disable, issue and revoke are audited.
+
 ## Config (environment variables)
 
 | Var              | Default    | Meaning                                      |
