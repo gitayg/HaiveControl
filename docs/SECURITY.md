@@ -17,6 +17,17 @@ cannot enroll un-owned. Enrollment requires a personal, opaque, rotatable enroll
 (`htok_…`) minted per account from the dashboard's *Register a device* panel. A device
 enrolled with your token is scoped to your account from birth.
 
+**Per-device credentials.** The enrollment token is meant to be used once. On its first
+hello an agent ≥ 3.7 asks the hub for its own secret (`hdev_…`) and authenticates every
+later `/relay/*` call with that instead; it keeps the secret in a private file
+(`~/.it-ai/relay.cred`, 0600) rather than on a command line. A device secret is valid only
+for the relay id it was issued to. The hub stores only its sha256, in
+`<HUB_DATA>/device_secrets.json` (0600, in a 0700 dir), and compares in constant time. One
+device's secret can be revoked from the dashboard without touching any other device, and
+removing or dissolving a device deletes its secret. Agents ≤ 3.6.x never ask for a secret
+and keep authenticating with the enrollment token. The contract is in
+[DEVICE-SECRETS.md](DEVICE-SECRETS.md).
+
 **Per-device relay-tunnel authentication.** The reverse tunnel binds each device to its own
 credential. A poll/reply caller must be authorized for *that* tunnel — the shared
 `RELAY_TOKEN` alone does not authorize acting as an arbitrary device id. This prevents one
@@ -81,7 +92,8 @@ Configure these on the hub and at agent enrollment to tighten a deployment.
 |---|---|---|
 | **`RELAY_TOKEN`** | hub env + agent (`--relay-token` / `HIVE_RELAY_TOKEN`) | Turns on authenticated (strict-ownership) mode. Every `/relay/*` call must carry a valid token; wrong/absent → `401`. Unset = open trusted-LAN/dev mode. Use a long random secret (`openssl rand -hex 32`). |
 | **`PROXY_AUTH_SECRET`** | hub env (behind an SSO proxy) | Requires a proxy-injected shared secret before the hub honors the forwarded `X-AppCrane-User-*` identity headers, so a client-supplied header can't impersonate a user. Make identity trust depend on the proxy, not on a spoofable header. |
-| **Personal enrollment tokens (`htok_…`)** | dashboard *Register a device* → `--relay-token htok_…` | Opaque, per-account, rotatable credential that scopes an enrolled device to your account. Prefer these over putting a raw owner id/email on the command line. **Rotate token** issues a fresh one and stops the old one minting *new* enrollments (already-enrolled devices keep their scope). |
+| **Personal enrollment tokens (`htok_…`)** | dashboard *Register a device* → `--relay-token htok_…` | Opaque, per-account, rotatable credential that scopes an enrolled device to your account. Prefer these over putting a raw owner id/email on the command line. **Rotate token** issues a fresh one and deletes the old one. Devices that hold their own device secret are unaffected. Devices still authenticating with the old enrollment token (agents ≤ 3.6.x, or any device not yet issued a secret) are **disconnected** on their next call and must be re-enrolled with the new token. The *Register a device* panel shows how many of your devices that is before you rotate. |
+| **Device secrets (`hdev_…`)** | issued by the hub to agents ≥ 3.7 on enrollment | Per-device relay credential, valid only for its own relay id. **Revoke** on a device in the dashboard deletes it; that device's next relay call is refused (`401`) until it is re-enrolled with an enrollment token. |
 | **`HAIVE_CAFILE`** | MCP / CLI env (`--cafile` on the CLI) | PEM used to verify the hub's (self-signed) certificate, so the controller channel pins the hub cert instead of accepting any certificate. Set this rather than running without certificate verification. |
 | **`MCP_TOKEN` / `HIVE_MCP_TOKEN`** | hub env + MCP client | Credential for the hub's `/m` MCP API. Only expose `/m` (and SSO-bypass it) if you actually use the MCP; keep `/x/*` behind SSO. Bind the token to a server-side owner (`MCP_OWNER`) so a shared token can't act as an arbitrary owner. |
 | **`SCREEN_SHARE`** | agent env | Confines file browse/upload/download to one folder (`..` blocked). Set it — leaving it unset exposes the whole filesystem to the file-transfer surface. |
@@ -100,8 +112,11 @@ Configure these on the hub and at agent enrollment to tighten a deployment.
   than disabling verification.
 - **Confine the agent** with `SCREEN_SHARE`, and set `SCREEN_EXEC=0` where you only need
   view + control.
-- **Rotate enrollment tokens** periodically and after any suspected exposure; already-
-  enrolled devices are unaffected.
+- **Rotate enrollment tokens** periodically and after any suspected exposure. Devices
+  holding their own device secret are unaffected; devices still on the old enrollment
+  token (agents ≤ 3.6.x) are disconnected until re-enrolled, so update agents to ≥ 3.7
+  first. Revoke a single device's secret, rather than rotating, when only that device is
+  suspect.
 
 ---
 

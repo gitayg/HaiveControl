@@ -21,8 +21,11 @@ mod mcptokens;
 mod monitor;
 mod elevation;
 mod jobs;
+mod devicesecrets;
+#[cfg(test)]
+mod testenv;
 
-const VERSION: &str = "3.15.0";
+const VERSION: &str = "3.16.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -246,7 +249,11 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
     // means the hub must authenticate them itself. If RELAY_TOKEN is set, every
     // /relay call must carry ?tok=<token>. Unset = open (trusted LAN / dev).
     if path.starts_with("/relay/") && !relay_ok(&url) {
-        let _ = req.respond(Response::from_string("unauthorized").with_status_code(401));
+        // A refused device secret says so, so the agent can tell "re-enroll this
+        // device" apart from a plain bad token (docs/DEVICE-SECRETS.md).
+        let tok = query_param(&url, "tok").unwrap_or_default();
+        let msg = if devicesecrets::is_device_secret(&tok) { devicesecrets::REJECTED } else { "unauthorized" };
+        let _ = req.respond(Response::from_string(msg).with_status_code(401));
         return;
     }
     let gz = req_header(&req, "Accept-Encoding").map(|e| e.to_lowercase().contains("gzip")).unwrap_or(false);
@@ -283,51 +290,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/relay/ai-chat") => relay_ai_chat_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-apply") => relay_ai_apply_ep(&mut req, &url, agents),
         (Method::Post, "/relay/ai-run-approved") => relay_ai_run_approved_ep(&mut req, &url, agents),
-        (Method::Post, "/relay/hello") => {
-            // Strict enrollment: when the hub is authed (RELAY_TOKEN set), a device
-            // must present a per-owner enrollment token (htok_…) so it enrolls UNDER
-            // an owner — never un-owned. relay_ok already blocks a wholly tokenless
-            // call; this additionally rejects a bare shared-token enrollment that
-            // would otherwise land un-owned (and thus invisible to everyone).
-            let owner = query_param(&url, "tok").and_then(|t| resolve_owner_token(&t));
-            let authed = std::env::var("RELAY_TOKEN").map(|t| !t.is_empty()).unwrap_or(false);
-            if authed && owner.is_none() {
-                Response::from_string(
-                    "enrollment requires a personal enrollment token (--relay-token htok_…) — get one from the dashboard's Register a device panel",
-                )
-                .with_status_code(403)
-            } else {
-                // The device dials out, so the socket (or X-Forwarded-For behind the
-                // AppCrane proxy) carries its real public IP — capture it for geo.
-                let pip = req_header(&req, "X-Forwarded-For")
-                    .and_then(|h| h.split(',').next().map(|s| s.trim().to_string()))
-                    .or_else(|| req.remote_addr().map(|a| a.ip().to_string()));
-                let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
-                let mut data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                if let Some(o) = data.as_object_mut() {
-                    if let Some(ip) = pip {
-                        o.insert("public_ip".into(), serde_json::json!(ip));
-                    }
-                    // Per-owner enrollment token → the device is owned by that account,
-                    // recorded as a persistent override so it survives every check-in.
-                    if let Some(owner) = &owner {
-                        if let Some(id) = o.get("relay_id").and_then(|x| x.as_str()) {
-                            set_owner(agents, &format!("relay:{id}"), owner);
-                        }
-                        o.insert("owner".into(), serde_json::json!(owner));
-                    }
-                }
-                let ah = relay::auth_hash(&query_param(&url, "tok").unwrap_or_default());
-                if relay::hello(agents, data, &ah) {
-                    Response::from_string("").with_status_code(204)
-                } else {
-                    // The id is already bound to a different enrollment token —
-                    // someone is trying to take over another device's tunnel.
-                    Response::from_string("relay id in use by another enrollment").with_status_code(403)
-                }
-            }
-        }
+        (Method::Post, "/relay/hello") => devicesecrets::hello_ep(&mut req, &url, agents),
         (Method::Get, "/whoami") => {
             // Dump every header the proxy actually sends so we can see what identity
             // header (if any) AppCrane injects, instead of guessing at the name.
@@ -423,6 +386,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
+        (Method::Post, "/x/device-secret/revoke") => devicesecrets::revoke_ep(&url),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/job/start") => jobs::start(&mut req, &url, agents, user.as_deref(), false),
@@ -830,6 +794,7 @@ fn action_label(path: &str) -> &'static str {
         "/shell/open" => "open shell",
         "/job/start" => jobs::START_LABEL,
         "/job/stop" => jobs::STOP_LABEL,
+        "/device-secret/revoke" => "revoke device secret",
         _ => "access",
     }
 }
@@ -837,7 +802,7 @@ fn action_label(path: &str) -> &'static str {
 /// Whether a device-action path is worth an audit entry (skips noisy polls).
 fn auditable(path: &str) -> bool {
     let p = path.strip_prefix("/x").or_else(|| path.strip_prefix("/m")).unwrap_or(path);
-    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open" | "/job/start" | "/job/stop")
+    matches!(p, "/frame" | "/camera" | "/stream" | "/camstream" | "/download" | "/upload" | "/update" | "/dissolve" | "/shell/open" | "/job/start" | "/job/stop" | "/device-secret/revoke")
 }
 
 /// A user may drive a device only if it's theirs. No user context (LAN/dev) = allowed.
@@ -866,15 +831,21 @@ fn direct_token(relay_id: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset.
+/// Agent auth for the SSO-bypassed /relay paths. Open when RELAY_TOKEN is unset —
+/// except that a presented device secret is always checked: it is only ever valid
+/// for the `id` it was issued to, and a revoked one must be refused even on an open
+/// hub, or revoking would mean nothing there.
 fn relay_ok(url: &str) -> bool {
+    let tok = query_param(url, "tok").unwrap_or_default();
+    if devicesecrets::is_device_secret(&tok) {
+        return devicesecrets::verify(&query_param(url, "id").unwrap_or_default(), &tok).is_some();
+    }
     match std::env::var("RELAY_TOKEN") {
         Ok(t) if !t.is_empty() => {
-            let tok = query_param(url, "tok").unwrap_or_default();
             // Accept the shared relay secret, OR any valid per-owner enrollment
             // token — the latter both authenticates AND stamps ownership (below),
             // so one `--relay-token htok_…` enrolls a device already owned.
-            tok == t || resolve_owner_token(&tok).is_some()
+            ct_eq_str(&tok, &t) || resolve_owner_token(&tok).is_some()
         }
         _ => true,
     }
@@ -2030,13 +2001,24 @@ fn load_state(agents: &Agents) {
     }
     load_pending();
     load_owner_tokens();
+    devicesecrets::load();
     load_queued();
     load_owner_overrides();
 }
 
 /// Remove a device (and its analysis) from the inventory + disk — the manual
-/// cleanup for the "keep forever" retention model.
+/// cleanup for the "keep forever" retention model — and delete its device secret,
+/// so a removed or dissolved device cannot reconnect on it.
 fn forget_device(agents: &Agents, target: &str) {
+    forget_inventory(agents, target);
+    if let Some(id) = relay_target(target) {
+        devicesecrets::remove(&id);
+    }
+}
+
+/// `forget_device` minus the device secret — for a queued dissolve, whose device
+/// must still be able to reconnect until the dissolve is actually delivered.
+pub(crate) fn forget_inventory(agents: &Agents, target: &str) {
     let key = device_key(target);
     agents.lock().unwrap().remove(&key);
     analysis_store().lock().unwrap().remove(&key);
@@ -2142,13 +2124,27 @@ fn enroll_token_for(owner: &str) -> String {
     save_owner_tokens();
     t
 }
-/// Invalidate every token for `owner` and mint a fresh one. Devices already
-/// enrolled are unaffected (they stored the resolved owner id, not the token).
+/// Invalidate every token for `owner` and mint a fresh one. Devices holding a device
+/// secret (`hdev_…`, see devicesecrets.rs) are unaffected. Devices still relaying
+/// with the old enrollment token — agents ≤ 3.6.x, or any device not yet issued a
+/// secret — are disconnected: `relay_ok` refuses the deleted token on their next call,
+/// and they must be re-enrolled with the new one. Their tunnels are dropped too, so
+/// they stop showing as connected and the new token can re-enroll them.
 fn rotate_enroll_token(owner: &str) -> String {
-    owner_tokens().lock().unwrap().retain(|_, o| o.as_str() != owner);
+    let mut removed = Vec::new();
+    owner_tokens().lock().unwrap().retain(|tok, o| {
+        let keep = o.as_str() != owner;
+        if !keep {
+            removed.push(relay::auth_hash(tok));
+        }
+        keep
+    });
     let t = rand_token();
     owner_tokens().lock().unwrap().insert(t.clone(), owner.to_string());
     save_owner_tokens();
+    // After the delete, so an old-token hello arriving from here on is refused by
+    // `relay_ok` instead of re-creating the tunnel.
+    relay::drop_tunnels_bound_to(&removed);
     t
 }
 
@@ -2664,7 +2660,7 @@ fn ai_chat_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>)
 /// Relay path: an endpoint asks the cloud AI about ITSELF (the tray chat). The
 /// /relay/ guard already checked the token; owner + self-target come from it.
 fn relay_ai_chat_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
-    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let owner = devicesecrets::relay_caller_owner(url).unwrap_or_default();
     let id = query_param(url, "id").unwrap_or_default();
     if id.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
@@ -2733,7 +2729,7 @@ fn ai_apply_ep(req: &mut Request, url: &str, agents: &Agents, user: Option<&str>
 /// Relay path: an endpoint approves a fix ON ITSELF from the tray chat. The /relay/
 /// guard already validated the token; owner + self-target come from it.
 fn relay_ai_apply_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
-    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let owner = devicesecrets::relay_caller_owner(url).unwrap_or_default();
     let id = query_param(url, "id").unwrap_or_default();
     if id.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
@@ -2818,7 +2814,7 @@ fn ai_run_approved_ep(req: &mut Request, url: &str, agents: &Agents, user: Optio
 
 /// Relay variant: an endpoint approves a custom command ON ITSELF from the tray chat.
 fn relay_ai_run_approved_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
-    let owner = query_param(url, "tok").and_then(|t| resolve_owner_token(&t)).unwrap_or_default();
+    let owner = devicesecrets::relay_caller_owner(url).unwrap_or_default();
     let id = query_param(url, "id").unwrap_or_default();
     if id.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "no device id"}));
@@ -4634,6 +4630,8 @@ fn live(agents: &Agents, user: Option<&str>) -> Vec<serde_json::Value> {
                 // tunnel for a moment (reconnecting after a dropped poll/redeploy).
                 if let Some(id) = key.strip_prefix("relay:") {
                     o.insert("connected".to_string(), serde_json::json!(relay::is_connected(id)));
+                    // Own credential (hdev_) vs still on the owner's enrollment token.
+                    o.insert("device_secret".to_string(), serde_json::json!(devicesecrets::has(id)));
                 }
                 if let Some(events) = alog.get(key) {
                     // Only surface accesses within the last 5 minutes.
@@ -4765,7 +4763,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
         hb_agent_ver.replace('"', "")
     );
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}{jobs_css}</style></head>\n<body>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>IT-AI hub</title>\n<link rel=\"stylesheet\" href=\"{ab}/assets/xterm.css\"><style>{cp_css}{jobs_css}{ds_css}</style></head>\n<body>\
 <div class=\"app\">\
 <button id=\"navtoggle\" class=\"navtoggle\" onclick=\"toggleNav()\" aria-label=\"menu\">☰</button>\
 <div id=\"navback\" class=\"navback\" onclick=\"toggleNav()\"></div>\
@@ -4791,7 +4789,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <button class=\"navb\" data-nav=\"settings\" onclick=\"showSettings()\"><span class=\"ni\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" class=\"ic\"><path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/></svg></span>Settings</button>\
 </nav>\
 <main class=\"stage\">\
-<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--owner htok_…</code>), so the device lists only for you. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating stops the old token working for <i>new</i> enrollments; devices already enrolled are unaffected.</div>\
+<div id=\"reg\" class=\"reg\" style=\"display:none\"><div class=\"aud-head\">Register a device <span class=\"dim2\">— download the agent, then run it</span></div>{enroll}<div class=\"reg-tok dim2\" id=\"regtok\">The commands embed your account's <b>enrollment token</b> (<code>--relay-token htok_…</code>), so the device lists only for you. On enrollment, agents 3.7+ get their own device credential and stop using it. <button class=\"b subtle\" onclick=\"rotateEnrollTok()\" title=\"issue a new enrollment token\">Rotate token</button> Rotating deletes the old token: devices with their own credential are unaffected; devices still on the enrollment token are disconnected until re-enrolled with the new one.<span id=\"ds-warn\" class=\"ds-warn\"></span></div>\
 <div class=\"aud-head\" style=\"margin-top:16px\">MCP access tokens <span class=\"dim2\">— scoped, expiring keys for the AI/MCP API</span></div>\
 <div class=\"reg-tok dim2\">Mint a token bound to your account. <b>read</b> = inspect only; <b>write</b> = run fixes/commands; <b>admin</b> = full. Pass it as <code>?mtok=…</code> on <code>/m/</code> calls.<div style=\"margin-top:8px\">Scope <select id=\"mtk-scope\" class=\"scr-sel\"><option value=\"read\">read</option><option value=\"write\">write</option><option value=\"admin\">admin</option></select> TTL <input id=\"mtk-ttl\" class=\"devsearch\" type=\"number\" min=\"0\" value=\"30\" style=\"width:64px\"> days <button class=\"b\" onclick=\"mintMcpToken()\">Mint token</button></div><div id=\"mtk-new\"></div><div id=\"mtk-list\"></div></div></div>\
 <div class=\"stage-empty\" id=\"stage-empty\">Pick a device from Inventory to control it.</div>\
@@ -4813,6 +4811,7 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <div class=\"detail-head\"><div class=\"dh-id\"><span class=\"dot\" id=\"d-dot\"></span><div><div class=\"dh-name\" id=\"d-name\"></div><div class=\"dh-sub\" id=\"d-sub\"></div></div></div>\
 <a class=\"dh-open\" id=\"d-open\" target=\"_blank\">Open agent&nbsp;↗</a></div>\
 <div class=\"specs\" id=\"d-specs\"></div>\
+<div id=\"d-cred\"></div>\
 <div id=\"d-activity\"></div>\
 <div id=\"d-analysis\" class=\"an-panel\"></div>\
 <div id=\"d-controls\"></div>\
@@ -4823,8 +4822,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{script}{jobs_js}</body></html>",
-        cp_css = CP_CSS, jobs_css = jobs::JOBS_CSS, script = COPY_SCRIPT, jobs_js = jobs::JOBS_JS, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
+</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{ds_js}{script}{jobs_js}</body></html>",
+        cp_css = CP_CSS, jobs_css = jobs::JOBS_CSS, ds_css = devicesecrets::DS_CSS, ds_js = devicesecrets::DS_JS, script = COPY_SCRIPT, jobs_js = jobs::JOBS_JS, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
     // no-store: the dashboard HTML bakes in window.HB (owner, version); never serve a
     // stale copy from a previous deploy.
@@ -5200,12 +5199,12 @@ function enc(s){return encodeURIComponent(s);}
 function esc2(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function attrEsc(s){return esc2(s).replace(/"/g,'&quot;');}
 function fmtSize(n){if(n<1024)return n+' B';if(n<1048576)return (n/1024).toFixed(0)+' KB';if(n<1073741824)return (n/1048576).toFixed(1)+' MB';return (n/1073741824).toFixed(1)+' GB';}
-function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';listMcpTokens();}}
+function toggleReg(){var r=document.getElementById('reg');if(r.style.display==='block'){showInventory();}else{setNav('');SEL=null;highlight();hideViews();r.style.display='block';listMcpTokens();dsRegWarn();}}
 function mintMcpToken(){var s=document.getElementById('mtk-scope').value;var t=document.getElementById('mtk-ttl').value||'0';fetch(API+'/x/mcp-tokens?scope='+enc(s)+'&ttl='+enc(t),{method:'POST'}).then(function(r){return r.json();}).then(function(j){if(!j.ok){alert(j.error||'mint failed');return;}document.getElementById('mtk-new').innerHTML='<div class=\"aifix-res ok\">New '+esc2(j.scope)+' token — copy now, shown once:<pre class=\"aifix-out\">'+esc2(j.token)+'</pre></div>';listMcpTokens();}).catch(function(e){alert('error: '+e);});}
 function listMcpTokens(){fetch(API+'/x/mcp-tokens').then(function(r){return r.json();}).then(function(j){var el=document.getElementById('mtk-list');if(!el)return;if(!j.ok){el.textContent='';return;}var ts=j.tokens||[];if(!ts.length){el.innerHTML='<div class=\"dim2\" style=\"margin-top:6px\">No tokens yet.</div>';return;}el.innerHTML='<table style=\"margin-top:8px;width:100%;font-size:12px\"><tr><th style=\"text-align:left\">id</th><th>scope</th><th>expires</th><th></th></tr>'+ts.map(function(t){var exp=t.expires_at?new Date(t.expires_at*1000).toISOString().slice(0,10):'never';return '<tr><td><code>'+esc2(t.id)+'</code></td><td style=\"text-align:center\">'+esc2(t.scope)+'</td><td style=\"text-align:center\">'+exp+'</td><td style=\"text-align:right\"><button class=\"b subtle\" onclick=\"revokeMcpToken(\''+esc2(t.id)+'\')\">Revoke</button></td></tr>';}).join('')+'</table>';}).catch(function(){});}
 function revokeMcpToken(id){if(!confirm('Revoke token '+id+'? Any MCP client using it stops working immediately.'))return;fetch(API+'/x/mcp-token-revoke?id='+enc(id),{method:'POST'}).then(function(r){return r.json();}).then(function(){listMcpTokens();}).catch(function(e){alert('error: '+e);});}
 function instMode(m){var v=document.querySelectorAll('.instv');for(var i=0;i<v.length;i++){v[i].style.display=(v[i].getAttribute('data-m')===m)?'block':'none';}}
-function rotateEnrollTok(){if(!confirm('Rotate your enrollment token? The old token stops working for new enrollments. Devices already enrolled are unaffected.'))return;fetch(API+'/x/enroll-token?rotate=1').then(function(r){return r.json();}).then(function(j){if(j&&j.ok){location.reload();}else{alert((j&&j.error)||'rotate failed');}}).catch(function(e){alert('error: '+e);});}
+function rotateEnrollTok(){if(!confirm('Rotate your enrollment token? The old token is deleted. '+dsWarnText()+' Devices with their own credential are unaffected.'))return;fetch(API+'/x/enroll-token?rotate=1').then(function(r){return r.json();}).then(function(j){if(j&&j.ok){location.reload();}else{alert((j&&j.error)||'rotate failed');}}).catch(function(e){alert('error: '+e);});}
 /* ---- devices ---- */
 var DEV={},SEL=null,SEARCH='',LAST=[];
 function baseOf(d){return d.scheme==='relay'?('relay://'+d.ip):(d.scheme+'://'+d.ip+':'+d.port);}
@@ -5329,7 +5328,7 @@ function ovSort(k){if(OV_SORT.key===k){OV_SORT.dir*=-1;}else{OV_SORT.key=k;OV_SO
 function ovVal(d,k){switch(k){case 'name':return (d.name||d.hostname||d.ip||'').toLowerCase();case 'os':return (d.os||'').toLowerCase();case 'user':return (d.user||'').toLowerCase();case 'cpu':return (d.cpu_pct==null?-1:d.cpu_pct);case 'ram':return (d.free_gb==null?-1:d.free_gb);case 'seen':return (d.last_seen_secs==null?1e9:d.last_seen_secs);case 'status':return ({on:0,idle:1,off:2}[statusOf(d)]);default:return 0;}}
 function refreshInv(btn){if(btn){btn.classList.add('spin');setTimeout(function(){btn.classList.remove('spin');},700);}fetchAgents();}
 function scopeHint(){var o=(window.HB&&HB.owner)||'';return o?('<div class="scope-hint">Viewing as owner <code>'+esc2(o)+'</code> — only devices enrolled with a matching <code>--owner</code> value appear here.</div>'):'<div class="scope-hint">Viewing all owners.</div>';}
-function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0,uncl=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(!d.owner)uncl++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices in your view.'+scopeHint()+'</td></tr>';return;}var sorted=(SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr).slice();sorted.sort(function(a,b){var va=ovVal(a,OV_SORT.key),vb=ovVal(b,OV_SORT.key);return (va<vb?-1:va>vb?1:0)*OV_SORT.dir;});if(!sorted.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices match “'+esc2(SEARCH)+'”.</td></tr>';return;}body.innerHTML=sorted.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+ownerChip(d)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+instChip(d)+'</td><td>'+presCell(d)+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td><td><button class="b subtle agi-btn" title="copy how to connect: MCP + curl + commands" onclick="copyConn(event,\''+attrEsc(b)+'\')">🔌 Connect</button></td></tr>';}).join('');}
+function renderOverview(arr){arr=arr||[];var on=0,idle=0,off=0,mcp=0,lsum=0,ln=0,uncl=0;arr.forEach(function(d){var s=statusOf(d);if(s==='on')on++;else if(s==='idle')idle++;else off++;if(d.mcp_active)mcp++;if(!d.owner)uncl++;if(d.cpu_pct!=null){lsum+=d.cpu_pct;ln++;}});var avg=ln?Math.round(lsum/ln)+'%':'—';document.getElementById('ov-summary').innerHTML='<span class="ovs"><b>'+arr.length+'</b> devices</span><span class="ovs"><span class="dot on"></span>'+on+' online</span><span class="ovs"><span class="dot idle"></span>'+idle+' idle</span><span class="ovs"><span class="dot off"></span>'+off+' stale</span><span class="ovs">avg CPU <b>'+avg+'</b></span>'+(mcp?'<span class="ovs mcp-live">🤖⇄ '+mcp+' active</span>':'');var body=document.getElementById('ov-body');if(!arr.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices in your view.'+scopeHint()+'</td></tr>';return;}var sorted=(SEARCH?arr.filter(function(d){return ((d.name||'')+' '+(d.hostname||'')+' '+(d.os||'')+' '+(d.ip||'')).toLowerCase().indexOf(SEARCH)>=0;}):arr).slice();sorted.sort(function(a,b){var va=ovVal(a,OV_SORT.key),vb=ovVal(b,OV_SORT.key);return (va<vb?-1:va>vb?1:0)*OV_SORT.dir;});if(!sorted.length){body.innerHTML='<tr><td colspan="13" class="ov-empty">No devices match “'+esc2(SEARCH)+'”.</td></tr>';return;}body.innerHTML=sorted.map(function(d){var b=baseOf(d);var nm=d.name||d.hostname||d.ip;var load=(d.cpu_pct!=null)?('<span class="dl-load '+loadCls(d.cpu_pct)+'">'+Math.round(d.cpu_pct)+'%</span>'):'—';var ram=(d.free_gb!=null&&d.mem_gb)?(d.free_gb.toFixed(1)+' / '+d.mem_gb+' GB'):'—';var addr=d.scheme==='relay'?('relay · '+d.ip):(d.ip+':'+d.port);var cams=(d.cameras||[]).length;var mics=(d.microphones||[]).length;var m=d.mcp_active?'<span class="mcp-live" title="AI agent accessing now">🤖⇄</span>':'';return '<tr class="ov-row" data-base="'+attrEsc(b)+'"><td><span class="dot '+statusOf(d)+'"></span></td><td class="ov-nm">'+esc2(nm)+ownerChip(d)+'</td><td>'+esc2((d.os||'')+(d.arch?(' '+d.arch):''))+instChip(d)+'</td><td>'+presCell(d)+'</td><td class="ov-num">'+load+'</td><td class="ov-num">'+esc2(ram)+'</td><td class="ov-num">'+esc2(''+(d.cores||'—'))+'</td><td class="ov-num">'+(cams||'—')+'</td><td class="ov-num">'+(mics||'—')+'</td><td class="mono">'+esc2(addr)+credChip(d)+'</td><td>'+esc2(seenTxt(d.last_seen_secs)||'—')+'</td><td>'+m+'</td><td><button class="b subtle agi-btn" title="copy how to connect: MCP + curl + commands" onclick="copyConn(event,\''+attrEsc(b)+'\')">🔌 Connect</button></td></tr>';}).join('');}
 function runFleet(){var c=document.getElementById('fleet-cmd').value;if(!c)return;var n=(LAST||[]).length;if(!confirm('Run this command on ALL '+n+' device'+(n===1?'':'s')+'?\n\n'+c))return;var el=document.getElementById('fleet-results');el.innerHTML='<div class="aud-empty">running on all devices…</div>';fetch(API+'/x/fleet?kind=exec&cmd='+enc(c)).then(function(r){return r.json();}).then(function(j){var rs=j.results||[];if(!rs.length){el.innerHTML='<div class="aud-empty">No devices.</div>';return;}el.innerHTML=rs.map(function(r){return '<div class="fleet-card"><div class="fleet-dev">'+esc2(r.device)+'</div><pre class="fleet-out">'+esc2(r.output||'')+'</pre></div>';}).join('');}).catch(function(e){el.innerHTML='<div class="aud-empty">error: '+esc2(''+e)+'</div>';});}
 var AUD_ALL=[];
 function loadAudit(){fetch(API+'/audit').then(function(r){return r.json();}).then(function(j){AUD_ALL=j.audit||[];renderAudit();}).catch(function(){});}
@@ -5338,7 +5337,7 @@ function fmtSummary(t){var devs='',cmds='',head=t;var di=t.indexOf(' Devices: ')
 function select(base){if(!DEV[base])return;SEL=base;highlight();renderDetail(DEV[base]);}
 function highlight(){var lis=document.querySelectorAll('.dev-li');for(var i=0;i<lis.length;i++){lis[i].classList.toggle('sel',lis[i].getAttribute('data-base')===SEL);}}
 function renderDetail(d){DASH_ON=false;AUDIT_ON=false;OVERVIEW_ON=false;SCRIPTS_ON=false;COMPLIANCE_ON=false;SCHED_ON=false;RECS_ON=false;MAP_ON=false;CVE_ON=false;SET_ON=false;hideViews();document.getElementById('detail').style.display='block';setNav('');refreshHead(d);document.getElementById('d-controls').innerHTML=buildControls(d);AI_HIST=[];var __aip=document.getElementById('ai-panel');if(__aip)__aip.style.display='none';document.getElementById('d-analysis').innerHTML='<div class="an-empty">Loading analysis…</div>';loadAnalysis(baseOf(d));jobsOpen(baseOf(d));resetTerm();stopView();var o=document.getElementById('out');o.style.display='none';o.textContent='';}
-function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':((relay&&d.connected===false)?' <span class="recon-pill">RECONNECTING</span>':''));var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);}
+function refreshHead(d){var relay=d.scheme==='relay';document.getElementById('d-dot').className='dot '+statusOf(d);document.getElementById('d-name').textContent=d.name||d.hostname||d.ip;document.getElementById('d-sub').innerHTML=esc2((relay?('relay · '+d.ip):(((d.hostname&&d.hostname!==d.name)?(d.hostname+'  ·  '):'')+d.ip+':'+d.port))+'  ·  '+seenTxt(d.last_seen_secs))+((d.online===false)?' <span class="off-pill">OFFLINE</span>':((relay&&d.connected===false)?' <span class="recon-pill">RECONNECTING</span>':''));var op=document.getElementById('d-open');if(relay){op.style.display='none';}else{op.style.display='';op.href=SEL+'/';}document.getElementById('d-specs').innerHTML=specHtml(d);document.getElementById('d-activity').innerHTML=activityHtml(d);dsCred(d);}
 var ANALYSIS_LABELS={hardware:'Hardware',packages:'Installed software',services:'Running services',processes:'Processes',network:'Network neighbors',updates:'Available updates',encryption:'Disk encryption',firewall:'Firewall',av:'Antivirus'};
 var ANALYSIS_ORDER=['encryption','firewall','av','updates','hardware','packages','services','processes','network'];
 function loadAnalysis(target){fetch(API+'/x/analysis?target='+enc(target)).then(function(r){return r.json();}).then(function(j){renderAnalysis(j,target);}).catch(function(){});}

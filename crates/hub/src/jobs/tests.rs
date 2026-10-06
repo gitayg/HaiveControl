@@ -76,12 +76,9 @@ const AGENT_START_REPLY: &str = r#"{"ok":true,"id":"j1790420836094a3f1","pid":42
 fn fixture() -> &'static Fixture {
     static F: OnceLock<Fixture> = OnceLock::new();
     F.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("it-ai-hub-jobs-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("policy.json"), r#"{"deny_patterns":["rm -rf"]}"#).unwrap();
-        std::env::set_var("HUB_DATA", &dir);
-        std::env::set_var("MCP_TOKEN", "legacy-jobs-test-token");
+        // HUB_DATA (with its deny-`rm -rf` policy) and MCP_TOKEN are process-wide, so
+        // they come from the one shared setup rather than a fixture of their own.
+        crate::testenv::init();
         let (_, ro_tok) = mcptokens::mint(RO_OWNER, "read", 1);
         let (_, rw_tok) = mcptokens::mint(RO_OWNER, "write", 1);
 

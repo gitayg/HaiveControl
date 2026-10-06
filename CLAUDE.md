@@ -65,6 +65,19 @@ Devices are real people's machines, though — act carefully on them (see below)
     `{"ok":false}`, and a plain 404 (an agent from before jobs) becomes `the agent does not
     support jobs — update it`.
   - Relay-only: the controllers call `/m/job/*`, not the LAN-direct capability path.
+- **Device secrets (`crates/hub/src/devicesecrets.rs`, contract in `docs/DEVICE-SECRETS.md`,
+  hub 3.16.0 / agent 3.7.0).** An agent enrolls with `htok_…` and is issued its own `hdev_…`.
+  - **Rotate the enrollment token only once every device shows "own credential".** Rotation
+    deletes the old `htok_`, and every device still relaying with it is disconnected.
+  - **Agents ≤ 3.6.x never get a secret.** The hub mints only on `ds=1`, which they never send;
+    a device enrolled with the shared `RELAY_TOKEN` gets none either. So update the fleet's
+    agents (release + `AGENT_REV` + `AGENT_VERSION`) before rotating.
+  - **Fixed in 3.16.0: rotation now drops the old token's tunnels.** `rotate_enroll_token` calls
+    `relay::drop_tunnels_bound_to` with `auth_hash` of every token it deleted, so a device on the
+    old token shows `connected: false` in `/agents` at once, and re-enrolling it with the new
+    token is accepted (it used to get `403 relay id in use by another enrollment` until a hub
+    restart). Tunnels bound to a device secret are untouched. Tests: `rotating_drops_the_tunnel_*`,
+    `a_device_on_the_old_token_re_enrolls_*`, `rotating_leaves_the_tunnel_of_a_secret_holder_alone`.
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed

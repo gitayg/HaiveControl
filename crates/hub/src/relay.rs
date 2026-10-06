@@ -41,7 +41,10 @@ pub struct Tunnel {
     /// subsequent poll/reply/heartbeat for this id must present the SAME token —
     /// so a holder of merely *a* valid token (the shared RELAY_TOKEN, or another
     /// owner's htok_) cannot poll/forge an arbitrary device's tunnel by id.
-    auth: String,
+    /// Re-bound only through `rebind` / `hello(.., rebind = true)`: on proof of the
+    /// device's own secret, or of the enrollment token of the owner that secret was
+    /// issued to (see devicesecrets.rs).
+    auth: Mutex<String>,
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<Tunnel>>> {
@@ -182,8 +185,10 @@ pub fn dedup_hostnames(agents: &Agents) {
 /// POST /relay/hello — register (or heartbeat) a relay agent. `auth` is
 /// sha256(enrollment token) (see `auth_hash`); it binds the tunnel to its enroller.
 /// Returns false if an EXISTING tunnel is heartbeat'd with a different token — i.e.
-/// someone other than the original agent is trying to take over the id.
-pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
+/// someone other than the original agent is trying to take over the id — unless
+/// `rebind`, which the caller passes only on proof of the device's own secret (or of
+/// its secret's owner's enrollment token): the tunnel is then re-bound to `auth`.
+pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str, rebind: bool) -> bool {
     let agent_id = match data.get("relay_id").and_then(|x| x.as_str()) {
         Some(s) => s.to_string(),
         None => return false,
@@ -192,8 +197,12 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
     let fresh = match reg.get(&agent_id) {
         // Existing tunnel: only its original enroller (same token) may heartbeat it.
         Some(t) => {
-            if !ct_eq(&t.auth, auth) {
-                return false;
+            let mut bound = t.auth.lock().unwrap();
+            if !ct_eq(&bound, auth) {
+                if !rebind {
+                    return false;
+                }
+                *bound = auth.to_string();
             }
             false
         }
@@ -205,7 +214,7 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
                     qcv: Condvar::new(),
                     pending: Mutex::new(HashMap::new()),
                     next_id: AtomicU32::new(1),
-                    auth: auth.to_string(),
+                    auth: Mutex::new(auth.to_string()),
                 }),
             );
             true
@@ -235,6 +244,7 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
         let id = agent_id.clone();
         std::thread::spawn(move || {
             if request(&id, "POST", "/dissolve", None).is_some() {
+                crate::devicesecrets::remove(&id);
                 println!("relay: {id} dissolved (queued while offline)");
             } else {
                 crate::queue_dissolve(&format!("relay:{id}"));
@@ -243,7 +253,10 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
         // A queued dissolve is now being delivered — drop the device from inventory
         // too (it just re-registered on this heartbeat). If the dispatch above fails
         // it re-queues, the agent re-hellos, and this repeats until it sticks.
-        crate::forget_device(agents, &format!("relay://{agent_id}"));
+        // Inventory only: the device secret has to outlive this, or a dispatch that
+        // fails and re-queues would leave the device unable to reconnect and so
+        // never receive its dissolve. It is deleted once the dissolve is delivered.
+        crate::forget_inventory(agents, &format!("relay://{agent_id}"));
     }
     // #50: dispatch any canned actions queued while this device was offline.
     let qid = agent_id.clone();
@@ -256,7 +269,7 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str) -> bool {
 /// caller can only dequeue commands destined for a device it actually enrolled.
 pub fn poll(agent_id: &str, auth: &str, timeout: Duration) -> Option<String> {
     let t = registry().lock().unwrap().get(agent_id)?.clone();
-    if !ct_eq(&t.auth, auth) {
+    if !ct_eq(&t.auth.lock().unwrap(), auth) {
         return None;
     }
     let mut q = t.queue.lock().unwrap();
@@ -273,7 +286,7 @@ pub fn poll(agent_id: &str, auth: &str, timeout: Duration) -> Option<String> {
 /// response for another device's in-flight request by guessing (agent_id, req_id).
 pub fn reply_stream(agent_id: &str, auth: &str, req_id: u32, status: u16, ctype: String, reader: &mut dyn Read) {
     let tx = match registry().lock().unwrap().get(agent_id).cloned() {
-        Some(t) if ct_eq(&t.auth, auth) => match t.pending.lock().unwrap().get(&req_id).cloned() {
+        Some(t) if ct_eq(&t.auth.lock().unwrap(), auth) => match t.pending.lock().unwrap().get(&req_id).cloned() {
             Some(tx) => tx,
             None => return,
         },
@@ -300,6 +313,41 @@ pub fn reply_stream(agent_id: &str, auth: &str, req_id: u32, status: u16, ctype:
     if let Some(t) = registry().lock().unwrap().get(agent_id) {
         t.pending.lock().unwrap().remove(&req_id);
     }
+}
+
+/// Re-bind `agent_id`'s tunnel to `auth` — right after a device secret is minted,
+/// so the device's next poll with that secret is accepted without waiting for a
+/// heartbeat. False if there is no tunnel.
+pub fn rebind(agent_id: &str, auth: &str) -> bool {
+    match registry().lock().unwrap().get(agent_id) {
+        Some(t) => {
+            *t.auth.lock().unwrap() = auth.to_string();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Forget `agent_id`'s tunnel. Used when its device secret is revoked: the tunnel
+/// is bound to that secret, so without this a re-enrollment with the enrollment
+/// token would be refused as a takeover. A poll already waiting ends on its timeout.
+pub fn drop_tunnel(agent_id: &str) -> bool {
+    registry().lock().unwrap().remove(agent_id).is_some()
+}
+
+/// Forget every tunnel bound to one of `hashes` (each an `auth_hash` of an
+/// enrollment token that was just deleted). Without this a device on a rotated-out
+/// token stays "connected" though every call is refused, and its re-enrollment with
+/// the new token is refused as a takeover until the hub restarts. Tunnels bound to a
+/// device secret never match. Returns how many were dropped.
+pub fn drop_tunnels_bound_to(hashes: &[String]) -> usize {
+    let mut reg = registry().lock().unwrap();
+    let before = reg.len();
+    reg.retain(|_, t| {
+        let bound = t.auth.lock().unwrap();
+        !hashes.iter().any(|h| ct_eq(&bound, h))
+    });
+    before - reg.len()
 }
 
 /// True once the agent has an active tunnel (dialed in via /relay/hello).

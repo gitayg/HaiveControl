@@ -590,8 +590,9 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
 2. Set env / secrets:
    - `HUB_PUBLIC_URL=https://<your-app-url>` — makes the dashboard show relay-mode install
      commands (add a custom domain for a cleaner product).
-   - `RELAY_TOKEN=<a long random secret>` — **the agent's credential**; it replaces SSO on
-     `/relay`, and the dashboard bakes it into the shown install command.
+   - `RELAY_TOKEN=<a long random secret>` — turns on relay authentication, which replaces SSO
+     on `/relay`. Behind SSO the dashboard's install command carries the user's own enrollment
+     token (`htok_…`); only without SSO does it carry this shared token.
 3. **Bypass SSO on the agent-facing paths** (`auth_bypass_paths=["/relay","/bin","/m"]`;
    add `/m` only if you use the MCP) so
    devices can reach the tunnel + downloads and long-lived connections aren't buffered or
@@ -600,11 +601,31 @@ be SSO-bypassed — and the hub then authenticates the agent itself with a share
    the platform edge, so the tunnel is encrypted even though it's plain HTTP inside. `/bin`
    serves only public binaries, so it needs no token.
 4. Deploy, then on each device run the relay command the dashboard shows
-   (`./it-ai --relay https://<your-app-url> --relay-token <token> --name <device>`).
+   (`./it-ai --relay https://<your-app-url> --relay-token htok_… --name <device>`, or the
+   token in `HIVE_RELAY_TOKEN` to keep it off the command line).
 
-**Relay auth:** with `RELAY_TOKEN` set, every `/relay/*` call must carry `?tok=<token>` —
-the agent sends it (`--relay-token` or `HIVE_RELAY_TOKEN`); wrong/absent → `401`. Unset =
-open (trusted LAN / dev). Query-string tokens on bypass paths aren't logged by the proxy.
+**Relay auth:** with `RELAY_TOKEN` set, every `/relay/*` call must carry `?tok=<token>`;
+wrong/absent → `401`. The agent enrolls with the token it was given (`--relay-token` or
+`HIVE_RELAY_TOKEN`); from then on an agent ≥ 3.7 uses its own device secret (`hdev_…`, see
+**Device credentials** below). Unset = open (trusted LAN / dev), except that a presented
+device secret is always checked. Query-string tokens on bypass paths aren't logged by the proxy.
+
+**Device credentials (hub 3.16.0, agent 3.7.0).** On its first hello an agent ≥ 3.7 asks for
+its own secret (`/relay/hello?…&ds=1`). If it authenticated with an enrollment token, the hub
+issues a device secret (`hdev_…`), stores only its sha256 in `HUB_DATA/device_secrets.json`
+(0600), and accepts that secret on every `/relay/*` call for that device's relay id only. Agents
+≤ 3.6.x never ask and stay on the enrollment token, as does a device enrolled with the shared
+`RELAY_TOKEN`. The wire contract is [`docs/DEVICE-SECRETS.md`](docs/DEVICE-SECRETS.md).
+- **Chips.** Every relay device shows **own credential** or **enrollment token**, in the
+  overview's address column and in the device's detail view.
+- **Revoke** (detail view, devices with their own credential): `POST /x/device-secret/revoke?target=…`
+  (owner-gated, audited as "revoke device secret") deletes the secret and drops the device's
+  tunnel. Its next call is refused `401 device credential rejected`, and it stays disconnected
+  until re-enrolled with an enrollment token. Removing or dissolving a device deletes its secret
+  too.
+- **Rotation** disconnects only devices still on the enrollment token (see **Enrollment
+  tokens** below). Before you rotate, the *Register a device* panel and the confirm dialog say
+  "N of M devices still authenticate with the enrollment token and will be disconnected."
 
 **Relay reliability.** The tunnel is HTTP long-poll, so it can be torn down between
 commands (proxy/NAT idle timeout, or a hub redeploy that clears the in-memory tunnel
@@ -639,8 +660,12 @@ device command line, each account gets an opaque enrollment token. The token map
 owner id on the hub (resolved in `canon_owner`, persisted to `HUB_DATA/owner_tokens.json`),
 so a device enrolled with `--owner htok_…` scopes to that account. The token is minted on
 first view and shown in **+ Add device**; **Rotate token** there issues a fresh one and
-stops the old one working for *new* enrollments — devices already enrolled keep their scope
-(they stored the resolved owner id, not the token). `GET /x/enroll-token[?rotate=1]` (behind
+deletes the old one. Devices holding their own device secret stay connected. Devices still
+relaying with the old enrollment token (agents ≤ 3.6.x, or any device not yet issued a
+secret) are refused on their next call and must be re-enrolled with the new token — so
+rotate only once every device shows **own credential**. Rotation drops those devices' tunnels
+straight away, so they show as not connected and re-enroll with the new token without a hub
+restart (before 3.16.0 the stale tunnel refused them as a takeover until the hub restarted). `GET /x/enroll-token[?rotate=1]` (behind
 SSO) is the API. An email or a raw owner id still works as `--owner`, for backward compat.
 
 > The `owner` is still self-asserted at the transport level (any holder of the shared
