@@ -159,9 +159,9 @@ pub fn relay_caller_owner(url: &str) -> Option<String> {
     crate::resolve_owner_token(&tok)
 }
 
-/// Record the device's public IP and owner on its hello payload, and pin the owner
-/// as a persistent override so it survives every check-in.
-fn stamp(req: &Request, agents: &Agents, data: &mut serde_json::Value, owner: Option<&str>) {
+/// Record the device's public IP and owner on its hello payload. No side effects:
+/// the payload is only stored if `relay::hello` accepts it.
+fn stamp(req: &Request, data: &mut serde_json::Value, owner: Option<&str>) {
     // The device dials out, so the socket (or X-Forwarded-For behind the AppCrane
     // proxy) carries its real public IP — capture it for geo.
     let pip = req_header(req, "X-Forwarded-For")
@@ -172,11 +172,17 @@ fn stamp(req: &Request, agents: &Agents, data: &mut serde_json::Value, owner: Op
             o.insert("public_ip".into(), serde_json::json!(ip));
         }
         if let Some(owner) = owner {
-            if let Some(id) = o.get("relay_id").and_then(|x| x.as_str()) {
-                crate::set_owner(agents, &format!("relay:{id}"), owner);
-            }
             o.insert("owner".into(), serde_json::json!(owner));
         }
+    }
+}
+
+/// Pin the owner as a persistent override so it survives every check-in. Call only
+/// after `relay::hello` accepted the hello, with the id it registered (the payload's
+/// `relay_id`): a refused hello must change no ownership.
+fn record_owner(agents: &Agents, rid: &str, owner: Option<&str>) {
+    if let Some(owner) = owner {
+        crate::set_owner(agents, &format!("relay:{rid}"), owner);
     }
 }
 
@@ -190,17 +196,20 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
     // The id the payload registers. A credential checked against `id=` must be
     // registering that same id, or a secret for one device could heartbeat — and,
     // since a secret may re-bind, take over — another device's tunnel.
-    let same_id = !rid.is_empty() && data.get("relay_id").and_then(|x| x.as_str()) == Some(rid.as_str());
+    let body_id = data.get("relay_id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+    let same_id = !rid.is_empty() && body_id == rid;
 
     if is_device_secret(&tok) {
         let owner = match verify(&rid, &tok) {
             Some(o) if same_id => o,
             _ => return Response::from_string(REJECTED).with_status_code(401),
         };
-        stamp(req, agents, &mut data, Some(&owner));
+        stamp(req, &mut data, Some(&owner));
         // A valid device secret proves identity, so it may take over a tunnel still
         // bound to the enrollment token it was issued under.
-        relay::hello(agents, data, &relay::auth_hash(&tok), true);
+        if relay::hello(agents, data, &relay::auth_hash(&tok), true) {
+            record_owner(agents, &body_id, Some(&owner));
+        }
         return Response::from_string("").with_status_code(204);
     }
 
@@ -234,7 +243,7 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
     };
     // A device queued to dissolve is dissolved by this hello; don't issue it a credential.
     let dissolving = crate::is_dissolve_pending(&format!("relay:{rid}"));
-    stamp(req, agents, &mut data, owner.as_deref());
+    stamp(req, &mut data, owner.as_deref());
     if !relay::hello(agents, data, &relay::auth_hash(&tok), rebind) {
         // The id is already bound to a different enrollment token —
         // someone is trying to take over another device's tunnel.
@@ -242,10 +251,14 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
     }
     let owner = match mint_for {
         Some(o) if !dissolving => o,
-        _ => return Response::from_string("").with_status_code(204),
+        _ => {
+            record_owner(agents, &body_id, owner.as_deref());
+            return Response::from_string("").with_status_code(204);
+        }
     };
     match mint(&rid, &owner) {
         Ok(secret) => {
+            record_owner(agents, &body_id, Some(&owner));
             // Its next poll will carry the new secret; accept it straight away.
             relay::rebind(&rid, &relay::auth_hash(&secret));
             println!("relay: {rid} issued a device credential");
@@ -253,7 +266,10 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
         }
         Err(MintError::OtherOwner) => Response::from_string(IN_USE).with_status_code(403),
         // Not issued: the device stays on its enrollment token, as with an older hub.
-        Err(_) => Response::from_string("").with_status_code(204),
+        Err(_) => {
+            record_owner(agents, &body_id, Some(&owner));
+            Response::from_string("").with_status_code(204)
+        }
     }
 }
 

@@ -44,6 +44,8 @@ silently dropped (there is no "unclaim" — only transfer). With no identity con
 trusted LAN / dev hub with `RELAY_TOKEN` unset), the hub is intentionally unscoped for
 single-operator use.
 
+**A refused enrollment changes no ownership (fixed in hub 3.16.1).** Before 3.16.1 a `/relay/hello` with another owner's enrollment token recorded that owner on the device *before* the takeover check refused it with `403`, so anyone holding any enrollment token who knew a relay id became that device's owner (and could control it). The owner is now recorded only after the hello, and any mint, is accepted.
+
 **Approval-gated AI writes.** The AI assistant investigates autonomously with read tools
 (inventory, system reports, compliance posture, screenshots, CVE lookup) but **cannot
 change a machine on its own**. Writes go through a fixed, server-side fix menu

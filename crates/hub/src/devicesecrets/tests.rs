@@ -397,6 +397,65 @@ fn another_owners_enrollment_token_cannot_take_over_a_tunnel_with_no_secret() {
     assert!(tunnel_bound_to("ds-http-legacy", &mine), "control: still the device's own token");
 }
 
+/// Both places a relay device's owner lives: the persisted override and the
+/// `/agents` row (which `may_control` reads).
+fn owner_state(rid: &str) -> (Option<String>, Option<String>) {
+    let ov = crate::owner_override(&format!("relay:{rid}"));
+    let (st, _, body) = call("GET", "/agents", "", &[]);
+    assert_eq!(st, 200);
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let row = v["agents"].as_array().unwrap().iter().find(|a| a["relay_id"] == rid).and_then(|a| a["owner"].as_str().map(String::from));
+    (ov, row)
+}
+
+fn owned_by(owner: &str) -> (Option<String>, Option<String>) {
+    (Some(owner.to_string()), Some(owner.to_string()))
+}
+
+#[test]
+fn a_refused_hello_with_another_owners_token_leaves_the_owner_alone() {
+    let x = htok("owner-http-own-x");
+    assert_eq!(hello("ds-http-own-noss", &x, false).0, 204);
+    assert_eq!(owner_state("ds-http-own-noss"), owned_by("owner-http-own-x"), "control: enrolled under X");
+    let y = htok("owner-http-own-y");
+    for ds in [false, true] {
+        let (st, body) = hello("ds-http-own-noss", &y, ds);
+        assert_eq!((st, body.as_str()), (403, IN_USE), "ds={ds}");
+        assert_eq!(owner_state("ds-http-own-noss"), owned_by("owner-http-own-x"), "ds={ds}: a refused hello changed the owner");
+    }
+}
+
+#[test]
+fn a_refused_hello_against_a_secret_holder_leaves_the_owner_alone() {
+    let s = enroll("ds-http-own-sec", "owner-http-own-sx");
+    assert_eq!(owner_state("ds-http-own-sec"), owned_by("owner-http-own-sx"), "control: enrolled under X");
+    let y = htok("owner-http-own-sy");
+    for ds in [false, true] {
+        let (st, body) = hello("ds-http-own-sec", &y, ds);
+        assert_eq!((st, body.as_str()), (403, IN_USE), "ds={ds}");
+        assert_eq!(owner_state("ds-http-own-sec"), owned_by("owner-http-own-sx"), "ds={ds}: a refused hello changed the owner");
+    }
+    assert_eq!(verify("ds-http-own-sec", &s).as_deref(), Some("owner-http-own-sx"));
+    assert_eq!(hello("ds-http-own-sec", &s, false).0, 204, "the device keeps working");
+}
+
+#[test]
+fn the_legitimate_enrollment_and_re_enrollment_still_record_the_owner() {
+    let x = htok("owner-http-own-legit");
+    assert_eq!(owner_state("ds-http-own-legit").0, None, "control: no owner before enrolling");
+    let s = enroll("ds-http-own-legit", "owner-http-own-legit");
+    assert_eq!(owner_state("ds-http-own-legit"), owned_by("owner-http-own-legit"), "first enrollment sets the owner");
+    // The owner's own token re-enrolls (lost secret): a new secret, same owner.
+    let s2 = enroll("ds-http-own-legit", "owner-http-own-legit");
+    assert_ne!(s, s2);
+    assert_eq!(owner_state("ds-http-own-legit"), owned_by("owner-http-own-legit"));
+    assert_eq!(hello("ds-http-own-legit", &s2, false).0, 204);
+    // A ≤ 3.6 device on the enrollment token: first hello records the owner too.
+    assert_eq!(hello("ds-http-own-legit-old", &x, false).0, 204);
+    assert_eq!(owner_state("ds-http-own-legit-old"), owned_by("owner-http-own-legit"));
+    assert_eq!(hello("ds-http-own-legit-old", &x, false).0, 204, "heartbeat on its own token");
+}
+
 #[test]
 fn the_device_list_says_which_credential_each_device_relays_with() {
     let owner = "owner-http-list";
