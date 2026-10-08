@@ -46,6 +46,8 @@ single-operator use.
 
 **A refused enrollment changes no ownership (fixed in hub 3.16.1).** Before 3.16.1 a `/relay/hello` with another owner's enrollment token recorded that owner on the device *before* the takeover check refused it with `403`, so anyone holding any enrollment token who knew a relay id became that device's owner (and could control it). The owner is now recorded only after the hello, and any mint, is accepted.
 
+**An owned device cannot be claimed by another owner's token after a hub restart (fixed in hub 3.16.2).** Tunnels live in memory, so until a device reconnected after a restart, a hello for its relay id with another owner's enrollment token was taken as a fresh enrollment and re-owned the device (even one holding its own device secret). An enrollment-token hello is now refused with `403` when the id's device secret, persisted owner override, or device row names a different owner.
+
 **Approval-gated AI writes.** The AI assistant investigates autonomously with read tools
 (inventory, system reports, compliance posture, screenshots, CVE lookup) but **cannot
 change a machine on its own**. Writes go through a fixed, server-side fix menu

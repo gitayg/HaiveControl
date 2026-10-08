@@ -478,3 +478,105 @@ fn the_device_list_says_which_credential_each_device_relays_with() {
     }
     assert!(!html.contains("devices already enrolled are unaffected"), "stale rotation text");
 }
+
+// ---- after a hub restart ---------------------------------------------------------
+// The tunnel registry is in memory; owners, device secrets and enrollment tokens are
+// persisted. `relay::drop_tunnel(rid)` is exactly what a restart loses for `rid`
+// (the whole registry is not cleared: tests share one hub and run in parallel).
+
+/// Per ds: (ds, status, body, owner state).
+type Outcomes = Vec<(bool, u16, String, (Option<String>, Option<String>))>;
+
+fn restart(rid: &str) {
+    crate::relay::drop_tunnel(rid);
+}
+
+/// For ds = false, then true: (status, body, owner state) of `tok`'s hello for `rid`
+/// right after a restart. Both are collected before asserting so a failure shows both.
+fn after_restart(rid: &str, tok: &str) -> Outcomes {
+    [false, true]
+        .into_iter()
+        .map(|ds| {
+            restart(rid);
+            let (st, body) = hello(rid, tok, ds);
+            // Never print a minted secret in a failure message.
+            let body = if body.contains(PREFIX) { "<device secret minted>".to_string() } else { body };
+            (ds, st, body, owner_state(rid))
+        })
+        .collect()
+}
+
+fn refused_and_owned_by(owner: &str) -> Outcomes {
+    [false, true].into_iter().map(|ds| (ds, 403, IN_USE.to_string(), owned_by(owner))).collect()
+}
+
+#[test]
+fn after_a_restart_another_owners_token_cannot_claim_a_device_holding_a_secret() {
+    let s = enroll("ds-http-rs-sec", "owner-http-rs-sx");
+    assert_eq!(owner_state("ds-http-rs-sec"), owned_by("owner-http-rs-sx"), "control: enrolled under X");
+    let y = htok("owner-http-rs-sy");
+    assert_eq!(after_restart("ds-http-rs-sec", &y), refused_and_owned_by("owner-http-rs-sx"));
+    assert_eq!(verify("ds-http-rs-sec", &s).as_deref(), Some("owner-http-rs-sx"), "secret untouched");
+    restart("ds-http-rs-sec");
+    assert_eq!(hello("ds-http-rs-sec", &s, false).0, 204, "the device reconnects on its own secret");
+    assert_eq!(owner_state("ds-http-rs-sec"), owned_by("owner-http-rs-sx"));
+}
+
+#[test]
+fn after_a_restart_another_owners_token_cannot_claim_a_device_without_a_secret() {
+    let x = htok("owner-http-rs-nx");
+    assert_eq!(hello("ds-http-rs-nos", &x, false).0, 204);
+    assert_eq!(owner_state("ds-http-rs-nos"), owned_by("owner-http-rs-nx"), "control: enrolled under X");
+    let y = htok("owner-http-rs-ny");
+    assert_eq!(after_restart("ds-http-rs-nos", &y), refused_and_owned_by("owner-http-rs-nx"));
+    assert!(!has("ds-http-rs-nos"), "a secret was minted for another owner");
+}
+
+#[test]
+fn after_a_restart_the_shared_relay_token_cannot_claim_an_owned_device() {
+    let x = htok("owner-http-rs-shx");
+    assert_eq!(hello("ds-http-rs-shared", &x, false).0, 204);
+    for (ds, st, _, owners) in after_restart("ds-http-rs-shared", crate::testenv::RELAY_TOKEN) {
+        assert_eq!(st, 403, "ds={ds}");
+        assert_eq!(owners, owned_by("owner-http-rs-shx"), "ds={ds}");
+    }
+    assert!(!has("ds-http-rs-shared"));
+}
+
+#[test]
+fn after_a_restart_the_owner_re_enrolls_and_the_device_reconnects() {
+    let owner = "owner-http-rs-own";
+    let x = htok(owner);
+    // Secret holder: reconnects on its hdev_, and its owner's token re-enrolls it.
+    let s = enroll("ds-http-rs-own", owner);
+    restart("ds-http-rs-own");
+    assert_eq!(hello("ds-http-rs-own", &s, false), (204, String::new()));
+    restart("ds-http-rs-own");
+    let s2 = enroll("ds-http-rs-own", owner);
+    assert_ne!(s, s2);
+    assert_eq!(hello("ds-http-rs-own", &s2, false).0, 204);
+    assert_eq!(owner_state("ds-http-rs-own"), owned_by(owner));
+    // Enrollment-token device: its owner's token reconnects it, with or without ds=1.
+    assert_eq!(hello("ds-http-rs-own-old", &x, false).0, 204);
+    restart("ds-http-rs-own-old");
+    assert_eq!(hello("ds-http-rs-own-old", &x, false), (204, String::new()));
+    restart("ds-http-rs-own-old");
+    assert_eq!(hello("ds-http-rs-own-old", &x, true).0, 200);
+    assert_eq!(owner_state("ds-http-rs-own-old"), owned_by(owner));
+    // A rotated token of the same owner re-enrolls it too.
+    let new = rotate_enroll_token(owner);
+    restart("ds-http-rs-own-old");
+    assert_eq!(hello("ds-http-rs-own-old", &new, true).0, 200);
+    assert_eq!(owner_state("ds-http-rs-own-old"), owned_by(owner));
+}
+
+#[test]
+fn after_a_restart_a_new_id_still_enrolls_under_any_owner() {
+    let y = htok("owner-http-rs-new");
+    assert_eq!(owner_state("ds-http-rs-new").0, None, "control: unowned");
+    assert_eq!(hello("ds-http-rs-new", &y, false), (204, String::new()));
+    assert_eq!(owner_state("ds-http-rs-new"), owned_by("owner-http-rs-new"));
+    assert_eq!(owner_state("ds-http-rs-new-ds").0, None, "control: unowned");
+    enroll("ds-http-rs-new-ds", "owner-http-rs-new");
+    assert_eq!(owner_state("ds-http-rs-new-ds"), owned_by("owner-http-rs-new"));
+}

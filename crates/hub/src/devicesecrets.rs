@@ -186,6 +186,14 @@ fn record_owner(agents: &Agents, rid: &str, owner: Option<&str>) {
     }
 }
 
+/// True if `rid` already belongs to an owner other than `owner`: by its device
+/// secret, its persisted owner override, or its device row.
+fn owned_by_other(agents: &Agents, rid: &str, owner: &str) -> bool {
+    let key = format!("relay:{rid}");
+    let row = agents.lock().unwrap().get(&key).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from));
+    [owner_of(rid), crate::owner_override(&key), row].into_iter().flatten().any(|held| held != owner)
+}
+
 /// POST /relay/hello?id=<rid>&tok=<t>[&ds=1] — register or heartbeat a relay agent.
 pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
     let tok = query_param(url, "tok").unwrap_or_default();
@@ -226,6 +234,14 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
             "enrollment requires a personal enrollment token (--relay-token htok_…) — get one from the dashboard's Register a device panel",
         )
         .with_status_code(403);
+    }
+    // The tunnel registry is in memory, so after a hub restart the takeover check in
+    // `relay::hello` has nothing to compare against until the device reconnects. The
+    // owner is persisted, though: an id already owned by someone else is refused here.
+    if let Some(o) = &owner {
+        if owned_by_other(agents, &body_id, o) {
+            return Response::from_string(IN_USE).with_status_code(403);
+        }
     }
     // Mint only for an enrollment token, only when asked (agents ≤ 3.6.x never ask),
     // and only for the id the payload actually registers.
