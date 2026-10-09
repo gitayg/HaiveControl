@@ -690,7 +690,10 @@ also delivers device traffic only to clients that recently spoke to that device,
 can't be used to reflect traffic. Each exit must have its own WireGuard key: Enable is
 refused (409, audited as "VPN exit refused") for a device that reports a key another
 exit already uses, such as a cloned SD-card image. The relay never routes a handshake that
-matches two devices.
+matches two devices. Client sessions are capped per exit (256) and per client IP (64), and
+4096 overall. A full cap evicts its own oldest session that the device has not answered.
+A flood of handshakes therefore only displaces its own kind, never another exit's clients or
+an established session.
 
 **Hub setup (AppCrane):**
 1. Env: `VPN_RELAY_ENDPOINT=crane.glick.run:<public udp port>` (what clients and devices

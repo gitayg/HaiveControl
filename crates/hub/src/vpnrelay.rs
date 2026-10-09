@@ -35,7 +35,14 @@ pub const T_DATA: u8 = 3;
 const DEVICE_TTL: Duration = Duration::from_secs(35);
 /// A client that has been silent this long must handshake again to be routed.
 const SESSION_TTL: Duration = Duration::from_secs(180);
+/// A client the device has not answered within this long is dropped first.
+const PENDING_TTL: Duration = Duration::from_secs(10);
+/// Session caps: overall (memory), per exit device, and per client IP (generous:
+/// phones behind one carrier NAT share an IP). A full cap evicts its own oldest
+/// unanswered session, so a flood only ever displaces its own kind.
 const MAX_SESSIONS: usize = 4096;
+const MAX_SESSIONS_PER_DEVICE: usize = 256;
+const MAX_SESSIONS_PER_IP: usize = 64;
 /// HELLO timestamps must be within this of our clock (replay window).
 const CLOCK_SKEW_MS: u64 = 120_000;
 
@@ -47,10 +54,24 @@ struct Dev {
     last_seen: Option<Instant>,
 }
 
+/// A client pinned to a device. `answered` once the device sent it a handshake
+/// response or transport data: it is a real peer of that device.
+struct Session {
+    device: String,
+    last: Instant,
+    answered: bool,
+}
+
+impl Session {
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.last) >= if self.answered { SESSION_TTL } else { PENDING_TTL }
+    }
+}
+
 #[derive(Default)]
 struct Relay {
     devs: HashMap<String, Dev>,
-    sessions: HashMap<SocketAddr, (String, Instant)>,
+    sessions: HashMap<SocketAddr, Session>,
 }
 
 fn relay() -> &'static Mutex<Relay> {
@@ -176,13 +197,42 @@ pub fn start(port: u16) {
 }
 
 fn prune(now: Instant) {
-    relay().lock().unwrap().sessions.retain(|_, (_, t)| now.duration_since(*t) < SESSION_TTL);
+    relay().lock().unwrap().sessions.retain(|_, s| !s.expired(now));
+}
+
+/// Get under `cap` sessions matching `of`, evicting the stalest one that is
+/// unanswered or expired. False if every one of them is answered and live: then
+/// only this IP or this device is turned away, never everyone.
+fn make_room(r: &mut Relay, of: &dyn Fn(&SocketAddr, &Session) -> bool, cap: usize, now: Instant) -> bool {
+    let mut n = 0;
+    let mut victim: Option<(SocketAddr, Instant)> = None;
+    for (a, s) in r.sessions.iter().filter(|(a, s)| of(a, s)) {
+        n += 1;
+        if (!s.answered || s.expired(now)) && victim.is_none_or(|(_, t)| s.last < t) {
+            victim = Some((*a, s.last));
+        }
+    }
+    if n < cap {
+        return true;
+    }
+    victim.is_some_and(|(a, _)| r.sessions.remove(&a).is_some())
+}
+
+/// Room for a new session from `ip` to `device`, under the per-IP, per-device and
+/// overall caps in turn.
+fn admit(r: &mut Relay, ip: IpAddr, device: &str, now: Instant) -> bool {
+    make_room(r, &|a, _| a.ip() == ip, MAX_SESSIONS_PER_IP, now)
+        && make_room(r, &|_, s| s.device == device, MAX_SESSIONS_PER_DEVICE, now)
+        && make_room(r, &|_, _| true, MAX_SESSIONS, now)
 }
 
 /// Decide what one incoming datagram turns into. Pure apart from the relay
 /// table, so the routing rules can be tested without sockets.
 fn route(pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(SocketAddr, Vec<u8>)> {
-    let mut r = relay().lock().unwrap();
+    route_in(&mut relay().lock().unwrap(), pkt, from, now, wall_ms)
+}
+
+fn route_in(r: &mut Relay, pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(SocketAddr, Vec<u8>)> {
     if pkt.first() == Some(&MAGIC) {
         if pkt.get(1) == Some(&T_HELLO) {
             let Some((id, ts)) = verify_hello(pkt, |id| r.devs.get(id).map(|d| d.secret.clone())) else { return vec![] };
@@ -204,8 +254,13 @@ fn route(pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(Socke
             // Only from the device's current address, and only to a client that
             // is talking to THAT device right now.
             let Some(id) = r.devs.iter().find(|(_, d)| d.addr == Some(from)).map(|(id, _)| id.clone()) else { return vec![] };
-            if let Some((sid, t)) = r.sessions.get_mut(&client) {
-                if *sid == id && now.duration_since(*t) < SESSION_TTL {
+            if let Some(s) = r.sessions.get_mut(&client) {
+                if s.device == id && now.duration_since(s.last) < SESSION_TTL {
+                    // A handshake response or transport data: the device took this
+                    // client as a peer. (Not a cookie reply, which anyone can get.)
+                    if matches!(payload.first(), Some(2 | 4)) {
+                        s.answered = true;
+                    }
                     return vec![(client, payload.to_vec())];
                 }
             }
@@ -227,13 +282,20 @@ fn route(pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(Socke
             _ => None,
         }
     } else {
-        r.sessions.get(&from).filter(|(_, t)| now.duration_since(*t) < SESSION_TTL).map(|(id, _)| id.clone())
+        r.sessions.get(&from).filter(|s| now.duration_since(s.last) < SESSION_TTL).map(|s| s.device.clone())
     };
     let Some(id) = target else { return vec![] };
-    if !r.sessions.contains_key(&from) && r.sessions.len() >= MAX_SESSIONS {
-        return vec![];
+    match r.sessions.get_mut(&from) {
+        Some(s) if s.device == id => s.last = now,
+        _ => {
+            // New, or re-pinned to another device: it takes a slot like any newcomer.
+            r.sessions.remove(&from);
+            if !admit(r, from.ip(), &id, now) {
+                return vec![];
+            }
+            r.sessions.insert(from, Session { device: id.clone(), last: now, answered: false });
+        }
     }
-    r.sessions.insert(from, (id.clone(), now));
     match r.devs.get(&id) {
         Some(d) if live(d) => vec![(d.addr.unwrap(), encode_data(from, pkt))],
         _ => vec![],
@@ -258,7 +320,7 @@ pub fn set_device(id: &str, secret: Vec<u8>, server_pubkey: &[u8; 32]) -> Result
 pub fn remove_device(id: &str) {
     let mut r = relay().lock().unwrap();
     r.devs.remove(id);
-    r.sessions.retain(|_, (sid, _)| sid != id);
+    r.sessions.retain(|_, s| s.device != id);
 }
 
 /// `(device connected to the relay, clients routed to it)`.
@@ -266,7 +328,7 @@ pub fn device_status(id: &str) -> (bool, usize) {
     let r = relay().lock().unwrap();
     let now = Instant::now();
     let connected = r.devs.get(id).and_then(|d| d.last_seen).map(|t| now.duration_since(t) < DEVICE_TTL).unwrap_or(false);
-    let clients = r.sessions.values().filter(|(sid, t)| sid == id && now.duration_since(*t) < SESSION_TTL).count();
+    let clients = r.sessions.values().filter(|s| s.device == id && now.duration_since(s.last) < SESSION_TTL).count();
     (connected, clients)
 }
 
@@ -410,6 +472,92 @@ mod tests {
         remove_device(b);
         assert_eq!(route(&initiation(&key), phone, t0, wall)[0].0, dev_a, "control: one device with the key is routed");
         remove_device(a);
+    }
+
+    fn add_dev(r: &mut Relay, id: &str, key: &[u8; 32]) {
+        r.devs.insert(id.to_string(), Dev { secret: id.as_bytes().to_vec(), mac1_key: mac1_key(key), addr: None, last_ts: 0, last_seen: None });
+    }
+
+    /// A private relay table with live devices `ids` (server key [n; 32] each) at
+    /// 198.51.100.n. A table of its own, so filling it cannot evict other tests'.
+    fn table(ids: &[(&str, u8)], t0: Instant, wall: u64) -> Relay {
+        let mut r = Relay::default();
+        for (id, n) in ids {
+            add_dev(&mut r, id, &[*n; 32]);
+            let dev = SocketAddr::new(IpAddr::from([198, 51, 100, *n]), 40000);
+            assert_eq!(route_in(&mut r, &hello(id, id.as_bytes(), wall), dev, t0, wall).len(), 1, "{id} HELLO");
+        }
+        r
+    }
+
+    fn dev_addr(n: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::from([198, 51, 100, n]), 40000)
+    }
+
+    /// `client` handshakes with device n and the device answers: an established peer.
+    fn connect(r: &mut Relay, client: SocketAddr, n: u8, t: Instant, wall: u64) -> bool {
+        let out = route_in(r, &initiation(&[n; 32]), client, t, wall);
+        if out.len() != 1 || out[0].0 != dev_addr(n) {
+            return false;
+        }
+        route_in(r, &encode_data(client, b"\x02\0\0\0resp"), dev_addr(n), t, wall) == vec![(client, b"\x02\0\0\0resp".to_vec())]
+    }
+
+    #[test]
+    fn a_flood_cannot_lock_another_device_out() {
+        let (t0, wall) = (Instant::now(), now_ms());
+        type From = Box<dyn Fn(u32) -> (SocketAddr, u8)>;
+        let floods: [(&str, From); 3] = [
+            ("A, from one IP on many ports", Box::new(|i| (SocketAddr::new(IpAddr::from([192, 0, 2, 1]), 1024 + i as u16), 51))),
+            ("A, from many IPs", Box::new(|i| (SocketAddr::new(IpAddr::from([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]), 5000), 51))),
+            ("17 other devices, from one IP", Box::new(|i| (SocketAddr::new(IpAddr::from([192, 0, 2, 2]), 1024 + i as u16), 60 + (i % 17) as u8))),
+        ];
+        for (flood, from) in floods {
+            let mut ids: Vec<(String, u8)> = vec![("hc-flood-a".into(), 51), ("hc-flood-b".into(), 52)];
+            ids.extend((60..77u8).map(|n| (format!("hc-flood-{n}"), n)));
+            let refs: Vec<(&str, u8)> = ids.iter().map(|(s, n)| (s.as_str(), *n)).collect();
+            let mut r = table(&refs, t0, wall);
+            let a_phone: SocketAddr = "203.0.113.51:1000".parse().unwrap();
+            assert!(connect(&mut r, a_phone, 51, t0, wall), "{flood}: control: A's client connects");
+            // B's client is mid-handshake when the flood starts.
+            let b_phone: SocketAddr = "198.18.0.7:4000".parse().unwrap();
+            assert_eq!(route_in(&mut r, &initiation(&[52; 32]), b_phone, t0, wall).len(), 1);
+            // Each flood packet a microsecond later, so B's pending session is the
+            // oldest unanswered one: the first to go if the flood can reach it.
+            let n_flood = MAX_SESSIONS as u32 + 1000;
+            for i in 0..n_flood {
+                let (src, n) = from(i);
+                route_in(&mut r, &initiation(&[n; 32]), src, t0 + Duration::from_micros(i as u64 + 1), wall);
+            }
+            let t1 = t0 + Duration::from_micros(n_flood as u64 + 1);
+            assert!(r.sessions.len() <= MAX_SESSIONS, "{flood}: {} sessions", r.sessions.len());
+            let resp = b"\x02\0\0\0resp".to_vec();
+            assert_eq!(route_in(&mut r, &encode_data(b_phone, &resp), dev_addr(52), t1, wall), vec![(b_phone, resp)], "{flood}: B's pending client was evicted");
+            assert!(connect(&mut r, "198.18.0.8:4000".parse().unwrap(), 52, t1, wall), "{flood}: a new client of B was locked out");
+            assert_eq!(route_in(&mut r, &[4, 0, 0, 0, 1], a_phone, t1, wall).len(), 1, "{flood}: A's established client was evicted");
+        }
+    }
+
+    #[test]
+    fn a_full_table_evicts_unanswered_sessions_not_established_ones() {
+        let (t0, wall) = (Instant::now(), now_ms());
+        let ids: Vec<(String, u8)> = (100..118u8).map(|n| (format!("hc-full-{n}"), n)).collect();
+        let refs: Vec<(&str, u8)> = ids.iter().map(|(s, n)| (s.as_str(), *n)).collect();
+        let mut r = table(&refs, t0, wall);
+        let old: SocketAddr = "203.0.113.100:1".parse().unwrap();
+        assert!(connect(&mut r, old, 100, t0, wall));
+        // Unanswered handshakes from many IPs to 17 devices: more than the table holds.
+        let mut i = 0u32;
+        for n in 101..118u8 {
+            for _ in 0..MAX_SESSIONS_PER_DEVICE {
+                i += 1;
+                route_in(&mut r, &initiation(&[n; 32]), SocketAddr::new(IpAddr::from([10, 9, (i >> 8) as u8, i as u8]), 7000), t0 + Duration::from_micros(i as u64), wall);
+            }
+        }
+        let t1 = t0 + Duration::from_micros(i as u64 + 1);
+        assert_eq!(r.sessions.len(), MAX_SESSIONS, "the table should be full");
+        assert!(connect(&mut r, "198.18.0.9:4000".parse().unwrap(), 100, t1, wall), "a newcomer is refused when the table is full");
+        assert_eq!(route_in(&mut r, &[4, 0, 0, 0, 1], old, t1, wall).len(), 1, "an established client was evicted");
     }
 
     #[test]
