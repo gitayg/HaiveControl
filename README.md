@@ -687,7 +687,10 @@ WireGuard app ──UDP──▶ hub relay (VPN_RELAY_ENDPOINT) ◀──UDP, ou
 The relay only moves WireGuard ciphertext. It routes new clients by WireGuard's own
 `mac1` field and drops anything that is not a valid handshake for an enabled device. It
 also delivers device traffic only to clients that recently spoke to that device, so it
-can't be used to reflect traffic.
+can't be used to reflect traffic. Each exit must have its own WireGuard key: Enable is
+refused (409, audited as "VPN exit refused") for a device that reports a key another
+exit already uses, such as a cloned SD-card image. The relay never routes a handshake that
+matches two devices.
 
 **Hub setup (AppCrane):**
 1. Env: `VPN_RELAY_ENDPOINT=crane.glick.run:<public udp port>` (what clients and devices

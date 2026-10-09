@@ -218,7 +218,14 @@ fn route(pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(Socke
     }
     let live = |d: &Dev| d.addr.is_some() && d.last_seen.map(|t| now.duration_since(t) < DEVICE_TTL).unwrap_or(false);
     let target = if pkt[0] == 1 {
-        r.devs.iter().find(|(_, d)| live(d) && initiation_matches(pkt, &d.mac1_key)).map(|(id, _)| id.clone())
+        // Only an initiation exactly one device answers to. `set_device` refuses a
+        // second device with the same key; if one existed anyway, routing to either
+        // would hand it the other's clients.
+        let mut m = r.devs.iter().filter(|(_, d)| initiation_matches(pkt, &d.mac1_key));
+        match (m.next(), m.next()) {
+            (Some((id, d)), None) if live(d) => Some(id.clone()),
+            _ => None,
+        }
     } else {
         r.sessions.get(&from).filter(|(_, t)| now.duration_since(*t) < SESSION_TTL).map(|(id, _)| id.clone())
     };
@@ -234,12 +241,18 @@ fn route(pkt: &[u8], from: SocketAddr, now: Instant, wall_ms: u64) -> Vec<(Socke
 }
 
 /// Register (or update) an exit device. Keeps its learned address across updates.
-pub fn set_device(id: &str, secret: Vec<u8>, server_pubkey: &[u8; 32]) {
+/// Refuses a server key another device already uses, and names that device:
+/// clients are routed by the key, so a copy could take the other device's clients.
+pub fn set_device(id: &str, secret: Vec<u8>, server_pubkey: &[u8; 32]) -> Result<(), String> {
     let mut r = relay().lock().unwrap();
     let key = mac1_key(server_pubkey);
+    if let Some(other) = r.devs.iter().find(|(o, d)| o.as_str() != id && d.mac1_key == key).map(|(o, _)| o.clone()) {
+        return Err(other);
+    }
     let d = r.devs.entry(id.to_string()).or_insert(Dev { secret: vec![], mac1_key: key, addr: None, last_ts: 0, last_seen: None });
     d.secret = secret;
     d.mac1_key = key;
+    Ok(())
 }
 
 pub fn remove_device(id: &str) {
@@ -316,7 +329,7 @@ mod tests {
     #[test]
     fn end_to_end_routing() {
         let (id, secret, server_pub) = ("hc-test-route", b"s3cret-s3cret-s3".to_vec(), [7u8; 32]);
-        set_device(id, secret.clone(), &server_pub);
+        set_device(id, secret.clone(), &server_pub).unwrap();
         let device: SocketAddr = "198.51.100.9:40000".parse().unwrap();
         let phone: SocketAddr = "203.0.113.5:55555".parse().unwrap();
         let stranger: SocketAddr = "192.0.2.1:9".parse().unwrap();
@@ -362,6 +375,41 @@ mod tests {
 
         remove_device(id);
         assert!(route(&init, phone, t0, wall).is_empty());
+    }
+
+    #[test]
+    fn a_second_device_cannot_register_another_devices_server_key() {
+        let (key, a, b) = ([31u8; 32], "hc-test-key-a", "hc-test-key-b");
+        set_device(a, b"secret-a".to_vec(), &key).unwrap();
+        assert_eq!(set_device(b, b"secret-b".to_vec(), &key), Err(a.to_string()));
+        assert!(set_device(a, b"secret-a".to_vec(), &key).is_ok(), "a device may re-register its own key");
+        let wall = now_ms();
+        let t0 = Instant::now();
+        assert!(route(&hello(b, b"secret-b", wall), "198.51.100.32:1".parse().unwrap(), t0, wall).is_empty(), "the refused device was registered");
+        let dev_a: SocketAddr = "198.51.100.31:1".parse().unwrap();
+        assert_eq!(route(&hello(a, b"secret-a", wall), dev_a, t0, wall).len(), 1);
+        let out = route(&initiation(&key), "203.0.113.31:1".parse().unwrap(), t0, wall);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, dev_a, "A's client went elsewhere");
+        remove_device(a);
+    }
+
+    #[test]
+    fn an_initiation_matching_two_devices_goes_to_neither() {
+        let (key, a, b) = ([33u8; 32], "hc-test-dup-a", "hc-test-dup-b");
+        set_device(a, b"secret-a".to_vec(), &key).unwrap();
+        // A copy that got in some other way (set_device would refuse it).
+        relay().lock().unwrap().devs.insert(b.to_string(), Dev { secret: b"secret-b".to_vec(), mac1_key: mac1_key(&key), addr: None, last_ts: 0, last_seen: None });
+        let wall = now_ms();
+        let t0 = Instant::now();
+        let (dev_a, dev_b): (SocketAddr, SocketAddr) = ("198.51.100.33:1".parse().unwrap(), "198.51.100.34:1".parse().unwrap());
+        assert_eq!(route(&hello(a, b"secret-a", wall), dev_a, t0, wall).len(), 1);
+        assert_eq!(route(&hello(b, b"secret-b", wall), dev_b, t0, wall).len(), 1);
+        let phone: SocketAddr = "203.0.113.33:1".parse().unwrap();
+        assert!(route(&initiation(&key), phone, t0, wall).is_empty(), "routed to one of two devices sharing a key");
+        remove_device(b);
+        assert_eq!(route(&initiation(&key), phone, t0, wall)[0].0, dev_a, "control: one device with the key is routed");
+        remove_device(a);
     }
 
     #[test]

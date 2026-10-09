@@ -193,9 +193,11 @@ fn push(target: &str, cfg: &DevCfg, passes: &[Pass], device: &str) -> Result<Val
     Ok(v.get("status").cloned().unwrap_or(Value::Null))
 }
 
-fn register_relay(device: &str, cfg: &DevCfg) {
-    if let Some(pk) = decode_key(&cfg.server_public_key) {
-        crate::vpnrelay::set_device(device, unhex(&cfg.secret), &pk);
+/// Err names the device that already uses this one's server key.
+fn register_relay(device: &str, cfg: &DevCfg) -> Result<(), String> {
+    match decode_key(&cfg.server_public_key) {
+        Some(pk) => crate::vpnrelay::set_device(device, unhex(&cfg.secret), &pk),
+        None => Ok(()),
     }
 }
 
@@ -211,7 +213,9 @@ pub fn start() {
     {
         let s = store().lock().unwrap();
         for (id, cfg) in &s.devices {
-            register_relay(id, cfg);
+            if let Err(other) = register_relay(id, cfg) {
+                println!("[vpn] {id}: not routed — {other} has the same WireGuard key");
+            }
         }
     }
     std::thread::spawn(|| loop {
@@ -315,7 +319,13 @@ pub fn enable_ep(target: &str, user: &str) -> (Value, u16) {
     };
     cfg.server_public_key = pk.to_string();
     cfg.dirty = false;
-    register_relay(&device, &cfg);
+    if let Err(other) = register_relay(&device, &cfg) {
+        // Clients find a device by its key: a second device with it (a cloned image,
+        // or one copying another's reported key) would take the first one's clients.
+        println!("[vpn] {device}: enable refused — {other} already uses its WireGuard key");
+        crate::audit(user, "browser", "VPN exit refused", &device, "its WireGuard key is already used by another VPN exit");
+        return (json!({"ok": false, "error": "this device reports a WireGuard key that another VPN exit already uses (a cloned image?) — give it a fresh key, then enable again"}), 409);
+    }
     let mut s = store().lock().unwrap();
     s.devices.insert(device.clone(), cfg);
     save(&s);
@@ -474,7 +484,7 @@ fn mark_dirty(device: &str) {
 #[cfg(test)]
 pub(crate) fn enable_for_test(device: &str, server_pub: &[u8; 32]) -> Vec<u8> {
     let cfg = DevCfg { secret: hex(&random32()), server_public_key: b64(server_pub), enabled_by: "test".into(), enabled_at: now(), dirty: false };
-    register_relay(device, &cfg);
+    register_relay(device, &cfg).unwrap();
     let t = now();
     let mut s = store().lock().unwrap();
     let address = allocate(&s.passes, device, t).unwrap();
@@ -494,6 +504,15 @@ pub(crate) fn on_disk(device: &str) -> (bool, usize) {
     let s = load();
     (s.devices.contains_key(device), s.passes.iter().filter(|p| p.device == device).count())
 }
+
+/// The HELLO secret `device` is enabled with, if it is.
+#[cfg(test)]
+pub(crate) fn hello_secret(device: &str) -> Option<Vec<u8>> {
+    store().lock().unwrap().devices.get(device).map(|c| unhex(&c.secret))
+}
+
+#[cfg(test)]
+mod http_tests;
 
 #[cfg(test)]
 mod tests {

@@ -18,6 +18,8 @@ pub fn init() -> &'static Path {
         std::env::set_var("HUB_DATA", &dir);
         std::env::set_var("MCP_TOKEN", MCP_TOKEN);
         std::env::set_var("RELAY_TOKEN", RELAY_TOKEN);
+        // The VPN exit endpoints refuse to run without it; nothing dials it in tests.
+        std::env::set_var("VPN_RELAY_ENDPOINT", "vpn.test.invalid:51820");
         dir
     })
 }

@@ -336,4 +336,4 @@ function dsRevoke(){var t=SEL;if(!t)return;var d=DEV[t]||{};if(!confirm('Revoke 
 </script>"#;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

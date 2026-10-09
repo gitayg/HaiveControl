@@ -76,7 +76,7 @@ use crate::{audit_log, handle, relay_ok, rotate_enroll_token, Agents};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-fn hub() -> &'static str {
+pub(crate) fn hub() -> &'static str {
     static H: OnceLock<String> = OnceLock::new();
     H.get_or_init(|| {
         crate::testenv::init();
@@ -94,19 +94,19 @@ fn hub() -> &'static str {
 
 /// The owner's enrollment token. Through `hub()` first: minting persists the token
 /// map under HUB_DATA, which must already point at the test dir.
-fn htok(owner: &str) -> String {
+pub(crate) fn htok(owner: &str) -> String {
     hub();
     crate::enroll_token_for(owner)
 }
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
         .collect()
 }
 
 /// (status, content-type, body)
-fn call(method: &str, pq: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String, String) {
+pub(crate) fn call(method: &str, pq: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String, String) {
     let c = reqwest::blocking::Client::new();
     let url = format!("{}{pq}", hub());
     let mut rb = if method == "POST" { c.post(url).body(body.to_string()) } else { c.get(url) };
@@ -131,7 +131,7 @@ fn hello_as(query_id: Option<&str>, body_id: &str, tok: &str, ds: bool) -> (u16,
     (st, b)
 }
 
-fn hello(rid: &str, tok: &str, ds: bool) -> (u16, String) {
+pub(crate) fn hello(rid: &str, tok: &str, ds: bool) -> (u16, String) {
     hello_as(Some(rid), rid, tok, ds)
 }
 
@@ -146,14 +146,14 @@ fn relay_get(id: Option<&str>, tok: &str) -> (u16, String) {
 }
 
 /// Enroll `rid` under `owner` the way a 3.7 agent does and return its device secret.
-fn enroll(rid: &str, owner: &str) -> String {
+pub(crate) fn enroll(rid: &str, owner: &str) -> String {
     let (st, body) = hello(rid, &htok(owner), true);
     assert_eq!(st, 200, "enroll {rid}: {body}");
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     v["device_secret"].as_str().unwrap().to_string()
 }
 
-fn audited(action: &str, device: &str) -> bool {
+pub(crate) fn audited(action: &str, device: &str) -> bool {
     audit_log().lock().unwrap().iter().any(|(_, _, _, a, d, _)| a == action && d == device)
 }
 
@@ -346,7 +346,7 @@ fn fake_agent(rid: &'static str, secret: String) -> std::thread::JoinHandle<Opti
     })
 }
 
-fn eventually(mut f: impl FnMut() -> bool) -> bool {
+pub(crate) fn eventually(mut f: impl FnMut() -> bool) -> bool {
     for _ in 0..100 {
         if f() {
             return true;
