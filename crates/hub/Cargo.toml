@@ -25,8 +25,6 @@ sha2 = "0.10"
 # algorithm/key from the rcgen CA (ECDSA P-256), which the agent cannot verify.
 ed25519-dalek = "2"
 getrandom = "0.2"
-# VPN exit (vpn.rs / vpnrelay.rs): WireGuard client keys (X25519), the mac1 check
-# the relay routes handshakes by (BLAKE2s), and the pass QR code (SVG only).
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+# VPN exit (vpnrelay.rs): the mac1 check the relay routes handshakes by (BLAKE2s).
+# Client keys and the pass QR code are made in the browser (assets/vpnpass.js).
 blake2 = "0.10"
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }

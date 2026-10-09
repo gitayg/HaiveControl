@@ -27,7 +27,7 @@ mod testenv;
 mod vpn;
 mod vpnrelay;
 
-const VERSION: &str = "3.16.2";
+const VERSION: &str = "3.17.0";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -379,6 +379,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 &t,
                 &query_param(&url, "name").unwrap_or_default(),
                 query_param(&url, "hours").and_then(|h| h.parse().ok()).unwrap_or(0),
+                &query_param(&url, "publicKey").unwrap_or_default(),
                 user.as_deref().unwrap_or(""),
                 device_owner(agents, &t).as_deref(),
             ))
@@ -428,6 +429,9 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/assets/xterm.js") => asset(XTERM_JS, "text/javascript; charset=utf-8", gz),
         (Method::Get, "/assets/xterm.css") => asset(XTERM_CSS, "text/css; charset=utf-8", gz),
         (Method::Get, "/assets/addon-fit.js") => asset(ADDON_FIT, "text/javascript; charset=utf-8", gz),
+        (Method::Get, "/assets/x25519.js") => asset(X25519_JS, "text/javascript; charset=utf-8", gz),
+        (Method::Get, "/assets/qrcode.js") => asset(QRCODE_JS, "text/javascript; charset=utf-8", gz),
+        (Method::Get, "/assets/vpnpass.js") => asset(VPNPASS_JS, "text/javascript; charset=utf-8", gz),
         (Method::Get, "/x/download") => proxy_download(&url),
         (Method::Get, "/x/list") => proxy_list(&url),
         (Method::Post, "/x/upload") => proxy_upload(&mut req, &url),
@@ -977,6 +981,11 @@ fn mcp_token_revoke_ep(url: &str, user: Option<&str>) -> Resp {
 const XTERM_JS: &[u8] = include_bytes!("../assets/xterm.js");
 const XTERM_CSS: &[u8] = include_bytes!("../assets/xterm.css");
 const ADDON_FIT: &[u8] = include_bytes!("../assets/addon-fit.js");
+// VPN passes (vpnpass.js): keys, .conf and QR made in the browser. x25519.js is a
+// TweetNaCl.js subset (public domain), qrcode.js is qrcode-generator (MIT).
+const X25519_JS: &[u8] = include_bytes!("../assets/x25519.js");
+const QRCODE_JS: &[u8] = include_bytes!("../assets/qrcode.js");
+const VPNPASS_JS: &[u8] = include_bytes!("../assets/vpnpass.js");
 
 fn asset(bytes: &'static [u8], ct: &str, gz: bool) -> Resp {
     maybe_gzip(bytes.to_vec(), ct, gz).with_header(hdr("Cache-Control", "max-age=86400"))
@@ -4870,8 +4879,8 @@ fn dashboard(_agents: &Agents, mac_id: &str, hub_ip: &str, hub_port: u16, user: 
 <pre class=\"output\" id=\"out\" style=\"display:none\"></pre>\
 </div>\
 </main>\
-</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script>{ds_js}{script}{jobs_js}{vpn}</body></html>",
-        cp_css = CP_CSS, jobs_css = jobs::JOBS_CSS, ds_css = devicesecrets::DS_CSS, ds_js = devicesecrets::DS_JS, script = COPY_SCRIPT, jobs_js = jobs::JOBS_JS, vpn = VPN_SCRIPT, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
+</div>{fb}{hb}<script src=\"{ab}/assets/xterm.js\"></script><script src=\"{ab}/assets/addon-fit.js\"></script><script src=\"{ab}/assets/x25519.js?v={v}\"></script><script src=\"{ab}/assets/qrcode.js?v={v}\"></script><script src=\"{ab}/assets/vpnpass.js?v={v}\"></script>{ds_js}{script}{jobs_js}{vpn}</body></html>",
+        cp_css = CP_CSS, jobs_css = jobs::JOBS_CSS, ds_css = devicesecrets::DS_CSS, ds_js = devicesecrets::DS_JS, script = COPY_SCRIPT, jobs_js = jobs::JOBS_JS, vpn = VPN_SCRIPT, v = VERSION, fb = FB_HTML, ab = hb_base.trim_end_matches('/')
     );
     // no-store: the dashboard HTML bakes in window.HB (owner, version); never serve a
     // stale copy from a previous deploy.
@@ -5240,8 +5249,9 @@ button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,.n
 const FB_HTML: &str = r#"<div id="fb" class="fbwrap"><div class="fbpanel"><div class="fbhead"><button onclick="fbLoad(fbParent)" title="up">&#8593;</button><span id="fbpath" class="fbpath"></span><button onclick="closeFb()">&#10005;</button></div><div id="fbbody" class="fbbody"></div><div class="fbfoot"><button id="fbupload" onclick="fbUploadHere()">Upload file here</button> <span class="dim2">or drag &amp; drop a file onto this panel</span> <span id="fbstatus" class="dim2"></span></div></div></div>"#;
 
 /// The VPN exit panel (vpn.rs): enable/disable the exit on a Linux relay device,
-/// issue passes as a WireGuard QR/.conf, revoke them. Uses the dashboard's
-/// API/SEL/enc/esc2 globals and the .fbwrap modal styling.
+/// issue passes as a WireGuard QR/.conf, revoke them. A pass's keypair, .conf and
+/// QR are made in the browser by assets/vpnpass.js; the hub gets the public key.
+/// Uses the dashboard's API/SEL/enc/esc2 globals and the .fbwrap modal styling.
 const VPN_SCRIPT: &str = r#"<script>
 var VPN_T=null,VPN_CFG=null,VPN_FILE='';
 function vpnEl(){var w=document.getElementById('vpnw');if(w)return w;w=document.createElement('div');w.id='vpnw';w.className='fbwrap';w.onclick=function(e){if(e.target===w)vpnClose();};
@@ -5264,8 +5274,10 @@ function vpnMsg(t){var m=document.getElementById('vpnmsg');if(m)m.textContent=t;
 function vpnEnable(){vpnMsg('enabling… (first time installs WireGuard on the device)');vpnPost('enable').then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
 function vpnDisable(){if(!confirm('Disable the VPN exit? All passes on this device are revoked.'))return;vpnPost('disable').then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
 function vpnRevoke(id){if(!confirm('Revoke this pass? It disconnects within seconds.'))return;vpnPost('revoke','&id='+enc(id)).then(vpnLoad).catch(function(e){vpnMsg('failed: '+e.message);});}
-function vpnIssue(){vpnMsg('creating…');vpnPost('pass','&name='+enc(document.getElementById('vpnname').value)+'&hours='+enc(document.getElementById('vpnttl').value)).then(function(j){VPN_CFG=j.config;VPN_FILE=j.filename;vpnLoad().then(function(){vpnMsg(j.warning||'');var n=document.getElementById('vpnnew');if(!n)return;
-n.innerHTML='<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:8px"><div style="background:#fff;padding:6px;border-radius:8px;width:240px">'+j.qrSvg.replace(/<\?xml[^>]*>/,'')+'</div><div style="flex:1 1 220px"><p><b>Shown once</b> — the private key is not stored anywhere.</p><ol style="padding-left:18px"><li><b>iPhone/Android:</b> free open-source <b>WireGuard</b> app → + → Create from QR code.</li><li><b>PC/Mac:</b> WireGuard → Import tunnel from file → the .conf below.</li><li>Turn it on; ifconfig.me shows this device\'s IP.</li></ol><button class="b" onclick="vpnDl()">Download .conf</button> <button class="b subtle" onclick="vpnHide()">Done</button></div></div>';var svg=n.querySelector('svg');if(svg){svg.style.width='100%';svg.style.height='auto';}});}).catch(function(e){vpnMsg('failed: '+e.message);});}
+function vpnIssue(){vpnMsg('creating… (the keys are made in this browser)');var nm=document.getElementById('vpnname').value,hrs=document.getElementById('vpnttl').value;
+// The private key stays here: the hub gets only the public key (vpnpass.js).
+vpnKeypair().then(function(kp){return vpnPost('pass','&name='+enc(nm)+'&hours='+enc(hrs)+'&publicKey='+enc(kp.publicKey)).then(function(j){VPN_CFG=vpnConf(j.pass.name,kp.privateKey,j.wireguard);VPN_FILE=j.filename;var qr=vpnQrSvg(VPN_CFG);return vpnLoad().then(function(){vpnMsg(j.warning||'');var n=document.getElementById('vpnnew');if(!n)return;
+n.innerHTML='<div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:8px"><div style="background:#fff;padding:6px;border-radius:8px;width:240px">'+qr+'</div><div style="flex:1 1 220px"><p><b>Shown once</b> — the private key was made in this browser; the hub never sees it.</p><ol style="padding-left:18px"><li><b>iPhone/Android:</b> free open-source <b>WireGuard</b> app → + → Create from QR code.</li><li><b>PC/Mac:</b> WireGuard → Import tunnel from file → the .conf below.</li><li>Turn it on; ifconfig.me shows this device\'s IP.</li></ol><button class="b" onclick="vpnDl()">Download .conf</button> <button class="b subtle" onclick="vpnHide()">Done</button></div></div>';var svg=n.querySelector('svg');if(svg){svg.style.width='100%';svg.style.height='auto';}});});}).catch(function(e){vpnMsg('failed: '+e.message);});}
 function vpnDl(){if(!VPN_CFG)return;var a=document.createElement('a');a.href=URL.createObjectURL(new Blob([VPN_CFG],{type:'text/plain'}));a.download=VPN_FILE||'itai.conf';a.click();setTimeout(function(){URL.revokeObjectURL(a.href);},1000);}
 function vpnHide(){VPN_CFG=null;var n=document.getElementById('vpnnew');if(n)n.innerHTML='';}
 </script>"#;

@@ -64,7 +64,7 @@ fn routes(rid: &str, pubkey: &str, n: u8) -> (bool, bool, usize) {
 fn a_device_cannot_enable_with_another_devices_wireguard_key() {
     vpn_hub();
     let owner = "owner-vpn-dupkey";
-    let pk = crate::vpn::keypair().1;
+    let pk = crate::vpn::test_key();
     let a = enroll("vpn-dupkey-a", owner);
     fake_vpn("vpn-dupkey-a", a, pk.clone());
     let b = enroll("vpn-dupkey-b", owner);
@@ -105,16 +105,150 @@ fn a_push_carries_only_passes_the_current_owner_issued() {
     let email = "vpn-push@test.example";
     let owner = crate::canon_owner(email);
     let s = enroll("vpn-push", &owner);
-    let applied = fake_vpn("vpn-push", s, crate::vpn::keypair().1);
+    let applied = fake_vpn("vpn-push", s, crate::vpn::test_key());
     let (st, v) = vpn_post("enable", "vpn-push", "", Some(email));
     assert_eq!(st, 200, "{v}");
     let mine = crate::vpn::add_pass_for_test("vpn-push", &owner);
     let theirs = crate::vpn::add_pass_for_test("vpn-push", "owner-vpn-push-before");
-    let (st, v) = vpn_post("pass", "vpn-push", "&hours=1&name=phone", Some(email));
+    let (st, v) = vpn_post("pass", "vpn-push", &format!("&hours=1&name=phone&publicKey={}", enc(&crate::vpn::test_key())), Some(email));
     assert_eq!(st, 201, "{v}");
     let last = applied.lock().unwrap().last().cloned().expect("nothing was pushed");
     let keys: Vec<&str> = last["peers"].as_array().unwrap().iter().map(|p| p["publicKey"].as_str().unwrap()).collect();
     assert!(keys.contains(&mine.as_str()), "control: the owner's own pass is missing: {last}");
     assert!(!keys.contains(&theirs.as_str()), "a pass another owner issued was pushed: {last}");
     assert_eq!(keys.len(), 2, "the owner's two passes: {last}");
+}
+
+// ---- the client's private key never reaches the hub ----------------------------------
+
+/// An enabled exit on `rid` with a fake agent; returns what the agent was sent.
+fn enabled_exit(rid: &'static str, owner: &str) -> Arc<Mutex<Vec<Value>>> {
+    vpn_hub();
+    let s = enroll(rid, owner);
+    let applied = fake_vpn(rid, s, crate::vpn::test_key());
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "{v}");
+    applied
+}
+
+fn passes_on_disk(rid: &str) -> usize {
+    crate::vpn::on_disk(rid).1
+}
+
+#[test]
+fn a_pass_needs_the_clients_public_key() {
+    let rid = "vpn-pk-required";
+    enabled_exit(rid, "owner-vpn-pk-required");
+    let bad = [
+        ("missing", String::new()),
+        ("empty", "&publicKey=".to_string()),
+        ("not base64", "&publicKey=not*base64*at*all*not*base64*at*all*".to_string()),
+        ("31 bytes", format!("&publicKey={}", enc(&crate::vpn::b64(&[7u8; 31])))),
+        ("33 bytes", format!("&publicKey={}", enc(&crate::vpn::b64(&[7u8; 33])))),
+        ("a private key's worth of hex", format!("&publicKey={}", "ab".repeat(32))),
+    ];
+    for (what, q) in bad {
+        let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone{q}"), None);
+        assert_eq!(st, 400, "{what}: {v}");
+        assert!(v["error"].as_str().unwrap_or("").contains("public key"), "{what}: {v}");
+    }
+    assert_eq!(passes_on_disk(rid), 0, "a refused pass was stored");
+    // Control: a valid key is accepted.
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(&crate::vpn::test_key())), None);
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(passes_on_disk(rid), 1);
+}
+
+#[test]
+fn a_pass_response_carries_no_private_key() {
+    let rid = "vpn-no-priv";
+    let applied = enabled_exit(rid, "owner-vpn-no-priv");
+    let pk = crate::vpn::test_key();
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=8&name=laptop&publicKey={}", enc(&pk)), None);
+    assert_eq!(st, 201, "{v}");
+    let text = v.to_string();
+    for word in ["PrivateKey", "privateKey", "private_key", "[Interface]", "qrSvg"] {
+        assert!(!text.contains(word), "the response has {word}: {text}");
+    }
+    // Everything the browser needs to write the .conf, except its own private key.
+    let w = &v["wireguard"];
+    assert!(!applied.lock().unwrap().is_empty(), "control: the exit was pushed to the device");
+    let server = crate::vpn::server_key(rid).expect("enabled");
+    assert_eq!(w["serverPublicKey"], json!(server), "{v}");
+    assert_eq!(w["endpoint"], json!("vpn.test.invalid:51820"), "{v}");
+    assert_eq!(w["address"], json!("10.77.0.2/32"), "{v}");
+    assert_eq!(w["mtu"], json!(1380), "{v}");
+    assert!(w["dns"].as_str().is_some_and(|d| !d.is_empty()), "{v}");
+    assert_eq!(w["allowedIps"], json!("0.0.0.0/0, ::/0"), "{v}");
+    assert!(v["pass"]["expiresAt"].as_u64().is_some_and(|e| e > v["pass"]["createdAt"].as_u64().unwrap()), "{v}");
+    let psk = w["presharedKey"].as_str().expect("psk");
+    // The only 32-byte keys in the response: the exit's public key and the pass's PSK.
+    // Nothing that could be a private key.
+    let mut keys: Vec<String> = Vec::new();
+    collect_keys(&v, &mut keys);
+    keys.sort();
+    let mut want = vec![server.clone(), psk.to_string()];
+    want.sort();
+    assert_eq!(keys, want, "unexpected key material in {v}");
+}
+
+/// Every string in `v` that decodes as a 32-byte base64 key.
+fn collect_keys(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if crate::vpn::decode_key(s).is_some() => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| collect_keys(x, out)),
+        Value::Object(o) => o.values().for_each(|x| collect_keys(x, out)),
+        _ => {}
+    }
+}
+
+#[test]
+fn the_dashboard_loads_the_pass_scripts_from_the_hub() {
+    hub();
+    let (st, _, html) = call("GET", "/", "", &[]);
+    assert_eq!(st, 200);
+    for (name, bytes) in [("x25519.js", crate::X25519_JS), ("qrcode.js", crate::QRCODE_JS), ("vpnpass.js", crate::VPNPASS_JS)] {
+        let src = format!("/assets/{name}?v={}", crate::VERSION);
+        // The dashboard prefixes the hub's base URL.
+        assert!(html.contains(&format!("{src}\"></script>")), "the dashboard does not load {src}");
+        let (st, _, body) = call("GET", &src, "", &[]);
+        assert_eq!((st, body.as_bytes() == bytes), (200, true), "{src}");
+    }
+    assert!(!html.contains("cdn") && !html.contains("unpkg"), "a script from a CDN");
+}
+
+/// The dashboard half (assets/vpnpass.js) under node: keygen on both paths checked
+/// against OpenSSL's X25519, and the .conf built from this real pass response.
+#[test]
+fn the_dashboard_builds_the_pass_in_the_browser() {
+    let rid = "vpn-js-conf";
+    enabled_exit(rid, "owner-vpn-js-conf");
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(&crate::vpn::test_key())), None);
+    assert_eq!(st, 201, "{v}");
+    let resp = crate::testenv::init().join("vpn-js-conf-response.json");
+    std::fs::write(&resp, v.to_string()).unwrap();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vpn/vpnpass_check.js");
+    let out = std::process::Command::new("node").arg(&script).arg(&resp).output().expect("node (>= 20) is needed for this test");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("from a real pass response"), "{text}");
+}
+
+#[test]
+fn the_peer_pushed_to_the_device_is_the_clients_public_key() {
+    let rid = "vpn-pk-pushed";
+    let applied = enabled_exit(rid, "owner-vpn-pk-pushed");
+    let pk = crate::vpn::test_key();
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(&pk)), None);
+    assert_eq!(st, 201, "{v}");
+    let last = applied.lock().unwrap().last().cloned().expect("nothing was pushed");
+    let peers = last["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1, "{last}");
+    assert_eq!(peers[0]["publicKey"], json!(pk), "the device got a key the client did not supply: {last}");
+    assert_eq!(peers[0]["presharedKey"], v["wireguard"]["presharedKey"], "{last}");
+    assert_eq!(peers[0]["allowedIps"], v["wireguard"]["address"], "{last}");
+    // The same key cannot be a second live pass on this device.
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=again&publicKey={}", enc(&pk)), None);
+    assert_eq!(st, 409, "{v}");
+    assert_eq!(passes_on_disk(rid), 1);
 }

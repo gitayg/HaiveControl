@@ -4,8 +4,10 @@
 //! agent's `/vpn/*` endpoints; clients use the stock, open-source WireGuard app
 //! and reach it through the UDP relay in vpnrelay.rs. This module owns the
 //! passes: who may connect, until when. A pass is a WireGuard peer with an
-//! expiry. Its private key is generated here, put into the config/QR once, and
-//! never stored.
+//! expiry. The client's keypair is generated in the browser (assets/vpnpass.js),
+//! which sends only the public key: the hub never sees a client private key. The
+//! hub makes the pass's preshared key (it pushes it to the device) and returns
+//! what the browser needs to write the .conf and QR itself.
 //!
 //! Configuration (env):
 //!   VPN_RELAY_ENDPOINT  public host:port of the relay, e.g. crane.glick.run:31820
@@ -115,7 +117,7 @@ fn dns() -> String {
 
 // ---- keys ------------------------------------------------------------------------
 
-fn b64(b: &[u8]) -> String {
+pub(crate) fn b64(b: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(b)
 }
@@ -124,18 +126,6 @@ fn random32() -> [u8; 32] {
     let mut b = [0u8; 32];
     getrandom::getrandom(&mut b).expect("OS entropy");
     b
-}
-
-/// A WireGuard keypair `(private, public)` in base64.
-pub fn keypair() -> (String, String) {
-    let mut sk = random32();
-    // Curve25519 clamping, as `wg genkey` does.
-    sk[0] &= 248;
-    sk[31] &= 127;
-    sk[31] |= 64;
-    let secret = x25519_dalek::StaticSecret::from(sk);
-    let public = x25519_dalek::PublicKey::from(&secret);
-    (b64(&sk), b64(public.as_bytes()))
 }
 
 pub fn decode_key(k: &str) -> Option<[u8; 32]> {
@@ -157,21 +147,6 @@ fn unhex(s: &str) -> Vec<u8> {
 pub fn allocate(passes: &[Pass], device: &str, now: u64) -> Option<String> {
     let used: Vec<&str> = passes.iter().filter(|p| p.device == device && p.live(now)).map(|p| p.address.as_str()).collect();
     (2..=254u32).map(|h| format!("10.77.0.{h}")).find(|a| !used.contains(&a.as_str()))
-}
-
-pub fn render_config(private_key: &str, address: &str, server_pub: &str, psk: &str, endpoint: &str, dns: &str, name: &str) -> String {
-    format!(
-        "# IT-AI VPN — {}\n[Interface]\nPrivateKey = {private_key}\nAddress = {address}/32\nDNS = {dns}\nMTU = {CLIENT_MTU}\n\n\
-         [Peer]\nPublicKey = {server_pub}\nPresharedKey = {psk}\nEndpoint = {endpoint}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 25\n",
-        name.replace(['\r', '\n'], " ")
-    )
-}
-
-fn qr_svg(text: &str) -> String {
-    match qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M) {
-        Ok(c) => c.render::<qrcode::render::svg::Color>().min_dimensions(260, 260).quiet_zone(true).build(),
-        Err(_) => String::new(),
-    }
 }
 
 /// Is `p` still its holder's to use on a device now owned by `owner`? A pass
@@ -389,7 +364,9 @@ pub fn shut_down(device: &str) -> (bool, usize) {
     r
 }
 
-pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str, owner: Option<&str>) -> (Value, u16) {
+/// Issue a pass for the client whose WireGuard public key is `client_public_key`
+/// (base64, 32 bytes). The browser generated the keypair and keeps the private key.
+pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, user: &str, owner: Option<&str>) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -397,6 +374,10 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str, owner: Option<
     if !TTL_CHOICES_H.contains(&hours) {
         return (json!({"ok": false, "error": format!("hours must be one of {TTL_CHOICES_H:?}")}), 400);
     }
+    let Some(client_key) = decode_key(client_public_key) else {
+        return (json!({"ok": false, "error": "publicKey must be the client's WireGuard public key (32 bytes, base64)"}), 400);
+    };
+    let public_key = b64(&client_key);
     let ep = match endpoint() {
         Some(e) => e,
         None => return (json!({"ok": false, "error": "VPN_RELAY_ENDPOINT is not set"}), 503),
@@ -404,18 +385,20 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str, owner: Option<
     let name: String = name.trim().chars().filter(|c| !c.is_control()).take(40).collect();
     let name = if name.is_empty() { "device".to_string() } else { name };
     let t = now();
-    let (pass, private_key, cfg, passes) = {
+    let (pass, cfg, passes) = {
         let mut s = store().lock().unwrap();
         let Some(cfg) = s.devices.get(&device).cloned() else {
             return (json!({"ok": false, "error": "enable the VPN exit on this device first"}), 409);
         };
+        if s.passes.iter().any(|p| p.device == device && p.live(t) && p.public_key == public_key) {
+            return (json!({"ok": false, "error": "an active pass on this device already uses that public key"}), 409);
+        }
         if s.passes.iter().filter(|p| p.device == device && p.live(t)).count() >= MAX_LIVE_PER_DEVICE {
             return (json!({"ok": false, "error": format!("{MAX_LIVE_PER_DEVICE} passes are already active on this device — revoke one first")}), 429);
         }
         let Some(address) = allocate(&s.passes, &device, t) else {
             return (json!({"ok": false, "error": "no free tunnel addresses"}), 503);
         };
-        let (private_key, public_key) = keypair();
         let pass = Pass {
             id: hex(&random32()[..12]),
             device: device.clone(),
@@ -430,20 +413,28 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str, owner: Option<
         };
         s.passes.push(pass.clone());
         save(&s);
-        (pass, private_key, cfg, s.passes.clone())
+        (pass, cfg, s.passes.clone())
     };
     let pushed = push(target, &cfg, &passes, &device, owner);
     if pushed.is_err() {
         mark_dirty(&device);
     }
-    let config = render_config(&private_key, &pass.address, &cfg.server_public_key, &pass.preshared_key, &ep, &dns(), &pass.name);
     let file = format!("itai-{}.conf", pass.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>());
     (
         json!({
             "ok": true,
             "pass": view(&pass, &[], t),
-            "config": config,
-            "qrSvg": qr_svg(&config),
+            // The .conf minus [Interface] PrivateKey, which only the browser has.
+            "wireguard": {
+                "address": format!("{}/32", pass.address),
+                "dns": dns(),
+                "mtu": CLIENT_MTU,
+                "serverPublicKey": cfg.server_public_key,
+                "presharedKey": pass.preshared_key,
+                "endpoint": ep,
+                "allowedIps": "0.0.0.0/0, ::/0",
+                "persistentKeepalive": 25,
+            },
             "filename": file,
             "warning": pushed.err().map(|e| format!("saved, but the device has not taken it yet ({e}); it activates when the device reconnects")),
         }),
@@ -497,7 +488,7 @@ pub(crate) fn enable_for_test(device: &str, server_pub: &[u8; 32]) -> Vec<u8> {
     let t = now();
     let mut s = store().lock().unwrap();
     let address = allocate(&s.passes, device, t).unwrap();
-    let pass = Pass { id: hex(&random32()[..12]), device: device.into(), name: "phone".into(), owner: "test".into(), public_key: keypair().1, preshared_key: b64(&random32()), address, created_at: t, expires_at: t + 3600, revoked_at: None };
+    let pass = Pass { id: hex(&random32()[..12]), device: device.into(), name: "phone".into(), owner: "test".into(), public_key: test_key(), preshared_key: b64(&random32()), address, created_at: t, expires_at: t + 3600, revoked_at: None };
     s.passes.push(pass);
     let secret = unhex(&cfg.secret);
     s.devices.insert(device.to_string(), cfg);
@@ -520,11 +511,23 @@ pub(crate) fn add_pass_for_test(device: &str, owner: &str) -> String {
     let t = now();
     let mut s = store().lock().unwrap();
     let address = allocate(&s.passes, device, t).unwrap();
-    let public_key = keypair().1;
+    let public_key = test_key();
     let pass = Pass { id: hex(&random32()[..12]), device: device.into(), name: "injected".into(), owner: owner.into(), public_key: public_key.clone(), preshared_key: b64(&random32()), address, created_at: t, expires_at: t + 3600, revoked_at: None };
     s.passes.push(pass);
     save(&s);
     public_key
+}
+
+/// A random 32-byte key in base64, as a WireGuard public key looks on the wire.
+#[cfg(test)]
+pub(crate) fn test_key() -> String {
+    b64(&random32())
+}
+
+/// The exit's WireGuard public key, if `device` is enabled.
+#[cfg(test)]
+pub(crate) fn server_key(device: &str) -> Option<String> {
+    store().lock().unwrap().devices.get(device).map(|c| c.server_public_key.clone())
 }
 
 /// The HELLO secret `device` is enabled with, if it is.
@@ -545,30 +548,10 @@ mod tests {
     }
 
     #[test]
-    fn keypair_is_a_valid_x25519_pair() {
-        let (sk, pk) = keypair();
-        let sk = decode_key(&sk).unwrap();
-        assert_eq!(sk[0] & 7, 0, "clamped");
-        let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(sk));
-        assert_eq!(b64(derived.as_bytes()), pk);
-        assert_eq!(pk.len(), 44);
-    }
-
-    #[test]
     fn allocation_is_per_device_and_reuses_dead_addresses() {
         let ps = vec![pass("a", "10.77.0.2", 100, None), pass("a", "10.77.0.3", 10, None), pass("a", "10.77.0.4", 100, Some(5)), pass("b", "10.77.0.5", 100, None)];
         assert_eq!(allocate(&ps, "a", 50).as_deref(), Some("10.77.0.3"));
         assert_eq!(allocate(&ps, "b", 50).as_deref(), Some("10.77.0.2"));
-    }
-
-    #[test]
-    fn config_routes_everything_and_sets_the_relay_mtu() {
-        let c = render_config("PRIV", "10.77.0.2", "PUB", "PSK", "crane.glick.run:31820", "1.1.1.1", "iPhone\nInjected = 1");
-        assert!(c.contains("AllowedIPs = 0.0.0.0/0, ::/0"));
-        assert!(c.contains("Endpoint = crane.glick.run:31820"));
-        assert!(c.contains("MTU = 1380"));
-        assert!(!c.contains("\nInjected"), "a pass name cannot add config lines");
-        assert!(qr_svg(&c).starts_with("<?xml") || qr_svg(&c).starts_with("<svg"));
     }
 
     #[test]

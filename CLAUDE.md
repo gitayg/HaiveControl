@@ -78,6 +78,20 @@ Devices are real people's machines, though — act carefully on them (see below)
     token is accepted (it used to get `403 relay id in use by another enrollment` until a hub
     restart). Tunnels bound to a device secret are untouched. Tests: `rotating_drops_the_tunnel_*`,
     `a_device_on_the_old_token_re_enrolls_*`, `rotating_leaves_the_tunnel_of_a_secret_holder_alone`.
+- **VPN exit passes (`crates/hub/src/vpn.rs`, hub 3.17.0 / agent 3.8.0): the hub never sees a
+  client private key.** The dashboard (`crates/hub/assets/vpnpass.js`) makes the X25519 keypair
+  (WebCrypto, else the vendored TweetNaCl subset `assets/x25519.js`), sends only `publicKey` to
+  `POST /x/vpn/pass`, and writes the `.conf` and QR (`assets/qrcode.js`, qrcode-generator) itself.
+  The hub returns the `wireguard` object (exit key, endpoint, PSK, address, DNS, MTU) plus
+  `pass.expiresAt`, never a private key or a finished config. Keep it that way: don't
+  reintroduce server-side keygen, `.conf` or QR (the `x25519-dalek` and `qrcode` crates were
+  dropped for this). No `/m` or MCP route issues passes; one that does must take the caller's
+  public key the same way. The vendored assets keep their own license headers (public domain,
+  MIT), the one exception to "no per-file license header". Tests: `vpn::http_tests`
+  (`a_pass_needs_the_clients_public_key`, `a_pass_response_carries_no_private_key`,
+  `the_peer_pushed_to_the_device_is_the_clients_public_key`, and
+  `the_dashboard_builds_the_pass_in_the_browser`, which needs `node` ≥ 20 on PATH and runs
+  `src/vpn/vpnpass_check.js` against a real pass response).
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed

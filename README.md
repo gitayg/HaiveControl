@@ -696,12 +696,18 @@ A flood of handshakes therefore only displaces its own kind, never another exit'
 an established session.
 
 **Hub setup (AppCrane):**
-1. Env: `VPN_RELAY_ENDPOINT=crane.glick.run:<public udp port>` (what clients and devices
-   connect to). Optional: `VPN_UDP_PORT` (container port, default `51820`) and `VPN_DNS`.
-2. Publish that port over UDP. This needs an AppCrane version with UDP data planes.
+1. Env:
+   - `VPN_RELAY_ENDPOINT`: the public `host:port` that clients and devices connect to,
+     e.g. `<hub host>:31820`. Unset turns the VPN exit off.
+   - `VPN_UDP_PORT`: the UDP port the relay binds inside the container. Default `51820`.
+   - `VPN_DNS`: the DNS servers written into client configs. Default `1.1.1.1, 1.0.0.1`.
+2. Publish the relay port over UDP. This needs an AppCrane version with UDP data planes.
+   Use `dual` ingress: HTTP stays on the app's normal route, and the UDP data plane maps
+   container port `51820` to a public port, `31820` on sandbox.
    `appcrane_set_app_ingress slug=haivecontrol ingress_type=dual data_plane_port=51820
    data_plane_protocol=udp` (platform admin). Then restart the app and open the public
-   UDP port in the host firewall (`DOCKER-USER`).
+   UDP port in the host firewall (`DOCKER-USER`). `VPN_RELAY_ENDPOINT` carries the public
+   port (`31820`), not the container port.
 
 **Device:** the agent must run as the root service (`--install`), agent ≥ the release
 carrying `/vpn/*`. In the dashboard, open the device → **VPN exit…** → **Enable**. The
@@ -709,7 +715,16 @@ first time, this installs `wireguard-tools`. On kernels without the WireGuard mo
 (some Jetson L4T builds) the agent uses `wireguard-go` if it is installed.
 
 **Passes:** **Create pass** issues a WireGuard config (QR + `.conf`) that lasts 1 h to
-7 days. The private key is shown once and never stored. **Revoke** cuts a pass off
+7 days. **The client's keys are generated in the browser, and the hub never sees the
+client's private key.** The dashboard makes an X25519 keypair with WebCrypto, or, in a
+browser without WebCrypto X25519 or on a page served over plain http, with a vendored
+TweetNaCl.js X25519 (`assets/x25519.js`, public domain). It sends only the public key to
+`POST /x/vpn/pass?publicKey=…`. The hub validates the key (base64, 32 bytes, not already an
+active pass on that device), makes the pass's preshared key (it pushes that to the device),
+and returns the rest of the config: the exit's public key, endpoint, PSK, address, DNS, MTU
+and expiry. The browser writes the `.conf` and draws the QR code (vendored
+qrcode-generator, `assets/qrcode.js`, MIT). Nothing is fetched from a CDN. The private key
+is shown once, in that browser tab, and is not stored anywhere. **Revoke** cuts a pass off
 within seconds. Expiry is also enforced on the device, so a pass ends on time even if the
 hub is down. Pass holders cannot reach the device itself, its LAN, or each other.
 Enable, disable, issue and revoke are audited.
