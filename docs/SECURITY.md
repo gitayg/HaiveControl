@@ -48,6 +48,8 @@ single-operator use.
 
 **An owned device cannot be claimed by another owner's token after a hub restart (fixed in hub 3.16.2).** Tunnels live in memory, so until a device reconnected after a restart, a hello for its relay id with another owner's enrollment token was taken as a fresh enrollment and re-owned the device (even one holding its own device secret). An enrollment-token hello is now refused with `403` when the id's device secret, persisted owner override, or device row names a different owner.
 
+**A VPN exit shut down mid-enable stays shut down (fixed in hub 3.17.1).** Enable, pass issue and the 30-second catch-up sweep push to the device without the store lock held, then recorded the result. A credential revoke, Forget, dissolve, owner change or Disable that landed during that push was undone afterwards: the enable re-registered the exit at the relay and wrote it back to `vpn.json`, so the relay routed clients to a device whose exit had been revoked. Each shutdown now bumps a per-device epoch under the store lock, and the relay registration and the `vpn.json` write happen under that lock only when the epoch the request started with (and the device's owner) is unchanged. Otherwise the request returns `409`, the hub state stays off, and the device is sent `/vpn/disable`.
+
 **Approval-gated AI writes.** The AI assistant investigates autonomously with read tools
 (inventory, system reports, compliance posture, screenshots, CVE lookup) but **cannot
 change a machine on its own**. Writes go through a fixed, server-side fix menu

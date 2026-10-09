@@ -27,7 +27,7 @@ mod testenv;
 mod vpn;
 mod vpnrelay;
 
-const VERSION: &str = "3.17.0";
+const VERSION: &str = "3.17.1";
 
 /// Refusal for a claim made with no SSO identity. Writing an empty owner would leave
 /// the device unclaimed — i.e. visible to every user on the hub — while reporting
@@ -370,7 +370,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/vpn/status") => vpn_resp(vpn::status_ep(&query_param(&url, "target").unwrap_or_default())),
         (Method::Post, "/x/vpn/enable") => {
             let t = query_param(&url, "target").unwrap_or_default();
-            vpn_resp(vpn::enable_ep(&t, user.as_deref().unwrap_or(""), device_owner(agents, &t).as_deref()))
+            vpn_resp(vpn::enable_ep(&t, user.as_deref().unwrap_or(""), agents))
         }
         (Method::Post, "/x/vpn/disable") => vpn_resp(vpn::disable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
         (Method::Post, "/x/vpn/pass") => {
@@ -381,7 +381,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
                 query_param(&url, "hours").and_then(|h| h.parse().ok()).unwrap_or(0),
                 &query_param(&url, "publicKey").unwrap_or_default(),
                 user.as_deref().unwrap_or(""),
-                device_owner(agents, &t).as_deref(),
+                agents,
             ))
         }
         (Method::Post, "/x/vpn/revoke") => {

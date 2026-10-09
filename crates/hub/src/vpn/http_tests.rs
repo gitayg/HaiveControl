@@ -17,8 +17,18 @@ fn vpn_hub() {
 /// A fake agent with a VPN, polling its tunnel with its device secret. It answers
 /// /vpn/apply with WireGuard key `pubkey`, and keeps every body it was sent there.
 fn fake_vpn(rid: &'static str, secret: String, pubkey: String) -> Arc<Mutex<Vec<Value>>> {
+    fake_vpn_hooked(rid, secret, pubkey, |_| {}).0
+}
+
+type Seen<T> = Arc<Mutex<Vec<T>>>;
+
+/// `fake_vpn` that runs `on_apply(n)` before it answers its n-th /vpn/apply (from 1),
+/// and also returns every path it was sent, in order.
+fn fake_vpn_hooked(rid: &'static str, secret: String, pubkey: String, on_apply: impl Fn(usize) + Send + 'static) -> (Seen<Value>, Seen<String>) {
     let applied = Arc::new(Mutex::new(Vec::new()));
     let seen = applied.clone();
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let sent = paths.clone();
     std::thread::spawn(move || {
         let c = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(90)).build().unwrap();
         loop {
@@ -28,10 +38,16 @@ fn fake_vpn(rid: &'static str, secret: String, pubkey: String) -> Arc<Mutex<Vec<
             }
             let Ok(job) = r.json::<Value>() else { continue };
             let id = job["id"].as_u64().unwrap();
+            sent.lock().unwrap().push(job["p"].as_str().unwrap_or("").to_string());
             let reply = if job["p"] == "/vpn/apply" {
                 use base64::Engine;
                 let b = base64::engine::general_purpose::STANDARD.decode(job["b"].as_str().unwrap_or("")).unwrap();
-                seen.lock().unwrap().push(serde_json::from_slice::<Value>(&b).unwrap());
+                let n = {
+                    let mut s = seen.lock().unwrap();
+                    s.push(serde_json::from_slice::<Value>(&b).unwrap());
+                    s.len()
+                };
+                on_apply(n);
                 json!({"ok": true, "status": {"publicKey": pubkey}})
             } else {
                 json!({"ok": true})
@@ -39,7 +55,7 @@ fn fake_vpn(rid: &'static str, secret: String, pubkey: String) -> Arc<Mutex<Vec<
             let _ = c.post(format!("{}/relay/reply?id={rid}&tok={secret}&req={id}&st=200&ct=application%2Fjson", hub())).body(reply.to_string()).send();
         }
     });
-    applied
+    (applied, paths)
 }
 
 pub(super) fn target(rid: &str) -> String {
@@ -251,4 +267,93 @@ fn the_peer_pushed_to_the_device_is_the_clients_public_key() {
     let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=again&publicKey={}", enc(&pk)), None);
     assert_eq!(st, 409, "{v}");
     assert_eq!(passes_on_disk(rid), 1);
+}
+
+// ---- a shutdown that lands during a push stands -------------------------------------
+
+/// A fake VPN agent on a freshly enrolled `rid` that shuts the exit down (as a
+/// revoke, forget, dissolve or owner change does) while it handles its `nth` apply.
+fn racing_exit(rid: &'static str, pubkey: &str, nth: usize) -> (Seen<Value>, Seen<String>) {
+    vpn_hub();
+    let s = enroll(rid, &format!("owner-{rid}"));
+    fake_vpn_hooked(rid, s, pubkey.to_string(), move |n| {
+        if n == nth {
+            crate::vpn::shut_down(rid);
+        }
+    })
+}
+
+/// What the relay does with `rid`'s HELLO signed with the secret its first apply
+/// carried, and a client handshake for `pubkey`: as `routes`, without the hub's store.
+fn routes_as_pushed(rid: &str, applied: &Seen<Value>, pubkey: &str, n: u8) -> (bool, bool, usize) {
+    let hex = applied.lock().unwrap()[0]["secret"].as_str().expect("the push carried a secret").to_string();
+    let secret: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+    let pk = crate::vpn::decode_key(pubkey).unwrap();
+    crate::vpnrelay::probe(rid, &secret, &pk, format!("198.51.100.{n}:42000").parse().unwrap(), format!("203.0.113.{n}:57000").parse().unwrap())
+}
+
+fn told_to_disable(paths: &Seen<String>) -> bool {
+    paths.lock().unwrap().iter().any(|p| p == "/vpn/disable")
+}
+
+#[test]
+fn a_shutdown_during_the_enable_push_keeps_the_exit_off() {
+    let rid = "vpn-race-enable";
+    let pk = crate::vpn::test_key();
+    let (applied, paths) = racing_exit(rid, &pk, 1);
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 409, "the enable outlived the shutdown: {v}");
+    assert!(v["error"].as_str().unwrap_or("").contains("shut down while enabling"), "{v}");
+    assert_eq!(crate::vpn::on_disk(rid), (false, 0), "vpn.json has the exit back");
+    assert_eq!(crate::vpn::server_key(rid), None, "the hub's memory has the exit back");
+    assert_eq!(routes_as_pushed(rid, &applied, &pk, 101), (false, false, 0), "the relay routes the shut-down exit");
+    assert!(told_to_disable(&paths), "the device kept the config the shutdown overtook");
+}
+
+#[test]
+fn a_shutdown_during_the_pass_push_keeps_the_exit_off() {
+    let rid = "vpn-race-pass";
+    let pk = crate::vpn::test_key();
+    let (applied, paths) = racing_exit(rid, &pk, 2);
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "control: the enable itself raced nothing: {v}");
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(&crate::vpn::test_key())), None);
+    assert_eq!(st, 409, "a pass was handed out for a shut-down exit: {v}");
+    assert!(v["error"].as_str().unwrap_or("").contains("shut down while issuing"), "{v}");
+    assert!(v.get("wireguard").is_none(), "{v}");
+    assert_eq!(crate::vpn::on_disk(rid), (false, 0), "vpn.json has the exit or its pass back");
+    assert_eq!(routes_as_pushed(rid, &applied, &pk, 102), (false, false, 0), "the relay routes the shut-down exit");
+    assert!(told_to_disable(&paths), "the device kept the pass the shutdown overtook");
+}
+
+#[test]
+fn a_shutdown_during_a_sweep_push_keeps_the_exit_off() {
+    let rid = "vpn-race-sweep";
+    let pk = crate::vpn::test_key();
+    let (applied, paths) = racing_exit(rid, &pk, 2);
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "control: {v}");
+    super::mark_dirty(rid);
+    super::sweep(&crate::Agents::default());
+    assert_eq!(applied.lock().unwrap().len(), 2, "control: the sweep pushed the dirty exit");
+    assert_eq!(crate::vpn::on_disk(rid), (false, 0), "vpn.json has the exit back");
+    assert_eq!(routes_as_pushed(rid, &applied, &pk, 103), (false, false, 0), "the relay routes the shut-down exit");
+    assert!(told_to_disable(&paths), "the device kept the config the shutdown overtook");
+}
+
+/// Control for the three above: the same hooked agent with no shutdown enables, issues
+/// and routes, and is never told to disable.
+#[test]
+fn an_enable_and_a_pass_with_no_shutdown_still_work() {
+    let rid = "vpn-race-none";
+    let pk = crate::vpn::test_key();
+    let (applied, paths) = racing_exit(rid, &pk, usize::MAX);
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "{v}");
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(&crate::vpn::test_key())), None);
+    assert_eq!(st, 201, "{v}");
+    assert_eq!(crate::vpn::on_disk(rid), (true, 1));
+    assert_eq!(routes(rid, &pk, 104), (true, true, 1));
+    assert!(routes_as_pushed(rid, &applied, &pk, 105).1, "the secret the device was given is the one the relay checks");
+    assert!(!told_to_disable(&paths), "{:?}", paths.lock().unwrap());
 }

@@ -92,6 +92,15 @@ Devices are real people's machines, though — act carefully on them (see below)
   `the_peer_pushed_to_the_device_is_the_clients_public_key`, and
   `the_dashboard_builds_the_pass_in_the_browser`, which needs `node` ≥ 20 on PATH and runs
   `src/vpn/vpnpass_check.js` against a real pass response).
+- **VPN pushes vs. shutdowns (hub 3.17.1).** `enable_ep`, `issue_ep` and `sweep` push to the device
+  with the `vpn::store` lock released. `switch_off` bumps a per-device `Store.epochs` counter and
+  removes the relay registration *under* the store lock; a push commits (relay register +
+  `vpn.json`) only under that lock and only if its starting epoch and the device owner are
+  unchanged, else it returns `409` and `take_back` sends `/vpn/disable` (or marks the exit dirty
+  if a newer enable won). Lock order is store → `vpnrelay`; never take the store inside the relay
+  lock. Any new code that pushes to the device must follow the same check. Tests:
+  `a_shutdown_during_the_{enable,pass}_push_keeps_the_exit_off`, `a_shutdown_during_a_sweep_push_keeps_the_exit_off` (the fake agent's
+  `/vpn/apply` hook calls `vpn::shut_down`) and the control `an_enable_and_a_pass_with_no_shutdown_still_work`.
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed

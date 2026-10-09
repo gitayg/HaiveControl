@@ -83,6 +83,18 @@ pub struct Store {
     pub devices: BTreeMap<String, DevCfg>,
     #[serde(default)]
     pub passes: Vec<Pass>,
+    /// Per device, bumped by every shutdown of its exit. An enable, pass or sweep
+    /// pushes to the device without the lock held, and commits only if the epoch it
+    /// started under is unchanged, so a shutdown that lands during the push stands.
+    /// Memory only: a restart ends every push in flight.
+    #[serde(skip)]
+    epochs: BTreeMap<String, u64>,
+}
+
+impl Store {
+    fn epoch(&self, device: &str) -> u64 {
+        self.epochs.get(device).copied().unwrap_or(0)
+    }
 }
 
 fn store() -> &'static Mutex<Store> {
@@ -208,7 +220,7 @@ pub fn start(agents: std::sync::Arc<crate::Agents>) {
 }
 
 fn sweep(agents: &crate::Agents) {
-    let (dirty, passes): (Vec<(String, DevCfg)>, Vec<Pass>) = {
+    let (dirty, passes): (Vec<(String, DevCfg, u64)>, Vec<Pass>) = {
         let mut s = store().lock().unwrap();
         let t = now();
         let before = s.passes.len();
@@ -216,18 +228,48 @@ fn sweep(agents: &crate::Agents) {
         if s.passes.len() != before {
             save(&s);
         }
-        (s.devices.iter().filter(|(_, c)| c.dirty).map(|(k, c)| (k.clone(), c.clone())).collect(), s.passes.clone())
+        (s.devices.iter().filter(|(_, c)| c.dirty).map(|(k, c)| (k.clone(), c.clone(), s.epoch(k))).collect(), s.passes.clone())
     };
-    for (id, cfg) in dirty {
+    for (id, cfg, epoch) in dirty {
+        // An earlier device's push took a while: this one may have been shut down since.
+        if store().lock().unwrap().epoch(&id) != epoch {
+            continue;
+        }
         let target = format!("relay://{id}");
-        if push(&target, &cfg, &passes, &id, crate::device_owner(agents, &target).as_deref()).is_ok() {
-            let mut s = store().lock().unwrap();
+        let pushed = push(&target, &cfg, &passes, &id, crate::device_owner(agents, &target).as_deref()).is_ok();
+        let mut s = store().lock().unwrap();
+        if s.epoch(&id) != epoch {
+            drop(s);
+            if pushed {
+                take_back(&target, &id);
+            }
+            continue;
+        }
+        if pushed {
             if let Some(c) = s.devices.get_mut(&id) {
                 c.dirty = false;
             }
             save(&s);
             println!("[vpn] {id}: caught up after reconnect");
         }
+    }
+}
+
+/// A push that lost a race with a shutdown (or an owner change) gave the device a
+/// config the hub no longer stands behind. Leave the hub state as the shutdown left
+/// it and take the config back on the device, best effort — unless a newer enable has
+/// switched the exit back on since, whose state the next sweep re-pushes.
+fn take_back(target: &str, device: &str) {
+    let enabled = {
+        let mut s = store().lock().unwrap();
+        let enabled = s.devices.get_mut(device).map(|c| c.dirty = true).is_some();
+        if enabled {
+            save(&s);
+        }
+        enabled
+    };
+    if !enabled {
+        let _ = dev_unary(target, "POST", "/vpn/disable", None);
     }
 }
 
@@ -281,7 +323,7 @@ pub fn status_ep(target: &str) -> (Value, u16) {
     )
 }
 
-pub fn enable_ep(target: &str, user: &str, owner: Option<&str>) -> (Value, u16) {
+pub fn enable_ep(target: &str, user: &str, agents: &crate::Agents) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -289,12 +331,13 @@ pub fn enable_ep(target: &str, user: &str, owner: Option<&str>) -> (Value, u16) 
     if endpoint().is_none() || !crate::vpnrelay::running() {
         return (json!({"ok": false, "error": "the hub's VPN relay is not configured (set VPN_RELAY_ENDPOINT and publish VPN_UDP_PORT over UDP)"}), 503);
     }
-    let (mut cfg, passes) = {
+    let owner = crate::device_owner(agents, target);
+    let (mut cfg, passes, epoch) = {
         let s = store().lock().unwrap();
         let cfg = s.devices.get(&device).cloned().unwrap_or_else(|| DevCfg { secret: hex(&random32()), enabled_by: user.to_string(), enabled_at: now(), ..Default::default() });
-        (cfg, s.passes.clone())
+        (cfg, s.passes.clone(), s.epoch(&device))
     };
-    let st = match push(target, &cfg, &passes, &device, owner) {
+    let st = match push(target, &cfg, &passes, &device, owner.as_deref()) {
         Ok(st) => st,
         Err(e) => return (json!({"ok": false, "error": e}), 502),
     };
@@ -303,16 +346,30 @@ pub fn enable_ep(target: &str, user: &str, owner: Option<&str>) -> (Value, u16) 
     };
     cfg.server_public_key = pk.to_string();
     cfg.dirty = false;
+    if crate::device_owner(agents, target) != owner {
+        take_back(target, &device);
+        return (json!({"ok": false, "error": "the device's owner changed while enabling"}), 409);
+    }
+    // Check, register and record under one lock: a shutdown either lands before (and
+    // the epoch says so) or after (and undoes all of it).
+    let mut s = store().lock().unwrap();
+    if s.epoch(&device) != epoch {
+        drop(s);
+        println!("[vpn] {device}: enable abandoned — the exit was shut down during the push");
+        take_back(target, &device);
+        return (json!({"ok": false, "error": "the exit was shut down while enabling"}), 409);
+    }
     if let Err(other) = register_relay(&device, &cfg) {
+        drop(s);
         // Clients find a device by its key: a second device with it (a cloned image,
         // or one copying another's reported key) would take the first one's clients.
         println!("[vpn] {device}: enable refused — {other} already uses its WireGuard key");
         crate::audit(user, "browser", "VPN exit refused", &device, "its WireGuard key is already used by another VPN exit");
         return (json!({"ok": false, "error": "this device reports a WireGuard key that another VPN exit already uses (a cloned image?) — give it a fresh key, then enable again"}), 409);
     }
-    let mut s = store().lock().unwrap();
     s.devices.insert(device.clone(), cfg);
     save(&s);
+    drop(s);
     println!("[vpn] {device}: exit enabled by {user}");
     (json!({"ok": true, "status": st}), 200)
 }
@@ -336,8 +393,11 @@ pub fn disable_ep(target: &str, user: &str) -> (Value, u16) {
 /// otherwise they stay, revoked, for the dashboard's history.
 /// Returns `(was enabled, passes revoked or dropped)`.
 fn switch_off(device: &str, drop_passes: bool) -> (bool, usize) {
-    crate::vpnrelay::remove_device(device);
     let mut s = store().lock().unwrap();
+    // The epoch and the relay under the store lock, as enable registers the relay:
+    // an enable can then never register between the two.
+    *s.epochs.entry(device.to_string()).or_default() += 1;
+    crate::vpnrelay::remove_device(device);
     let was_enabled = s.devices.remove(device).is_some();
     let n = if drop_passes {
         let before = s.passes.len();
@@ -366,7 +426,7 @@ pub fn shut_down(device: &str) -> (bool, usize) {
 
 /// Issue a pass for the client whose WireGuard public key is `client_public_key`
 /// (base64, 32 bytes). The browser generated the keypair and keeps the private key.
-pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, user: &str, owner: Option<&str>) -> (Value, u16) {
+pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, user: &str, agents: &crate::Agents) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -385,7 +445,8 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, u
     let name: String = name.trim().chars().filter(|c| !c.is_control()).take(40).collect();
     let name = if name.is_empty() { "device".to_string() } else { name };
     let t = now();
-    let (pass, cfg, passes) = {
+    let owner = crate::device_owner(agents, target);
+    let (pass, cfg, passes, epoch) = {
         let mut s = store().lock().unwrap();
         let Some(cfg) = s.devices.get(&device).cloned() else {
             return (json!({"ok": false, "error": "enable the VPN exit on this device first"}), 409);
@@ -413,11 +474,33 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, u
         };
         s.passes.push(pass.clone());
         save(&s);
-        (pass, cfg, s.passes.clone())
+        (pass, cfg, s.passes.clone(), s.epoch(&device))
     };
-    let pushed = push(target, &cfg, &passes, &device, owner);
-    if pushed.is_err() {
-        mark_dirty(&device);
+    let pushed = push(target, &cfg, &passes, &device, owner.as_deref());
+    let owner_kept = crate::device_owner(agents, target) == owner;
+    {
+        let mut s = store().lock().unwrap();
+        let shut = s.epoch(&device) != epoch;
+        if shut || !owner_kept {
+            // A shutdown has already revoked or dropped the pass; an owner change has
+            // not, and the pass must not outlive the push it rode on either way.
+            if let Some(p) = s.passes.iter_mut().find(|p| p.id == pass.id && p.revoked_at.is_none()) {
+                p.revoked_at = Some(now());
+            }
+            save(&s);
+            drop(s);
+            if pushed.is_ok() {
+                take_back(target, &device);
+            }
+            let error = if shut { "the exit was shut down while issuing the pass" } else { "the device's owner changed while issuing the pass" };
+            return (json!({"ok": false, "error": error}), 409);
+        }
+        if pushed.is_err() {
+            if let Some(c) = s.devices.get_mut(&device) {
+                c.dirty = true;
+            }
+            save(&s);
+        }
     }
     let file = format!("itai-{}.conf", pass.name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>());
     (

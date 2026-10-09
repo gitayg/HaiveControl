@@ -736,6 +736,9 @@ Changing the device's owner (Set owner, `/x/set-owner`, `/m/set-owner`) does the
 pass belongs to the owner who issued it. That is audited as "shut down VPN exit". Re-enrolling
 does not bring the exit back; enable it again and issue new passes. A config push to the device
 also leaves out any pass that the device's current owner did not issue.
+A shutdown that lands while an enable, a pass or a catch-up push is still talking to the device
+stands (hub 3.17.1): the request fails with `409`, the hub keeps the exit off, and the device is
+told to disable what it was just sent.
 
 ## Config (environment variables)
 
