@@ -90,7 +90,7 @@ fn main() {
     });
     start_scheduler(agents.clone(), ip.clone(), port);
     // VPN exit relay (UDP) + pass sweeper. No-op unless VPN_RELAY_ENDPOINT is set.
-    vpn::start();
+    vpn::start(agents.clone());
 
     // Reverse tunnel: agents behind NAT dial in over HTTP long-poll on THIS port
     // (/relay/hello, /relay/poll, /relay/reply — see relay.rs), so it works
@@ -368,15 +368,25 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/dissolve") => proxy_dissolve(&url, agents, user.as_deref().unwrap_or(""), "browser"),
         (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/vpn/status") => vpn_resp(vpn::status_ep(&query_param(&url, "target").unwrap_or_default())),
-        (Method::Post, "/x/vpn/enable") => vpn_resp(vpn::enable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
+        (Method::Post, "/x/vpn/enable") => {
+            let t = query_param(&url, "target").unwrap_or_default();
+            vpn_resp(vpn::enable_ep(&t, user.as_deref().unwrap_or(""), device_owner(agents, &t).as_deref()))
+        }
         (Method::Post, "/x/vpn/disable") => vpn_resp(vpn::disable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
-        (Method::Post, "/x/vpn/pass") => vpn_resp(vpn::issue_ep(
-            &query_param(&url, "target").unwrap_or_default(),
-            &query_param(&url, "name").unwrap_or_default(),
-            query_param(&url, "hours").and_then(|h| h.parse().ok()).unwrap_or(0),
-            user.as_deref().unwrap_or(""),
-        )),
-        (Method::Post, "/x/vpn/revoke") => vpn_resp(vpn::revoke_ep(&query_param(&url, "target").unwrap_or_default(), &query_param(&url, "id").unwrap_or_default())),
+        (Method::Post, "/x/vpn/pass") => {
+            let t = query_param(&url, "target").unwrap_or_default();
+            vpn_resp(vpn::issue_ep(
+                &t,
+                &query_param(&url, "name").unwrap_or_default(),
+                query_param(&url, "hours").and_then(|h| h.parse().ok()).unwrap_or(0),
+                user.as_deref().unwrap_or(""),
+                device_owner(agents, &t).as_deref(),
+            ))
+        }
+        (Method::Post, "/x/vpn/revoke") => {
+            let t = query_param(&url, "target").unwrap_or_default();
+            vpn_resp(vpn::revoke_ep(&t, &query_param(&url, "id").unwrap_or_default(), device_owner(agents, &t).as_deref()))
+        }
         (Method::Get, "/x/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/x/enroll-token") => enroll_token_ep(&url, user.as_deref()),
         (Method::Get, "/x/alerts") => json_resp(&serde_json::json!({"ok": true, "alerts": monitor::recent(user.as_deref())})),
@@ -399,7 +409,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/wake") => wake_ep(&url, agents, mowner.as_deref()),
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
-        (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
+        (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref(), "browser"),
         (Method::Post, "/x/device-secret/revoke") => devicesecrets::revoke_ep(&url, agents, user.as_deref().unwrap_or("")),
         (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t, user.as_deref().unwrap_or(""), "browser", "device removed"); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
@@ -501,7 +511,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/m/dissolve") => proxy_dissolve(&url, agents, mowner.as_deref().unwrap_or(""), "mcp"),
         (Method::Get, "/m/persist") => proxy_persist(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
-        (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
+        (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref(), "mcp"),
         (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t, mowner.as_deref().unwrap_or(""), "mcp", "device removed"); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
@@ -2218,8 +2228,10 @@ pub(crate) fn owner_override(key: &str) -> Option<String> {
     owner_overrides().lock().unwrap().get(key).cloned()
 }
 /// Assign `key` to `owner` (empty clears it): record the override, apply it to the
-/// live registry entry now, and persist.
-fn set_owner(agents: &Agents, key: &str, owner: &str) {
+/// live registry entry now, and persist. A change of owner shuts the device's VPN
+/// exit down (audited as `actor`): its passes belong to the owner who issued them.
+pub(crate) fn set_owner(agents: &Agents, key: &str, owner: &str, actor: &str, source: &str) {
+    let prev = owner_override(key).or_else(|| agents.lock().unwrap().get(key).and_then(|a| a.data.get("owner").and_then(|o| o.as_str()).map(String::from)));
     {
         let mut m = owner_overrides().lock().unwrap();
         if owner.is_empty() {
@@ -2239,12 +2251,17 @@ fn set_owner(agents: &Agents, key: &str, owner: &str) {
     }
     save_owner_overrides();
     save_state(agents);
+    if prev.as_deref() != Some(owner) {
+        if let Some(id) = key.strip_prefix("relay:") {
+            shut_down_vpn_exit(id, &device_name(agents, &format!("relay://{id}")), actor, source, "device owner changed");
+        }
+    }
 }
 
 /// GET /x/set-owner?target=X[&owner=Y] — assign a device to an owner. Owner
 /// defaults to the caller (claim to self); `?owner=` sets it explicitly (email or
 /// id, canonicalized); `?owner=` empty clears it back to un-owned.
-fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
+fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>, source: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     if target.is_empty() {
         return Response::from_string("no target").with_status_code(400);
@@ -2269,7 +2286,7 @@ fn set_owner_ep(url: &str, agents: &Agents, user: Option<&str>) -> Resp {
             _ => return Response::from_string(NO_IDENTITY).with_status_code(409),
         },
     };
-    set_owner(agents, &device_key(&target), &owner);
+    set_owner(agents, &device_key(&target), &owner, user.unwrap_or(""), source);
     json_resp(&serde_json::json!({"ok": true, "owner": owner}))
 }
 

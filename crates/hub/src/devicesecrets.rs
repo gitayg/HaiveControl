@@ -182,7 +182,7 @@ fn stamp(req: &Request, data: &mut serde_json::Value, owner: Option<&str>) {
 /// `relay_id`): a refused hello must change no ownership.
 fn record_owner(agents: &Agents, rid: &str, owner: Option<&str>) {
     if let Some(owner) = owner {
-        crate::set_owner(agents, &format!("relay:{rid}"), owner);
+        crate::set_owner(agents, &format!("relay:{rid}"), owner, "system", "relay");
     }
 }
 

@@ -585,15 +585,15 @@ fn after_a_restart_a_new_id_still_enrolls_under_any_owner() {
 
 /// A device with its VPN exit enabled and one pass, checked in at the relay with a
 /// client routed to it. Returns what `vpn_alive` needs.
-struct Exit {
-    rid: &'static str,
+pub(crate) struct Exit {
+    pub(crate) rid: &'static str,
     secret: Vec<u8>,
     server_pub: [u8; 32],
     device: std::net::SocketAddr,
     phone: std::net::SocketAddr,
 }
 
-fn vpn_exit(rid: &'static str, n: u8) -> Exit {
+pub(crate) fn vpn_exit(rid: &'static str, n: u8) -> Exit {
     hub(); // vpn.json lives under HUB_DATA, which must already point at the test dir
     let server_pub = [n; 32];
     let secret = crate::vpn::enable_for_test(rid, &server_pub);
@@ -604,11 +604,11 @@ fn vpn_exit(rid: &'static str, n: u8) -> Exit {
 }
 
 /// (relay ACKs its signed HELLO, relay routes a client to it, clients routed to it)
-fn vpn_alive(e: &Exit) -> (bool, bool, usize) {
+pub(crate) fn vpn_alive(e: &Exit) -> (bool, bool, usize) {
     crate::vpnrelay::probe(e.rid, &e.secret, &e.server_pub, e.device, e.phone)
 }
 
-fn assert_vpn_gone(e: &Exit, after: &str) {
+pub(crate) fn assert_vpn_gone(e: &Exit, after: &str) {
     assert_eq!(crate::vpn::on_disk(e.rid), (false, 0), "{after}: vpn.json still has {}'s exit or passes", e.rid);
     assert_eq!(crate::vpnrelay::device_status(e.rid), (false, 0), "{after}: the relay kept {}'s client sessions", e.rid);
     assert_eq!(vpn_alive(e), (false, false, 0), "{after}: the relay still accepts {}", e.rid);

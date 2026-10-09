@@ -174,14 +174,22 @@ fn qr_svg(text: &str) -> String {
     }
 }
 
-/// Send the device everything it should have: relay, secret, live peers.
-/// Returns the agent's status (which carries its WireGuard public key).
-fn push(target: &str, cfg: &DevCfg, passes: &[Pass], device: &str) -> Result<Value, String> {
+/// Is `p` still its holder's to use on a device now owned by `owner`? A pass
+/// belongs to the owner who issued it (empty: issued with no identity, as
+/// `may_control` lets anyone then).
+fn owned(p: &Pass, owner: Option<&str>) -> bool {
+    p.owner.is_empty() || owner == Some(p.owner.as_str())
+}
+
+/// Send the device everything it should have: relay, secret, live peers whose
+/// pass its current `owner` issued. Returns the agent's status (which carries its
+/// WireGuard public key).
+fn push(target: &str, cfg: &DevCfg, passes: &[Pass], device: &str, owner: Option<&str>) -> Result<Value, String> {
     let ep = endpoint().ok_or("VPN_RELAY_ENDPOINT is not set on the hub")?;
     let t = now();
     let peers: Vec<Value> = passes
         .iter()
-        .filter(|p| p.device == device && p.live(t))
+        .filter(|p| p.device == device && p.live(t) && owned(p, owner))
         .map(|p| json!({"publicKey": p.public_key, "presharedKey": p.preshared_key, "allowedIps": format!("{}/32", p.address), "expiresAt": p.expires_at}))
         .collect();
     let body = json!({"relay": ep, "secret": cfg.secret, "peers": peers}).to_string();
@@ -203,7 +211,7 @@ fn register_relay(device: &str, cfg: &DevCfg) -> Result<(), String> {
 
 /// At startup: bind the relay and register every enabled device, then keep
 /// retrying pushes to devices that missed a change while offline.
-pub fn start() {
+pub fn start(agents: std::sync::Arc<crate::Agents>) {
     let port = std::env::var("VPN_UDP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(51820u16);
     if endpoint().is_none() {
         println!("[vpn] VPN_RELAY_ENDPOINT unset — VPN exit disabled");
@@ -218,13 +226,13 @@ pub fn start() {
             }
         }
     }
-    std::thread::spawn(|| loop {
+    std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
-        sweep();
+        sweep(&agents);
     });
 }
 
-fn sweep() {
+fn sweep(agents: &crate::Agents) {
     let (dirty, passes): (Vec<(String, DevCfg)>, Vec<Pass>) = {
         let mut s = store().lock().unwrap();
         let t = now();
@@ -236,7 +244,8 @@ fn sweep() {
         (s.devices.iter().filter(|(_, c)| c.dirty).map(|(k, c)| (k.clone(), c.clone())).collect(), s.passes.clone())
     };
     for (id, cfg) in dirty {
-        if push(&format!("relay://{id}"), &cfg, &passes, &id).is_ok() {
+        let target = format!("relay://{id}");
+        if push(&target, &cfg, &passes, &id, crate::device_owner(agents, &target).as_deref()).is_ok() {
             let mut s = store().lock().unwrap();
             if let Some(c) = s.devices.get_mut(&id) {
                 c.dirty = false;
@@ -297,7 +306,7 @@ pub fn status_ep(target: &str) -> (Value, u16) {
     )
 }
 
-pub fn enable_ep(target: &str, user: &str) -> (Value, u16) {
+pub fn enable_ep(target: &str, user: &str, owner: Option<&str>) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -310,7 +319,7 @@ pub fn enable_ep(target: &str, user: &str) -> (Value, u16) {
         let cfg = s.devices.get(&device).cloned().unwrap_or_else(|| DevCfg { secret: hex(&random32()), enabled_by: user.to_string(), enabled_at: now(), ..Default::default() });
         (cfg, s.passes.clone())
     };
-    let st = match push(target, &cfg, &passes, &device) {
+    let st = match push(target, &cfg, &passes, &device, owner) {
         Ok(st) => st,
         Err(e) => return (json!({"ok": false, "error": e}), 502),
     };
@@ -380,7 +389,7 @@ pub fn shut_down(device: &str) -> (bool, usize) {
     r
 }
 
-pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str) -> (Value, u16) {
+pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str, owner: Option<&str>) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -423,7 +432,7 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str) -> (Value, u16
         save(&s);
         (pass, private_key, cfg, s.passes.clone())
     };
-    let pushed = push(target, &cfg, &passes, &device);
+    let pushed = push(target, &cfg, &passes, &device, owner);
     if pushed.is_err() {
         mark_dirty(&device);
     }
@@ -442,7 +451,7 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str) -> (Value, u16
     )
 }
 
-pub fn revoke_ep(target: &str, id: &str) -> (Value, u16) {
+pub fn revoke_ep(target: &str, id: &str, owner: Option<&str>) -> (Value, u16) {
     let device = match device_of(target) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
@@ -462,7 +471,7 @@ pub fn revoke_ep(target: &str, id: &str) -> (Value, u16) {
     };
     let mut synced = true;
     if let Some(cfg) = cfg {
-        if push(target, &cfg, &passes, &device).is_err() {
+        if push(target, &cfg, &passes, &device, owner).is_err() {
             mark_dirty(&device);
             synced = false;
         }
@@ -503,6 +512,19 @@ pub(crate) fn on_disk(device: &str) -> (bool, usize) {
     let _g = store().lock().unwrap();
     let s = load();
     (s.devices.contains_key(device), s.passes.iter().filter(|p| p.device == device).count())
+}
+
+/// Add a live pass on `device` issued by `owner`; returns its public key.
+#[cfg(test)]
+pub(crate) fn add_pass_for_test(device: &str, owner: &str) -> String {
+    let t = now();
+    let mut s = store().lock().unwrap();
+    let address = allocate(&s.passes, device, t).unwrap();
+    let public_key = keypair().1;
+    let pass = Pass { id: hex(&random32()[..12]), device: device.into(), name: "injected".into(), owner: owner.into(), public_key: public_key.clone(), preshared_key: b64(&random32()), address, created_at: t, expires_at: t + 3600, revoked_at: None };
+    s.passes.push(pass);
+    save(&s);
+    public_key
 }
 
 /// The HELLO secret `device` is enabled with, if it is.

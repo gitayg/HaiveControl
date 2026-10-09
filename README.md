@@ -717,8 +717,10 @@ Enable, disable, issue and revoke are audited.
 **The exit goes with the device.** Revoking a device's credential, or removing (Forget)
 or dissolving the device, also shuts its exit down: the relay stops accepting the
 device and drops its clients, and its config and passes are deleted from `vpn.json`.
-That is audited as "shut down VPN exit". Re-enrolling does not bring the exit back; enable
-it again and issue new passes.
+Changing the device's owner (Set owner, `/x/set-owner`, `/m/set-owner`) does the same, because a
+pass belongs to the owner who issued it. That is audited as "shut down VPN exit". Re-enrolling
+does not bring the exit back; enable it again and issue new passes. A config push to the device
+also leaves out any pass that the device's current owner did not issue.
 
 ## Config (environment variables)
 

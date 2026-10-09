@@ -80,3 +80,41 @@ fn a_device_cannot_enable_with_another_devices_wireguard_key() {
     assert_eq!(crate::vpn::on_disk("vpn-dupkey-b"), (false, 0));
     assert_eq!(routes("vpn-dupkey-a", &pk, 81), (true, true, 1), "A no longer gets its clients");
 }
+
+#[test]
+fn a_change_of_owner_shuts_the_vpn_exit_down() {
+    use crate::devicesecrets::tests::{assert_vpn_gone, vpn_alive, vpn_exit};
+    enroll("vpn-xfer-a", "owner-vpn-xfer-1");
+    enroll("vpn-xfer-b", "owner-vpn-xfer-1");
+    let a = vpn_exit("vpn-xfer-a", 91);
+    let b = vpn_exit("vpn-xfer-b", 92);
+    let (st, _, body) = call("GET", &format!("/x/set-owner?target={}&owner=owner-vpn-xfer-2", target("vpn-xfer-a")), "", &[]);
+    assert_eq!(st, 200, "{body}");
+    assert_vpn_gone(&a, "transfer");
+    assert!(audited("shut down VPN exit", "host-vpn-xfer-a"), "the shutdown was not audited");
+    // Control: setting B's current owner again is not a change.
+    let (st, _, body) = call("GET", &format!("/x/set-owner?target={}&owner=owner-vpn-xfer-1", target("vpn-xfer-b")), "", &[]);
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(vpn_alive(&b), (true, true, 1), "re-asserting the owner shut B's exit down");
+    assert_eq!(crate::vpn::on_disk(b.rid), (true, 1));
+}
+
+#[test]
+fn a_push_carries_only_passes_the_current_owner_issued() {
+    vpn_hub();
+    let email = "vpn-push@test.example";
+    let owner = crate::canon_owner(email);
+    let s = enroll("vpn-push", &owner);
+    let applied = fake_vpn("vpn-push", s, crate::vpn::keypair().1);
+    let (st, v) = vpn_post("enable", "vpn-push", "", Some(email));
+    assert_eq!(st, 200, "{v}");
+    let mine = crate::vpn::add_pass_for_test("vpn-push", &owner);
+    let theirs = crate::vpn::add_pass_for_test("vpn-push", "owner-vpn-push-before");
+    let (st, v) = vpn_post("pass", "vpn-push", "&hours=1&name=phone", Some(email));
+    assert_eq!(st, 201, "{v}");
+    let last = applied.lock().unwrap().last().cloned().expect("nothing was pushed");
+    let keys: Vec<&str> = last["peers"].as_array().unwrap().iter().map(|p| p["publicKey"].as_str().unwrap()).collect();
+    assert!(keys.contains(&mine.as_str()), "control: the owner's own pass is missing: {last}");
+    assert!(!keys.contains(&theirs.as_str()), "a pass another owner issued was pushed: {last}");
+    assert_eq!(keys.len(), 2, "the owner's two passes: {last}");
+}
