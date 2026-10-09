@@ -242,9 +242,11 @@ pub fn hello(agents: &Agents, data: serde_json::Value, auth: &str, rebind: bool)
     let key = format!("relay:{agent_id}");
     if crate::clear_pending_dissolve(&key) {
         let id = agent_id.clone();
+        let name = crate::device_name(agents, &format!("relay://{agent_id}"));
         std::thread::spawn(move || {
             if request(&id, "POST", "/dissolve", None).is_some() {
                 crate::devicesecrets::remove(&id);
+                crate::shut_down_vpn_exit(&id, &name, "system", "relay", "queued dissolve delivered");
                 println!("relay: {id} dissolved (queued while offline)");
             } else {
                 crate::queue_dissolve(&format!("relay:{id}"));

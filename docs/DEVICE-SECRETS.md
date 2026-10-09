@@ -43,7 +43,9 @@ dialog, and `docs/SECURITY.md` to say exactly this.
 
 **Revoke.** `POST /x/device-secret/revoke?target=<t>` (dashboard; `may_control`, audited
 as "revoke device secret") deletes `store[rid]`. The device's next call gets 401. Removing
-or dissolving a device also deletes its entry.
+or dissolving a device also deletes its entry. Each of the three also shuts down the
+device's VPN exit (relay registration, `vpn.json` config and passes), audited as "shut
+down VPN exit".
 
 **Dashboard.**
 - Each device shows whether it holds a device secret ("own credential" vs "enrollment

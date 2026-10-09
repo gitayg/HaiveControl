@@ -580,3 +580,91 @@ fn after_a_restart_a_new_id_still_enrolls_under_any_owner() {
     enroll("ds-http-rs-new-ds", "owner-http-rs-new");
     assert_eq!(owner_state("ds-http-rs-new-ds"), owned_by("owner-http-rs-new"));
 }
+
+// ---- the VPN exit goes with the credential ---------------------------------------
+
+/// A device with its VPN exit enabled and one pass, checked in at the relay with a
+/// client routed to it. Returns what `vpn_alive` needs.
+struct Exit {
+    rid: &'static str,
+    secret: Vec<u8>,
+    server_pub: [u8; 32],
+    device: std::net::SocketAddr,
+    phone: std::net::SocketAddr,
+}
+
+fn vpn_exit(rid: &'static str, n: u8) -> Exit {
+    hub(); // vpn.json lives under HUB_DATA, which must already point at the test dir
+    let server_pub = [n; 32];
+    let secret = crate::vpn::enable_for_test(rid, &server_pub);
+    let e = Exit { rid, secret, server_pub, device: format!("198.51.100.{n}:40000").parse().unwrap(), phone: format!("203.0.113.{n}:55555").parse().unwrap() };
+    assert_eq!(vpn_alive(&e), (true, true, 1), "{rid}: control: the exit works before");
+    assert_eq!(crate::vpn::on_disk(rid), (true, 1), "{rid}: control: enabled with a pass on disk");
+    e
+}
+
+/// (relay ACKs its signed HELLO, relay routes a client to it, clients routed to it)
+fn vpn_alive(e: &Exit) -> (bool, bool, usize) {
+    crate::vpnrelay::probe(e.rid, &e.secret, &e.server_pub, e.device, e.phone)
+}
+
+fn assert_vpn_gone(e: &Exit, after: &str) {
+    assert_eq!(crate::vpn::on_disk(e.rid), (false, 0), "{after}: vpn.json still has {}'s exit or passes", e.rid);
+    assert_eq!(crate::vpnrelay::device_status(e.rid), (false, 0), "{after}: the relay kept {}'s client sessions", e.rid);
+    assert_eq!(vpn_alive(e), (false, false, 0), "{after}: the relay still accepts {}", e.rid);
+}
+
+#[test]
+fn revoking_the_credential_shuts_the_vpn_exit_down() {
+    let owner = "owner-http-vpn-rev";
+    enroll("ds-http-vpn-rev-a", owner);
+    enroll("ds-http-vpn-rev-b", owner);
+    let a = vpn_exit("ds-http-vpn-rev-a", 61);
+    let b = vpn_exit("ds-http-vpn-rev-b", 62);
+    let (st, _, body) = call("POST", &format!("/x/device-secret/revoke?target={}", enc("relay://ds-http-vpn-rev-a")), "", &[]);
+    assert_eq!((st, body.as_str()), (200, r#"{"ok":true,"revoked":true}"#));
+    assert_vpn_gone(&a, "revoke");
+    assert!(audited("shut down VPN exit", "host-ds-http-vpn-rev-a"), "the shutdown was not audited");
+    // Control: the other device's exit is untouched.
+    assert_eq!(vpn_alive(&b), (true, true, 1), "revoking A broke B's exit");
+    assert_eq!(crate::vpn::on_disk(b.rid), (true, 1));
+    assert!(!audited("shut down VPN exit", "host-ds-http-vpn-rev-b"));
+}
+
+#[test]
+fn removing_or_dissolving_a_device_shuts_its_vpn_exit_down() {
+    let owner = "owner-http-vpn-gone";
+    let b = vpn_exit("ds-http-vpn-keep", 70);
+
+    // Remove (Forget).
+    enroll("ds-http-vpn-forget", owner);
+    let e = vpn_exit("ds-http-vpn-forget", 71);
+    assert_eq!(call("GET", &format!("/x/forget?target={}", enc("relay://ds-http-vpn-forget")), "", &[]).0, 200);
+    assert_vpn_gone(&e, "forget");
+    assert!(audited("shut down VPN exit", "host-ds-http-vpn-forget"), "forget: not audited");
+
+    // Dissolve, device online.
+    let s = enroll("ds-http-vpn-dis", owner);
+    let e = vpn_exit("ds-http-vpn-dis", 72);
+    let agent = fake_agent("ds-http-vpn-dis", s);
+    let (st, _, body) = call("GET", &format!("/x/dissolve?target={}", enc("relay://ds-http-vpn-dis")), "", &[]);
+    assert_eq!((st, body.as_str()), (200, "dissolving"));
+    assert_eq!(agent.join().unwrap().as_deref(), Some("/dissolve"));
+    assert_vpn_gone(&e, "dissolve");
+    assert!(audited("shut down VPN exit", "host-ds-http-vpn-dis"), "dissolve: not audited");
+
+    // Dissolve queued while offline: the exit goes once the dissolve is delivered.
+    let s = enroll("ds-http-vpn-dis-q", owner);
+    let e = vpn_exit("ds-http-vpn-dis-q", 73);
+    crate::queue_dissolve("relay:ds-http-vpn-dis-q");
+    let agent = fake_agent("ds-http-vpn-dis-q", s.clone());
+    assert_eq!(hello("ds-http-vpn-dis-q", &s, false).0, 204);
+    assert_eq!(agent.join().unwrap().as_deref(), Some("/dissolve"));
+    assert!(eventually(|| crate::vpn::on_disk(e.rid) == (false, 0)), "queued dissolve: vpn.json still has the exit");
+    assert_vpn_gone(&e, "queued dissolve");
+    assert!(audited("shut down VPN exit", "host-ds-http-vpn-dis-q"), "queued dissolve: not audited");
+
+    // Control: a device nobody touched keeps its exit.
+    assert_eq!(vpn_alive(&b), (true, true, 1), "another device's exit was shut down");
+    assert_eq!(crate::vpn::on_disk(b.rid), (true, 1));
+}

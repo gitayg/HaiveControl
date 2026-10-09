@@ -708,6 +708,12 @@ within seconds. Expiry is also enforced on the device, so a pass ends on time ev
 hub is down. Pass holders cannot reach the device itself, its LAN, or each other.
 Enable, disable, issue and revoke are audited.
 
+**The exit goes with the device.** Revoking a device's credential, or removing (Forget)
+or dissolving the device, also shuts its exit down: the relay stops accepting the
+device and drops its clients, and its config and passes are deleted from `vpn.json`.
+That is audited as "shut down VPN exit". Re-enrolling does not bring the exit back; enable
+it again and issue new passes.
+
 ## Config (environment variables)
 
 | Var              | Default    | Meaning                                      |

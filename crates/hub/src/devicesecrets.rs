@@ -291,8 +291,9 @@ pub fn hello_ep(req: &mut Request, url: &str, agents: &Agents) -> Resp {
 
 /// POST /x/device-secret/revoke?target=<t> — delete a device's secret. `may_control`
 /// and the audit entry ("revoke device secret") are applied by the /x/ preamble in
-/// `handle`. The device's next relay call is refused with 401.
-pub fn revoke_ep(url: &str) -> Resp {
+/// `handle`. The device's next relay call is refused with 401, and its VPN exit is
+/// shut down (audited as `actor`): re-enrolling does not bring the exit back.
+pub fn revoke_ep(url: &str, agents: &Agents, actor: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     let rid = match crate::relay_target(&target) {
         Some(r) if !r.is_empty() => r,
@@ -303,6 +304,7 @@ pub fn revoke_ep(url: &str) -> Resp {
         // The tunnel is bound to the revoked secret. Dropping it lets the device
         // re-enroll with its enrollment token; until it does, it is disconnected.
         relay::drop_tunnel(&rid);
+        crate::shut_down_vpn_exit(&rid, &crate::device_name(agents, &target), actor, "browser", "device credential revoked");
         println!("relay: {rid} device credential revoked");
     }
     json_resp(&serde_json::json!({"ok": true, "revoked": revoked}))

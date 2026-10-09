@@ -365,7 +365,7 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Get, "/x/frame") => proxy_frame(&url),
         (Method::Get, "/x/camera") => proxy_camera(&url),
         (Method::Get, "/x/update") => proxy_update(&url, agents, hub_ip, hub_port),
-        (Method::Get, "/x/dissolve") => proxy_dissolve(&url, agents),
+        (Method::Get, "/x/dissolve") => proxy_dissolve(&url, agents, user.as_deref().unwrap_or(""), "browser"),
         (Method::Get, "/x/persist") => proxy_persist(&url),
         (Method::Get, "/x/vpn/status") => vpn_resp(vpn::status_ep(&query_param(&url, "target").unwrap_or_default())),
         (Method::Post, "/x/vpn/enable") => vpn_resp(vpn::enable_ep(&query_param(&url, "target").unwrap_or_default(), user.as_deref().unwrap_or(""))),
@@ -400,8 +400,8 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (_, "/x/mcp-tokens") => mcp_tokens_ep(&req, &url, user.as_deref()),
         (Method::Post, "/x/mcp-token-revoke") => mcp_token_revoke_ep(&url, user.as_deref()),
         (Method::Get, "/x/set-owner") => set_owner_ep(&url, agents, user.as_deref()),
-        (Method::Post, "/x/device-secret/revoke") => devicesecrets::revoke_ep(&url),
-        (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t); } json_resp(&serde_json::json!({"ok": true})) }
+        (Method::Post, "/x/device-secret/revoke") => devicesecrets::revoke_ep(&url, agents, user.as_deref().unwrap_or("")),
+        (Method::Get, "/x/forget") => { let t = query_param(&url, "target").unwrap_or_default(); if may_control(user.as_deref(), agents, &t) { forget_device(agents, &t, user.as_deref().unwrap_or(""), "browser", "device removed"); } json_resp(&serde_json::json!({"ok": true})) }
         (Method::Post, "/x/exec") => proxy_exec(&mut req, agents, user.as_deref(), false),
         (Method::Post, "/x/job/start") => jobs::start(&mut req, &url, agents, user.as_deref(), false),
         (Method::Get, "/x/job/logs") => jobs::logs(&url),
@@ -498,11 +498,11 @@ fn handle(mut req: Request, agents: &Agents, mac_id: &str, hub_ip: &str, hub_por
         (Method::Post, "/m/push-file") => push_file_ep(&url, mowner.as_deref(), hub_ip, hub_port),
         (Method::Get, "/m/file-status") => file_status_ep(&url),
         (Method::Get, "/m/update") => proxy_update(&url, agents, hub_ip, hub_port),
-        (Method::Get, "/m/dissolve") => proxy_dissolve(&url, agents),
+        (Method::Get, "/m/dissolve") => proxy_dissolve(&url, agents, mowner.as_deref().unwrap_or(""), "mcp"),
         (Method::Get, "/m/persist") => proxy_persist(&url),
         (Method::Get, "/m/dissolve-cancel") => cancel_dissolve(&url),
         (Method::Get, "/m/set-owner") => set_owner_ep(&url, agents, mowner.as_deref()),
-        (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t); json_resp(&serde_json::json!({"ok": true})) }
+        (Method::Get, "/m/forget") => { let t = query_param(&url, "target").unwrap_or_default(); forget_device(agents, &t, mowner.as_deref().unwrap_or(""), "mcp", "device removed"); json_resp(&serde_json::json!({"ok": true})) }
         (Method::Get, "/") => dashboard(agents, mac_id, hub_ip, hub_port, user.as_deref(), gz),
         _ => Response::from_string("not found").with_status_code(404),
     };
@@ -1252,14 +1252,14 @@ fn proxy_update(url: &str, agents: &Agents, hub_ip: &str, hub_port: u16) -> Resp
     }
 }
 
-fn proxy_dissolve(url: &str, agents: &Agents) -> Resp {
+fn proxy_dissolve(url: &str, agents: &Agents, actor: &str, source: &str) -> Resp {
     let target = query_param(url, "target").unwrap_or_default();
     match dev_unary(&target, "POST", "/dissolve", None) {
         Some((_st, _ct, b)) => {
             // Dissolved now (agent stopped + autostart removed) — drop it from the
             // inventory too, so a dissolved device disappears instead of lingering as
             // a stale offline row. (Also clears any queued dissolve for it.)
-            forget_device(agents, &target);
+            forget_device(agents, &target, actor, source, "agent dissolved");
             Response::from_data(b).with_header(hdr("Content-Type", "text/plain"))
         }
         // Offline / unreachable: queue it so it fires when the agent next connects,
@@ -2026,11 +2026,24 @@ fn load_state(agents: &Agents) {
 
 /// Remove a device (and its analysis) from the inventory + disk — the manual
 /// cleanup for the "keep forever" retention model — and delete its device secret,
-/// so a removed or dissolved device cannot reconnect on it.
-fn forget_device(agents: &Agents, target: &str) {
+/// so a removed or dissolved device cannot reconnect on it. Its VPN exit goes too.
+fn forget_device(agents: &Agents, target: &str, actor: &str, source: &str, why: &str) {
+    let name = device_name(agents, target);
     forget_inventory(agents, target);
-    if let Some(id) = relay_target(target) {
+    if let Some(id) = relay_target(target).filter(|s| !s.is_empty()) {
         devicesecrets::remove(&id);
+        shut_down_vpn_exit(&id, &name, actor, source, why);
+    }
+}
+
+/// A device lost its credential or was removed (`why`): shut its VPN exit down
+/// (see `vpn::shut_down`). Audited under the action's actor, only when there was
+/// an exit or a pass to shut down. Takes no other lock while the VPN stores are held.
+pub(crate) fn shut_down_vpn_exit(relay_id: &str, device: &str, actor: &str, source: &str, why: &str) {
+    let (was_enabled, passes) = vpn::shut_down(relay_id);
+    if was_enabled || passes > 0 {
+        let s = if passes == 1 { "" } else { "es" };
+        audit(actor, source, "shut down VPN exit", device, &format!("{why}: exit {}, {passes} pass{s} dropped", if was_enabled { "disabled" } else { "was off" }));
     }
 }
 

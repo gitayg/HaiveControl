@@ -261,11 +261,31 @@ pub fn running() -> bool {
     SOCK.get().is_some()
 }
 
+/// For tests outside this module: does the relay ACK a freshly signed HELLO from
+/// `id` at `device`, and then route a client's handshake for `server_pub` to it?
+/// Also returns the clients routed to `id` afterwards.
+#[cfg(test)]
+pub(crate) fn probe(id: &str, secret: &[u8], server_pub: &[u8; 32], device: SocketAddr, phone: SocketAddr) -> (bool, bool, usize) {
+    // HELLO timestamps must strictly increase per device, even within one ms.
+    static LAST: Mutex<u64> = Mutex::new(0);
+    let ts = {
+        let mut l = LAST.lock().unwrap();
+        *l = (*l + 1).max(now_ms());
+        *l
+    };
+    let now = Instant::now();
+    let out = route(&tests::hello(id, secret, ts), device, now, ts);
+    let acked = out.len() == 1 && out[0].0 == device && out[0].1[..2] == [MAGIC, T_ACK];
+    let out = route(&tests::initiation(server_pub), phone, now, ts);
+    let routed = out.len() == 1 && out[0].0 == device;
+    (acked, routed, device_status(id).1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn hello(id: &str, secret: &[u8], ts: u64) -> Vec<u8> {
+    pub(super) fn hello(id: &str, secret: &[u8], ts: u64) -> Vec<u8> {
         let mut f = vec![MAGIC, T_HELLO];
         f.extend_from_slice(&ts.to_be_bytes());
         f.push(id.len() as u8);
@@ -275,7 +295,7 @@ mod tests {
         f
     }
 
-    fn initiation(server_pub: &[u8; 32]) -> Vec<u8> {
+    pub(super) fn initiation(server_pub: &[u8; 32]) -> Vec<u8> {
         let mut p = vec![0u8; 148];
         p[0] = 1;
         for (i, b) in p.iter_mut().enumerate().take(116).skip(4) {

@@ -329,18 +329,45 @@ pub fn disable_ep(target: &str, user: &str) -> (Value, u16) {
         Err(e) => return (json!({"ok": false, "error": e}), 400),
     };
     let reached = dev_unary(target, "POST", "/vpn/disable", None).map(|(st, _, _)| st == 200).unwrap_or(false);
-    crate::vpnrelay::remove_device(&device);
-    let mut s = store().lock().unwrap();
-    s.devices.remove(&device);
-    let t = now();
-    for p in s.passes.iter_mut().filter(|p| p.device == device && p.revoked_at.is_none()) {
-        p.revoked_at = Some(t);
-    }
-    save(&s);
+    switch_off(&device, false);
     println!("[vpn] {device}: exit disabled by {user}");
     // Even unreached, the relay no longer routes to it, so no pass can connect;
     // the device tears its interface down on the next disable that reaches it.
     (json!({"ok": true, "deviceReached": reached}), 200)
+}
+
+/// The hub side of switching a device's exit off, whether or not the device is
+/// reachable: the relay stops accepting its HELLOs and drops its client sessions,
+/// and vpn.json no longer has it enabled. `drop_passes` deletes its passes;
+/// otherwise they stay, revoked, for the dashboard's history.
+/// Returns `(was enabled, passes revoked or dropped)`.
+fn switch_off(device: &str, drop_passes: bool) -> (bool, usize) {
+    crate::vpnrelay::remove_device(device);
+    let mut s = store().lock().unwrap();
+    let was_enabled = s.devices.remove(device).is_some();
+    let n = if drop_passes {
+        let before = s.passes.len();
+        s.passes.retain(|p| p.device != device);
+        before - s.passes.len()
+    } else {
+        let t = now();
+        s.passes.iter_mut().filter(|p| p.device == device && p.revoked_at.is_none()).map(|p| p.revoked_at = Some(t)).count()
+    };
+    if was_enabled || n > 0 {
+        save(&s);
+    }
+    (was_enabled, n)
+}
+
+/// The device's credential was revoked, or it was removed or dissolved: shut its
+/// exit down as Disable does, and drop its passes so vpn.json keeps no orphan.
+/// Returns `(was enabled, passes dropped)`.
+pub fn shut_down(device: &str) -> (bool, usize) {
+    let r = switch_off(device, true);
+    if r != (false, 0) {
+        println!("[vpn] {device}: exit shut down with the device's credential");
+    }
+    r
 }
 
 pub fn issue_ep(target: &str, name: &str, hours: u64, user: &str) -> (Value, u16) {
@@ -439,6 +466,33 @@ fn mark_dirty(device: &str) {
         c.dirty = true;
     }
     save(&s);
+}
+
+/// What `enable_ep` + `issue_ep` leave behind once the device has answered, for
+/// tests that cannot reach a device: `device` enabled with `server_pub` and one
+/// live pass. Returns the HELLO secret it signs with.
+#[cfg(test)]
+pub(crate) fn enable_for_test(device: &str, server_pub: &[u8; 32]) -> Vec<u8> {
+    let cfg = DevCfg { secret: hex(&random32()), server_public_key: b64(server_pub), enabled_by: "test".into(), enabled_at: now(), dirty: false };
+    register_relay(device, &cfg);
+    let t = now();
+    let mut s = store().lock().unwrap();
+    let address = allocate(&s.passes, device, t).unwrap();
+    let pass = Pass { id: hex(&random32()[..12]), device: device.into(), name: "phone".into(), owner: "test".into(), public_key: keypair().1, preshared_key: b64(&random32()), address, created_at: t, expires_at: t + 3600, revoked_at: None };
+    s.passes.push(pass);
+    let secret = unhex(&cfg.secret);
+    s.devices.insert(device.to_string(), cfg);
+    save(&s);
+    secret
+}
+
+/// `(enabled, passes)` for `device` as /data/vpn.json has it on disk.
+#[cfg(test)]
+pub(crate) fn on_disk(device: &str) -> (bool, usize) {
+    // Every save happens under the store lock and truncates first: read under it too.
+    let _g = store().lock().unwrap();
+    let s = load();
+    (s.devices.contains_key(device), s.passes.iter().filter(|p| p.device == device).count())
 }
 
 #[cfg(test)]
