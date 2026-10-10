@@ -191,7 +191,9 @@ So the audit record is written before the command runs, on the LAN path exactly 
 The hub's secrets on disk — the CA key that signs agent leaf certs, the capability signing key, and
 the owner enrollment tokens in `owner_tokens.json` (whoever reads one can enroll devices as that
 owner) — are written `0600` inside a `0700` data directory, created that way at `open(2)` time so they are
-never briefly world-readable. A key found with any group or other permission bit is **tightened and
+never briefly world-readable. Files the hub rewrites (`owner_tokens.json`, `device_secrets.json`,
+`vpn.json`) are replaced atomically (hub 3.17.2): a temp file in the same directory, synced, then
+renamed over the old one, so a crash or a concurrent read never sees an empty or half-written file. A key found with any group or other permission bit is **tightened and
 reported** as a `SECURITY:` line telling you to rotate it — a hub upgrading from an older version has
 a `0644 ca.key`, and refusing to start would add an outage to an exposure that already happened
 without undoing it. It is refused outright only when it cannot be tightened. Either key is

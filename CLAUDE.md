@@ -110,6 +110,12 @@ Devices are real people's machines, though — act carefully on them (see below)
   `a_pass_revoked_during_a_{sweep,re_enable}_push_is_pushed_again` (the hook runs `vpn::revoke` +
   `mark_dirty`, as an unreached `revoke_ep` does) and the control
   `a_sweep_push_with_no_pass_change_clears_the_retry_flag`.
+- **Secret files are replaced, never truncated (hub 3.17.2).** `secretfile::write_secret` writes
+  `.<name>.<pid>.<seq>.tmp` beside the target (`create_new`, `0600`), `sync_all`, renames it over the
+  target, then syncs the dir; `replace_secret` takes a `before_rename` hook so a test can fail it
+  with the temp file complete. `write_new_secret` (`ca.key`, `cap.key`) is unchanged. Tests in
+  `src/secretfile/tests.rs`; `a_concurrent_reader_never_sees_a_partial_secret` fails on the old
+  truncate-then-write code. `mcptokens.rs` does not use it (plain `std::fs::write` of hashes).
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed

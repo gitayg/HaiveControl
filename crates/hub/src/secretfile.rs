@@ -124,30 +124,58 @@ pub fn write_new_secret(path: &Path, contents: &str) -> io::Result<()> {
 }
 
 /// Write a secret that is REWRITTEN over its lifetime — a token map gains and
-/// loses entries — so unlike `write_new_secret` an existing file is expected and
-/// truncating it is correct.
+/// loses entries — so unlike `write_new_secret` an existing file is expected and is
+/// replaced.
 ///
-/// `.mode()` only applies when open(2) actually creates the file, so a file that
-/// already exists keeps whatever mode it had. That is precisely the case that
-/// matters here: anything written before this module existed is sitting at 0644.
-/// Hence the explicit `set_permissions` after the write rather than trusting the
-/// open flags to have done it.
+/// Replaced, never truncated in place: truncate-then-write lets a crash, or a reader
+/// that opens the file mid-write, see it empty or half-written — and every caller
+/// treats an unparseable file as no file, i.e. every owner token, device secret or
+/// VPN pass gone. So the new content goes to a temp file in the same directory
+/// (same filesystem, so the rename is atomic), created 0600 at open(2) time, synced,
+/// then renamed over the target: a reader sees the old file or the new one, whole.
+/// The rename also replaces a file an older hub left 0644 with a 0600 one.
 pub fn write_secret(path: &Path, contents: &str) -> io::Result<()> {
+    replace_secret(path, contents, || Ok(()))
+}
+
+/// `write_secret`, with `before_rename` run once the temp file is complete — the
+/// point a test injects a failure at.
+fn replace_secret(path: &Path, contents: &str, before_rename: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
     use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // Unique per write, so two writers (threads, or two hub processes on one data dir)
+    // never share a temp file; `create_new` refuses one that somehow exists.
+    let tmp = dir.join(format!(".{name}.{}.{}.tmp", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let written = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        before_rename()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(contents.as_bytes())?;
-    f.sync_all()?;
+    // The rename itself is durable only once the directory entry is: best effort, as
+    // not every platform lets a directory be opened and synced.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
