@@ -101,6 +101,15 @@ Devices are real people's machines, though — act carefully on them (see below)
   lock. Any new code that pushes to the device must follow the same check. Tests:
   `a_shutdown_during_the_{enable,pass}_push_keeps_the_exit_off`, `a_shutdown_during_a_sweep_push_keeps_the_exit_off` (the fake agent's
   `/vpn/apply` hook calls `vpn::shut_down`) and the control `an_enable_and_a_pass_with_no_shutdown_still_work`.
+- **VPN pushes vs. pass changes (hub 3.17.2).** The epoch only covers shutdowns. Every pass change
+  (`issue_ep`, `revoke`, sweep pruning, `switch_off`) also calls `Store::passes_changed`, which bumps
+  a per-device `Store.versions` counter; a push records `version` with its snapshot and, if it moved
+  by the time the push returns, leaves (or sets) `dirty` instead of clearing it. New code that
+  changes a device's passes must call `passes_changed`; new code that clears `dirty` must check the
+  version. `sweep(agents, Some(rid))` sweeps one device (tests share the store). Tests:
+  `a_pass_revoked_during_a_{sweep,re_enable}_push_is_pushed_again` (the hook runs `vpn::revoke` +
+  `mark_dirty`, as an unreached `revoke_ep` does) and the control
+  `a_sweep_push_with_no_pass_change_clears_the_retry_flag`.
 - **Sept 2026 incident — the hourly OOM restarts.** Two independent bugs. (1) `auto_update_pass`
   compared each agent's version to the HUB's `VERSION` (a separate version line, never equal), so
   with auto-update on every agent was pushed /update every 5 min forever and re-exec'd (fixed

@@ -334,7 +334,7 @@ fn a_shutdown_during_a_sweep_push_keeps_the_exit_off() {
     let (st, v) = vpn_post("enable", rid, "", None);
     assert_eq!(st, 200, "control: {v}");
     super::mark_dirty(rid);
-    super::sweep(&crate::Agents::default());
+    super::sweep(&crate::Agents::default(), Some(rid));
     assert_eq!(applied.lock().unwrap().len(), 2, "control: the sweep pushed the dirty exit");
     assert_eq!(crate::vpn::on_disk(rid), (false, 0), "vpn.json has the exit back");
     assert_eq!(routes_as_pushed(rid, &applied, &pk, 103), (false, false, 0), "the relay routes the shut-down exit");
@@ -356,4 +356,89 @@ fn an_enable_and_a_pass_with_no_shutdown_still_work() {
     assert_eq!(routes(rid, &pk, 104), (true, true, 1));
     assert!(routes_as_pushed(rid, &applied, &pk, 105).1, "the secret the device was given is the one the relay checks");
     assert!(!told_to_disable(&paths), "{:?}", paths.lock().unwrap());
+}
+
+// ---- a pass revoked while a push is in flight is pushed again, not lost -------------
+
+/// What `revoke_ep` does when its own push cannot reach the device (here: the device
+/// is busy with the push being raced): the pass is revoked and the exit marked for retry.
+fn revoke_unreached(rid: &str, id: &str) {
+    super::revoke(rid, id).expect("the pass exists");
+    super::mark_dirty(rid);
+}
+
+fn pending_sync(rid: &str) -> bool {
+    super::store().lock().unwrap().devices.get(rid).is_some_and(|c| c.dirty)
+}
+
+fn peer_keys(push: &Value) -> Vec<String> {
+    push["peers"].as_array().unwrap().iter().map(|p| p["publicKey"].as_str().unwrap().to_string()).collect()
+}
+
+/// An enabled exit on a freshly enrolled `rid` with one live pass for client key `pk`
+/// (applies 1 and 2). With `revoke`, its fake agent revokes that pass, as an unreached
+/// `revoke_ep` would, while it handles apply number `nth`.
+fn revoke_racing_exit(rid: &'static str, pk: &str, nth: usize, revoke: bool) -> Seen<Value> {
+    vpn_hub();
+    let s = enroll(rid, &format!("owner-{rid}"));
+    let id: Arc<OnceLock<String>> = Arc::default();
+    let hook_id = id.clone();
+    let (applied, _) = fake_vpn_hooked(rid, s, crate::vpn::test_key(), move |n| {
+        if revoke && n == nth {
+            revoke_unreached(rid, hook_id.get().expect("the pass was issued"));
+        }
+    });
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "control: {v}");
+    let (st, v) = vpn_post("pass", rid, &format!("&hours=1&name=phone&publicKey={}", enc(pk)), None);
+    assert_eq!(st, 201, "control: {v}");
+    id.set(v["pass"]["id"].as_str().unwrap().to_string()).unwrap();
+    assert!(!pending_sync(rid), "control: the exit is in sync before the race");
+    applied
+}
+
+#[test]
+fn a_pass_revoked_during_a_sweep_push_is_pushed_again() {
+    let rid = "vpn-revoke-sweep";
+    let pk = crate::vpn::test_key();
+    let applied = revoke_racing_exit(rid, &pk, 3, true);
+    super::mark_dirty(rid); // it missed a change while offline
+    super::sweep(&crate::Agents::default(), Some(rid));
+    assert_eq!(applied.lock().unwrap().len(), 3, "control: the sweep pushed the dirty exit");
+    assert!(peer_keys(&applied.lock().unwrap()[2]).contains(&pk), "control: the sweep's push carried the pass the revoke overtook");
+    assert!(pending_sync(rid), "the sweep cleared the retry flag over a revoke that landed during its push: the device keeps the revoked peer");
+    super::sweep(&crate::Agents::default(), Some(rid));
+    assert_eq!(applied.lock().unwrap().len(), 4, "the next sweep did not push again");
+    assert!(!peer_keys(&applied.lock().unwrap()[3]).contains(&pk), "the revoked pass was pushed again");
+    assert!(!pending_sync(rid), "the re-push left the exit marked for retry");
+}
+
+#[test]
+fn a_pass_revoked_during_a_re_enable_push_is_pushed_again() {
+    let rid = "vpn-revoke-enable";
+    let pk = crate::vpn::test_key();
+    let applied = revoke_racing_exit(rid, &pk, 3, true);
+    let (st, v) = vpn_post("enable", rid, "", None);
+    assert_eq!(st, 200, "control: re-enabling an enabled exit: {v}");
+    assert!(peer_keys(&applied.lock().unwrap()[2]).contains(&pk), "control: the enable's push carried the pass the revoke overtook");
+    assert!(pending_sync(rid), "the enable cleared the retry flag a revoke set during its push: the device keeps the revoked peer");
+    super::sweep(&crate::Agents::default(), Some(rid));
+    assert_eq!(applied.lock().unwrap().len(), 4, "the sweep did not push again");
+    assert!(!peer_keys(&applied.lock().unwrap()[3]).contains(&pk), "the revoked pass was pushed again");
+}
+
+/// Control for the two above: a catch-up push that no pass change overtook clears the
+/// retry flag, and the next sweep leaves the device alone.
+#[test]
+fn a_sweep_push_with_no_pass_change_clears_the_retry_flag() {
+    let rid = "vpn-revoke-none";
+    let pk = crate::vpn::test_key();
+    let applied = revoke_racing_exit(rid, &pk, 3, false);
+    super::mark_dirty(rid);
+    super::sweep(&crate::Agents::default(), Some(rid));
+    assert_eq!(applied.lock().unwrap().len(), 3, "the sweep did not push the dirty exit");
+    assert!(peer_keys(&applied.lock().unwrap()[2]).contains(&pk), "{:?}", applied.lock().unwrap()[2]);
+    assert!(!pending_sync(rid), "a push nothing overtook left the exit marked for retry");
+    super::sweep(&crate::Agents::default(), Some(rid));
+    assert_eq!(applied.lock().unwrap().len(), 3, "an in-sync exit was pushed again");
 }

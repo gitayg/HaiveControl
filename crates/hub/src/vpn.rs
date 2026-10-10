@@ -89,11 +89,24 @@ pub struct Store {
     /// Memory only: a restart ends every push in flight.
     #[serde(skip)]
     epochs: BTreeMap<String, u64>,
+    /// Per device, bumped by every change to its passes: issue, revoke, expiry pruning
+    /// and shutdown (an owner change shuts the exit down, which is what changes the
+    /// owner filter). A push records the version it carried; if the version moved
+    /// while it was in flight, what the device took may already be stale, so the push
+    /// leaves the device marked for retry instead of clearing the flag. Memory only.
+    #[serde(skip)]
+    versions: BTreeMap<String, u64>,
 }
 
 impl Store {
     fn epoch(&self, device: &str) -> u64 {
         self.epochs.get(device).copied().unwrap_or(0)
+    }
+    fn version(&self, device: &str) -> u64 {
+        self.versions.get(device).copied().unwrap_or(0)
+    }
+    fn passes_changed(&mut self, device: &str) {
+        *self.versions.entry(device.to_string()).or_default() += 1;
     }
 }
 
@@ -215,22 +228,31 @@ pub fn start(agents: std::sync::Arc<crate::Agents>) {
     }
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(30));
-        sweep(&agents);
+        sweep(&agents, None);
     });
 }
 
-fn sweep(agents: &crate::Agents) {
-    let (dirty, passes): (Vec<(String, DevCfg, u64)>, Vec<Pass>) = {
+/// A device to catch up: its id and config, and the epoch and pass version pushed.
+type Catchup = (String, DevCfg, u64, u64);
+
+/// Prune long-dead passes and re-push every device marked for retry — or, with `only`,
+/// just that one (tests run side by side in one process and share the store).
+fn sweep(agents: &crate::Agents, only: Option<&str>) {
+    let (dirty, passes): (Vec<Catchup>, Vec<Pass>) = {
         let mut s = store().lock().unwrap();
         let t = now();
-        let before = s.passes.len();
-        s.passes.retain(|p| p.live(t) || t.saturating_sub(p.revoked_at.unwrap_or(p.expires_at)) < PURGE_AFTER_S);
-        if s.passes.len() != before {
+        let keep = |p: &Pass| p.live(t) || t.saturating_sub(p.revoked_at.unwrap_or(p.expires_at)) < PURGE_AFTER_S;
+        let pruned: Vec<String> = s.passes.iter().filter(|p| !keep(p)).map(|p| p.device.clone()).collect();
+        s.passes.retain(keep);
+        for d in &pruned {
+            s.passes_changed(d);
+        }
+        if !pruned.is_empty() {
             save(&s);
         }
-        (s.devices.iter().filter(|(_, c)| c.dirty).map(|(k, c)| (k.clone(), c.clone(), s.epoch(k))).collect(), s.passes.clone())
+        (s.devices.iter().filter(|(k, c)| c.dirty && only.is_none_or(|o| o == k.as_str())).map(|(k, c)| (k.clone(), c.clone(), s.epoch(k), s.version(k))).collect(), s.passes.clone())
     };
-    for (id, cfg, epoch) in dirty {
+    for (id, cfg, epoch, version) in dirty {
         // An earlier device's push took a while: this one may have been shut down since.
         if store().lock().unwrap().epoch(&id) != epoch {
             continue;
@@ -246,6 +268,13 @@ fn sweep(agents: &crate::Agents) {
             continue;
         }
         if pushed {
+            if s.version(&id) != version {
+                // A pass changed during the push (a revoke whose own push failed, say):
+                // the device may hold a peer the hub has dropped. Stay marked; the next
+                // sweep pushes the current list.
+                println!("[vpn] {id}: passes changed during the catch-up push — pushing again next sweep");
+                continue;
+            }
             if let Some(c) = s.devices.get_mut(&id) {
                 c.dirty = false;
             }
@@ -332,10 +361,10 @@ pub fn enable_ep(target: &str, user: &str, agents: &crate::Agents) -> (Value, u1
         return (json!({"ok": false, "error": "the hub's VPN relay is not configured (set VPN_RELAY_ENDPOINT and publish VPN_UDP_PORT over UDP)"}), 503);
     }
     let owner = crate::device_owner(agents, target);
-    let (mut cfg, passes, epoch) = {
+    let (mut cfg, passes, epoch, version) = {
         let s = store().lock().unwrap();
         let cfg = s.devices.get(&device).cloned().unwrap_or_else(|| DevCfg { secret: hex(&random32()), enabled_by: user.to_string(), enabled_at: now(), ..Default::default() });
-        (cfg, s.passes.clone(), s.epoch(&device))
+        (cfg, s.passes.clone(), s.epoch(&device), s.version(&device))
     };
     let st = match push(target, &cfg, &passes, &device, owner.as_deref()) {
         Ok(st) => st,
@@ -367,6 +396,9 @@ pub fn enable_ep(target: &str, user: &str, agents: &crate::Agents) -> (Value, u1
         crate::audit(user, "browser", "VPN exit refused", &device, "its WireGuard key is already used by another VPN exit");
         return (json!({"ok": false, "error": "this device reports a WireGuard key that another VPN exit already uses (a cloned image?) — give it a fresh key, then enable again"}), 409);
     }
+    // A pass change during the push (and the retry mark a failed revoke set) must not
+    // be overwritten by the in-sync flag this push started from.
+    cfg.dirty = s.version(&device) != version;
     s.devices.insert(device.clone(), cfg);
     save(&s);
     drop(s);
@@ -399,6 +431,7 @@ fn switch_off(device: &str, drop_passes: bool) -> (bool, usize) {
     *s.epochs.entry(device.to_string()).or_default() += 1;
     crate::vpnrelay::remove_device(device);
     let was_enabled = s.devices.remove(device).is_some();
+    s.passes_changed(device);
     let n = if drop_passes {
         let before = s.passes.len();
         s.passes.retain(|p| p.device != device);
@@ -446,7 +479,7 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, u
     let name = if name.is_empty() { "device".to_string() } else { name };
     let t = now();
     let owner = crate::device_owner(agents, target);
-    let (pass, cfg, passes, epoch) = {
+    let (pass, cfg, passes, epoch, version) = {
         let mut s = store().lock().unwrap();
         let Some(cfg) = s.devices.get(&device).cloned() else {
             return (json!({"ok": false, "error": "enable the VPN exit on this device first"}), 409);
@@ -473,8 +506,9 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, u
             revoked_at: None,
         };
         s.passes.push(pass.clone());
+        s.passes_changed(&device);
         save(&s);
-        (pass, cfg, s.passes.clone(), s.epoch(&device))
+        (pass, cfg, s.passes.clone(), s.epoch(&device), s.version(&device))
     };
     let pushed = push(target, &cfg, &passes, &device, owner.as_deref());
     let owner_kept = crate::device_owner(agents, target) == owner;
@@ -495,7 +529,8 @@ pub fn issue_ep(target: &str, name: &str, hours: u64, client_public_key: &str, u
             let error = if shut { "the exit was shut down while issuing the pass" } else { "the device's owner changed while issuing the pass" };
             return (json!({"ok": false, "error": error}), 409);
         }
-        if pushed.is_err() {
+        // Unreached, or another pass change overtook this push: the sweep re-pushes.
+        if pushed.is_err() || s.version(&device) != version {
             if let Some(c) = s.devices.get_mut(&device) {
                 c.dirty = true;
             }
@@ -530,27 +565,34 @@ pub fn revoke_ep(target: &str, id: &str, owner: Option<&str>) -> (Value, u16) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": e}), 400),
     };
-    let (cfg, passes) = {
-        let mut s = store().lock().unwrap();
-        // The pass must belong to the target the caller was authorized for.
-        let Some(p) = s.passes.iter_mut().find(|p| p.id == id && p.device == device) else {
-            return (json!({"ok": false, "error": "not found"}), 404);
-        };
-        if p.revoked_at.is_none() {
-            p.revoked_at = Some(now());
-        }
-        let cfg = s.devices.get(&device).cloned();
-        save(&s);
-        (cfg, s.passes.clone())
+    let Some((cfg, passes, version)) = revoke(&device, id) else {
+        return (json!({"ok": false, "error": "not found"}), 404);
     };
     let mut synced = true;
     if let Some(cfg) = cfg {
-        if push(target, &cfg, &passes, &device, owner).is_err() {
+        synced = push(target, &cfg, &passes, &device, owner).is_ok();
+        let overtaken = store().lock().unwrap().version(&device) != version;
+        // Unreached, or another pass change overtook this push: the sweep re-pushes.
+        if !synced || overtaken {
             mark_dirty(&device);
-            synced = false;
         }
     }
     (json!({"ok": true, "synced": synced}), 200)
+}
+
+/// The store half of a revoke: pass `id` on `device` is revoked and saved. Returns
+/// what the push needs, or None when `device` has no such pass.
+fn revoke(device: &str, id: &str) -> Option<(Option<DevCfg>, Vec<Pass>, u64)> {
+    let mut s = store().lock().unwrap();
+    // The pass must belong to the target the caller was authorized for.
+    let p = s.passes.iter_mut().find(|p| p.id == id && p.device == device)?;
+    if p.revoked_at.is_none() {
+        p.revoked_at = Some(now());
+    }
+    s.passes_changed(device);
+    let cfg = s.devices.get(device).cloned();
+    save(&s);
+    Some((cfg, s.passes.clone(), s.version(device)))
 }
 
 fn mark_dirty(device: &str) {

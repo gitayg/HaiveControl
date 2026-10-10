@@ -50,6 +50,8 @@ single-operator use.
 
 **A VPN exit shut down mid-enable stays shut down (fixed in hub 3.17.1).** Enable, pass issue and the 30-second catch-up sweep push to the device without the store lock held, then recorded the result. A credential revoke, Forget, dissolve, owner change or Disable that landed during that push was undone afterwards: the enable re-registered the exit at the relay and wrote it back to `vpn.json`, so the relay routed clients to a device whose exit had been revoked. Each shutdown now bumps a per-device epoch under the store lock, and the relay registration and the `vpn.json` write happen under that lock only when the epoch the request started with (and the device's owner) is unchanged. Otherwise the request returns `409`, the hub state stays off, and the device is sent `/vpn/disable`.
 
+**A VPN pass revoked during a retry push is no longer kept by the device (fixed in hub 3.17.2).** The 3.17.1 epoch only covered shutdowns. When a pass revoke could not reach the device (so the exit stayed marked for retry) while the 30-second sweep was already pushing that device an older peer list, the sweep's success cleared the retry flag and the device kept the revoked peer until the pass expired; a re-enable did the same. Every pass change (issue, revoke, expiry pruning, shutdown) now bumps a per-device version under the store lock, and a push clears the retry flag only if the version it carried is unchanged; otherwise the device stays marked and the next sweep pushes the current list.
+
 **Approval-gated AI writes.** The AI assistant investigates autonomously with read tools
 (inventory, system reports, compliance posture, screenshots, CVE lookup) but **cannot
 change a machine on its own**. Writes go through a fixed, server-side fix menu
